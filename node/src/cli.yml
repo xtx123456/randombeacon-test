@@ -1,0 +1,64 @@
+name: replica
+version: "1.0"
+author: hermitsage <dth.bht@gmail.com>
+about: Apollo node
+args:
+    - config:
+        short: c
+        long: config
+        help: the config file containing startup information
+        takes_value: true
+        required: true
+    - debug:
+        short: v
+        multiple: true
+        help: sets the verbosity level
+    - ip:
+        short: i
+        long: ip
+        help: A file containing all the ips for the other servers
+        takes_value: true
+    - delta:
+        short: d
+        long: delta
+        help: the protocol delta value
+        takes_value: true
+    - val:
+        short: z
+        long: val
+        help: Value to start approximate consensus
+        takes_value: true
+    - epsilon:
+        short: e
+        long: epsilon
+        help: epsilon required
+        takes_value: true
+    - tri:
+        short: t
+        long: tri
+        help: tri value required
+        takes_value: true
+    - sleep:
+        long: sleep
+        help: the initial sleep time (in seconds) to ensure that all the other nodes are up and ready for the protocol
+        takes_value: true
+    - vsstype:
+        short: s
+        long: vsstype
+        help: Helps determine what VSS scheme to run
+        takes_value: true
+    - batch:
+        short: b
+        long: batch
+        help: Batch size used in protocol
+        takes_value: true
+    - syncer:
+        short: y
+        long: syncer
+        help: IPs for the syncer to connect to
+        takes_value: true
+    - frequency:
+        short: f
+        long: frequency
+        help: Frequency of initiating batchwss
+        takes_value: true

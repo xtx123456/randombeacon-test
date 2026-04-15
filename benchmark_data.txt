@@ -1,0 +1,15 @@
+Benchmark Data Summary
+=====================
+
+Batch=10: bea=524 beacons/s, ppt=440 beacons/s, bea_lat=19.1ms, ppt_lat=22.7ms
+Batch=20: bea=850 beacons/s, ppt=605 beacons/s, bea_lat=23.5ms, ppt_lat=33.1ms
+Batch=40: bea=1140 beacons/s, ppt=834 beacons/s, bea_lat=35.1ms, ppt_lat=48.0ms
+
+Phase Progression (batch=20):
+Baseline(hashrand): 768 beacons/s, 25.6ms
+Phase 2 (ACS): 781 beacons/s, 25.6ms
+Phase 3 (Merkle): 756 beacons/s, 26.4ms
+Phase 4A (SS-AVSS): 676 beacons/s, 29.6ms
+Phase 4B (Two-Field+Batch): 632 beacons/s, 31.7ms
+
+All 3 charts generated: benchmark_comparison.png, phase_progression.png, feature_comparison.png

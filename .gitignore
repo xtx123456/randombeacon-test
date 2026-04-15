@@ -1,0 +1,116 @@
+# =========================
+# OS / Editor
+# =========================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+env/
+ENV/
+
+# =========================
+# Node
+# =========================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# =========================
+# Rust / Cargo
+# =========================
+target/
+**/target/
+debug/
+release/
+
+# Keep Cargo.lock only if you want reproducible app builds.
+# For libraries, sometimes people ignore it; here we keep it by default.
+# Cargo.lock
+
+# =========================
+# Logs / runtime files
+# =========================
+logs/
+*.log
+*.out
+*.err
+nohup.out
+bench_results/
+benchmark/*.log
+benchmark/*.out
+
+# =========================
+# Data / local test artifacts
+# =========================
+data/
+datasets/
+tmp/
+temp/
+*.db
+*.sqlite
+*.sqlite3
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.wtns
+*.zkey
+*.r1cs
+
+# =========================
+# Archives
+# =========================
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+
+# =========================
+# Secrets / credentials
+# =========================
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+id_rsa
+id_rsa.pub
+id_ed25519
+id_ed25519.pub
+secrets.json
+credentials.json
+token.json
+
+# =========================
+# Project-specific generated files
+# =========================
+ip_file
+baseline_records/
+*.bak
+*.orig
+*_BACKUP_*
+*_*_*
+*.bak
+*.orig
+consensus/ppt_beacon/src/node/gather/gather.rs_102_47
+consensus/ppt_beacon/src/node/gather/gather.rs_147_26
