@@ -1,0 +1,14 @@
+[workspace]
+# This should only list projects that are not
+# in the dependency tree in any other way
+members = [
+    "types",
+    "config",
+    "crypto",
+    "crypto_blstrs",
+    "tools/genconfig",
+    "consensus",
+    "node",
+    "consensus/beacon",
+    "consensus/glow_dvrf",
+]

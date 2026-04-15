@@ -1,0 +1,12 @@
+benchmark/benchmark/local.py:91:            cmd = CommandMaker.generate_config_files(self.BASE_PORT, self.cl_bport, self.cl_bport + 500, nodes)
+benchmark/benchmark/local.py:118:            #     cmd = CommandMaker.run_primary(
+benchmark/benchmark/local.py:135:            sync_cmd = CommandMaker.run_syncer(
+benchmark/benchmark/local.py:145:                cmd = CommandMaker.run_primary(
+benchmark/benchmark/commands.py:29:    def generate_config_files(bport,client_bport,client_run_port,num_nodes):
+benchmark/benchmark/commands.py:33:    def run_primary(key,delay,ep,delta,val,tri,batch,freq, debug=False):
+benchmark/benchmark/commands.py:38:                f'--sleep {delay} --vsstype bea --epsilon {ep} --delta {delta} --val {val} --tri {tri} --syncer syncer --batch {batch} --frequency {freq}')
+benchmark/benchmark/commands.py:41:    def run_syncer(key,delay, debug=False):
+benchmark/benchmark/commands.py:46:                f'--sleep {delay} --vsstype sync --epsilon 10 --delta 5000 --val 100 --tri 10 --syncer syncer --batch 200 --frequency 10')
+scripts/beacon-test.sh:17:# ./scripts/beacon-test.sh 10 bea testdata/cc_16/syncer 200 10
+scripts/beacon-test.sh:22:    --vsstype sync \
+scripts/beacon-test.sh:40:    --vsstype $2 \
