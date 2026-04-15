@@ -32,10 +32,10 @@ use crate::node::{ShamirSecretSharing, appxcon::RoundState};
 
 /**
  * This file contains the CTRBCState object responsible for keeping track of all messages and state in an n-parallel RBC.
- * We use Cachin-Tessaro's Reliable Broadcast protocol for broadcasting the vector of Merkle roots.  
- * 
+ * We use Cachin-Tessaro's Reliable Broadcast protocol for broadcasting the vector of Merkle roots.
+ *
  * TODO: Separate this monolith into separate modules for ease of maintenance
- * */ 
+ */
 #[derive(Debug,Clone)]
 pub struct CTRBCState{
     /// BeaconMsg contains the secret shares, CTRBCMsg contains its corresponding broadcasted root commitments
@@ -66,7 +66,7 @@ pub struct CTRBCState{
     pub appxcon_allround_vals: HashMap<Replica,HashMap<Round,Vec<(Replica,BigUint)>>>,
     /// Final termination value of Binary Approximate Agreement
     pub appxcon_vals: HashMap<Replica,Vec<BigUint>>,
-    /// AnyTrust Sample for this n-parallel BAwVSS instantiation 
+    /// AnyTrust Sample for this n-parallel BAwVSS instantiation
     pub committee:Vec<Replica>,
     /// Which round of Approximate Agreement is this current BAwVSS instance undergoing?
     pub appxcon_round: Round,
@@ -74,10 +74,14 @@ pub struct CTRBCState{
     pub send_w1: bool,
     /// Witness2 has been sent in Gather?
     pub send_w2:bool,
-    /// Did the Gather protocol terminate?
-    pub started_baa:bool,
+    /// Reused as a one-shot ACS-trigger guard in the PPT path.
+    pub ppt_acs_init_sent: bool,
     /// Has the AnyTrust sampling been conducted already?
     pub committee_elected:bool,
+    /// Phase B: pure-PPT round bootstrap status
+    pub ppt_round_started: bool,
+    /// Phase B: pure-PPT round finished status
+    pub ppt_round_finished: bool,
     /// List of Accepted witnesses
     pub accepted_witnesses1: HashSet<Replica,nohash_hasher::BuildNoHashHasher<Replica>>,
     pub accepted_witnesses2: HashSet<Replica,nohash_hasher::BuildNoHashHasher<Replica>>,
@@ -114,17 +118,17 @@ pub struct CTRBCState{
     pub post_complaint_complete: bool,
     /// Beacon outputs computed by batch recovery, held back until post-complaint finishes.
     pub pending_beacon_outputs: HashMap<usize,Vec<u8>,nohash_hasher::BuildNoHashHasher<usize>>,
-    /// Code for binary approximate agreement. Remember, Binary Approximate Agreement must run for self.rounds_aa number of rounds. Accordingly, those many round states need to be created and managed.
+    /// BeaconConstruct packets that arrived before ACS finalization.
+    /// Tuple = (packet, share_sender, coin_num)
+    pub pre_acs_beacon_constructs: Vec<(BatchWSSReconMsg, Replica, usize)>,
+    /// Legacy Binary-AA round states (kept for compatibility during refactor; PPT path should stop using them)
     pub round_state: HashMap<Round,RoundState>,
     pub cleared:bool,
 }
 
 impl CTRBCState{
     pub fn new(sec_domain:BigUint,num_nodes:usize)-> CTRBCState{
-        let mut master_committee = Vec::new();
-        for i in 0..num_nodes{
-            master_committee.push(i);
-        }
+        let _ = num_nodes; // retained for signature compatibility
         CTRBCState{
             msgs: HashMap::default(),
             node_secrets: HashMap::default(),
@@ -138,13 +142,15 @@ impl CTRBCState{
             witness1:HashMap::default(),
             witness2: HashMap::default(),
             appxcon_allround_vals: HashMap::default(),
-            committee:master_committee,
+            committee: Vec::new(),
             appxcon_vals: HashMap::default(),
             appxcon_round: 0,
             send_w1:false,
             send_w2:false,
-            started_baa:false,
+            ppt_acs_init_sent:false,
             committee_elected:false,
+            ppt_round_started:false,
+            ppt_round_finished:false,
             terminated_secrets:HashSet::default(),
             accepted_witnesses1:HashSet::default(),
             accepted_witnesses2:HashSet::default(),
@@ -160,6 +166,7 @@ impl CTRBCState{
             acs_decided_set: None,
             malicious_dealers: HashSet::default(),
             blame_log: Vec::new(),
+            pre_acs_beacon_constructs: Vec::new(),
             post_complaint_packets: HashMap::default(),
             recovered_shares_multicast_sent: false,
             batch_reconstruction_complete: false,
@@ -172,12 +179,13 @@ impl CTRBCState{
 
     pub fn add_message(&mut self, beacon_msg:BeaconMsg,ctr:CTRBCMsg)->(){
         let sec_origin = beacon_msg.origin;
-        // Message Validation happens in the method calling this method. 
+        // Message Validation happens in the method calling this method.
         self.msgs.insert(sec_origin, (beacon_msg,ctr));
     }
 
     pub fn set_committee(&mut self,committee:Vec<Replica>){
-        self.committee = committee.clone();
+        self.committee = committee;
+        self.committee_elected = true;
     }
 
     pub fn add_echo(&mut self, sec_origin: Replica, echo_origin: Replica, ctr:&CTRBCMsg){
@@ -218,6 +226,7 @@ impl CTRBCState{
             }
         }
     }
+
     /**
      * This function prepares to start Gather and Approximate agreement after terminating CTRBC protocol for a message.
      */
@@ -230,7 +239,7 @@ impl CTRBCState{
                 for (rep,value) in y.into_iter(){
                     vec_values.push((rep,BigUint::from_bytes_be(&value)));
                 }
-                return (x,vec_values);
+                (x,vec_values)
             }).collect();
             let mut hashmap_vals = HashMap::default();
             for (round,vals) in appx_con_vals.into_iter(){
@@ -238,11 +247,15 @@ impl CTRBCState{
             }
             self.appxcon_allround_vals.insert(beacon_msg.origin.clone(), hashmap_vals);
         }
+
         // Phase 4B: Store degree-test data before consuming the message.
         if let Some(ref dtc) = beacon_msg.degree_test_coeffs {
             self.degree_test_coeffs.insert(terminated_index, dtc.clone());
-            log::info!("[TWO-FIELD] Stored degree_test_coeffs for dealer {} ({} secrets)",
-                terminated_index, dtc.len());
+            log::info!(
+                "[TWO-FIELD] Stored degree_test_coeffs for dealer {} ({} secrets)",
+                terminated_index,
+                dtc.len()
+            );
         }
         if let Some(ref mask) = beacon_msg.mask_shares {
             self.mask_shares.insert(terminated_index, mask.clone());
@@ -256,13 +269,14 @@ impl CTRBCState{
             self.comm_vectors.insert(terminated_index, beacon_msg.root_vec.unwrap());
         }
         self.terminated_secrets.insert(terminated_index);
+
         // clean up for memory efficiency
         let beacon_msg = self.msgs.get(&terminated_index).unwrap().0.clone();
         self.msgs.remove(&terminated_index);
         self.echos.remove(&terminated_index);
         self.readys.remove(&terminated_index);
         self.recon_msgs.remove(&terminated_index);
-        return beacon_msg;
+        beacon_msg
     }
 
     pub fn add_secret_share(&mut self, coin_number:usize, secret_id:usize,share_provider:usize, share:Val){
@@ -277,7 +291,6 @@ impl CTRBCState{
                 share_map.insert(share_provider, share_bg);
                 coin_shares.insert(secret_id, share_map);
             }
-            //self.secret_shares.get_mut(&coin_number).unwrap().insert(share_provider, (coin_number,wss_msg.clone()));
         }
         else{
             let mut coin_shares = HashMap::default();
@@ -287,38 +300,33 @@ impl CTRBCState{
             self.secret_shares.insert(coin_number, coin_shares);
         }
     }
+
     /**
      * Check the RBC's validity after you receive n-f ECHOs
+     * Returns the root of all individual polynomial merkle root vectors and the polynomial vector itself
      */
-    // Returns the root of all individual polynomial merkle root vectors and the polynomial vector itself
     pub fn echo_check(&mut self, sec_origin: Replica, num_nodes: usize,num_faults:usize, batch_size:usize,hf:&HashState)-> Option<(Hash,Vec<Hash>)>{
         let echos = self.echos.get_mut(&sec_origin).unwrap();
-        // 2. Check if echos reached the threshold, init already received, and round number is matching
         log::debug!("WSS ECHO check: echos.len {}, contains key: {}"
         ,echos.len(),self.msgs.contains_key(&sec_origin));
-        
-        if echos.len() == num_nodes-num_faults && 
+
+        if echos.len() == num_nodes-num_faults &&
             self.msgs.contains_key(&sec_origin) && !self.ready_sent.contains(&sec_origin){
-            // Broadcast readys, otherwise, just wait longer
-            // Cachin-Tessaro RBC implies ECHO verification needed
-            // Send your own shard in the echo phase to every other node. 
             let mut echo_map = HashMap::default();
             self.ready_sent.insert(sec_origin);
             for (rep,(shard,_mp)) in echos.clone().into_iter(){
                 echo_map.insert(rep, shard);
             }
-            // This function uses Erasure codes to reconstruct the root vector and checks if the broadcaster 
-            // cheated or not. Only then it will echo the message. 
-            return self.verify_reconstructed_root(sec_origin, num_nodes, num_faults, batch_size, echo_map,hf);   
+            return self.verify_reconstructed_root(sec_origin, num_nodes, num_faults, batch_size, echo_map,hf);
         }
         None
     }
+
     /**
      * Check the RBC's validity after you receive f+1 or n-f readys
      */
     pub fn ready_check(&mut self, sec_origin: Replica, num_nodes:usize,num_faults:usize, batch_size:usize,hf:&HashState)-> (usize, Option<(Hash,Vec<Hash>)>){
         let readys = self.readys.get_mut(&sec_origin).unwrap();
-        // 2. Check if readys reached the threshold, init already received, and round number is matching
         log::debug!("READY check: readys.len {}, contains key: {}"
         ,readys.len(),self.msgs.contains_key(&sec_origin));
         let mut ready_map = HashMap::default();
@@ -326,27 +334,23 @@ impl CTRBCState{
             ready_map.insert(rep, shard);
         }
         if readys.len() == num_faults+1 && self.msgs.contains_key(&sec_origin) && !self.ready_sent.contains(&sec_origin){
-            // Broadcast readys, otherwise, just wait longer
-            // Cachin-Tessaro RBC implies verification needed
             self.ready_sent.insert(sec_origin);
             return (num_faults+1,self.verify_reconstructed_root(sec_origin, num_nodes, num_faults, batch_size, ready_map,hf));
         }
         else if readys.len() == num_nodes-num_faults &&
             self.msgs.contains_key(&sec_origin){
-            // Terminate RBC, RAccept the value
-            // Add value to value list, add rbc to rbc list
             return (num_nodes-num_faults,self.verify_reconstructed_root(sec_origin, num_nodes, num_faults, batch_size, ready_map,hf));
         }
         (0,None)
     }
+
     /**
-     * CTRBC Reconstruction phase. Reconstruct message using Erasure codes and veriy if the Root of Merkle tree is correctly formed.
+     * CTRBC Reconstruction phase. Reconstruct message using Erasure codes and verify if the root of Merkle tree is correctly formed.
      */
     pub fn verify_reconstruct_rbc(&mut self, sec_origin:Replica, num_nodes:usize, num_faults:usize, batch_size:usize,hf:&HashState) -> Option<(Hash,Vec<Hash>)>{
         let ready_check = self.readys.get(&sec_origin).unwrap().len() >= (num_nodes-num_faults);
         let vec_fmap = self.recon_msgs.get(&sec_origin).unwrap().clone();
         if vec_fmap.len()==num_nodes-num_faults && ready_check{
-            // Reconstruct here
             let res_root = self.verify_reconstructed_root(sec_origin, num_nodes, num_faults, batch_size, vec_fmap,hf);
             match res_root.clone() {
                 None=> {
@@ -356,13 +360,13 @@ impl CTRBCState{
                 Some(_vec)=>{
                     log::info!("Successfully reconstructed message for Batch WSS, checking validity of root for secret {}",sec_origin);
                     self.terminated_secrets.insert(sec_origin);
-                    // Initiate next phase of the protocol here
                     return res_root;
                 }
             }
         }
         None
     }
+
     /**
      * Phase 4B: Use BatchExtractor for O(n) recovery instead of per-secret Lagrange interpolation.
      * The BatchExtractor's Lagrange coefficients are precomputed once when ACS decides,
@@ -380,15 +384,11 @@ impl CTRBCState{
         let already_constructed = self.reconstructed_secrets.contains_key(&coin_number) && self.reconstructed_secrets.get(&coin_number).unwrap().contains_key(&sec_origin);
         if sec_map.len() >= num_faults+1 && !already_constructed{
             log::info!("Received t+1 shares for secret instantiated by {}, reconstructing secret for coin_num {}",wss_msg.origin,coin_number);
-            
-            // Phase 4B: Use BatchExtractor if available, otherwise fall back to direct Lagrange
+
             let secret = if let Some(ref extractor) = self.batch_extractor {
-                // Use precomputed Lagrange coefficients from BatchExtractor
-                // Build a single-coin shares_matrix for batch_recover
                 let mut single_coin_matrix: HashMap<usize, HashMap<usize, BigUint>> = HashMap::new();
                 let mut dealer_shares: HashMap<usize, BigUint> = HashMap::new();
                 for (&rep, share) in sec_map.iter() {
-                    // rep is 0-indexed, evaluation point is rep+1
                     dealer_shares.insert(rep + 1, share.clone());
                 }
                 single_coin_matrix.insert(0, dealer_shares);
@@ -396,7 +396,6 @@ impl CTRBCState{
                 if let Some((_, sec)) = recovered.into_iter().next() {
                     sec
                 } else {
-                    // Fallback: direct Lagrange interpolation
                     let mut secret_shares: Vec<(Replica, BigUint)> =
                         sec_map.clone().into_iter()
                         .map(|(rep, val)| (rep + 1, val))
@@ -410,7 +409,6 @@ impl CTRBCState{
                     shamir_ss.recover(&secret_shares)
                 }
             } else {
-                // No BatchExtractor yet — use traditional Lagrange interpolation
                 let mut secret_shares: Vec<(Replica, BigUint)> =
                     sec_map.clone().into_iter()
                     .map(|(rep, val)| (rep + 1, val))
@@ -436,26 +434,16 @@ impl CTRBCState{
         None
     }
 
-    // Sync secrets and multiply them by the agreed-upon weight after terminating Approximate Agreement. 
+    // Sync secrets and multiply them by the agreed-upon weight after terminating Approximate Agreement.
+    /// Pure-PPT path:
+    /// beacon aggregation no longer depends on legacy appxcon / AA weights.
+    /// Keep this function as a compatibility no-op so existing call sites compile.
     pub async fn sync_secret_maps(&mut self){
-        //self.reconstructed_secrets.insert(sec_origin, secret.clone());
-        for (coin_num,recon_sec) in self.reconstructed_secrets.clone().into_iter(){
-            for (rep,sec) in recon_sec.into_iter(){
-                if self.appx_con_term_vals.contains_key(&rep){
-                    let appxcox_var = self.appx_con_term_vals.get_mut(&rep).unwrap();
-                    if !self.contribution_map.contains_key(&coin_num){
-                        let contribution_map_coin:HashMap<Replica, BigUint, nohash_hasher::BuildNoHashHasher<Replica>> = HashMap::default();
-                        self.contribution_map.insert(coin_num, contribution_map_coin);
-                    }
-                    let sec_contrib_map = self.contribution_map.get_mut(&coin_num).unwrap();
-                    sec_contrib_map.insert(rep, appxcox_var.clone()*sec.clone());
-                }
-            }
-        }
+        log::debug!(
+            "[PPT][LEGACY-OFF] sync_secret_maps() is a no-op in pure PPT mode"
+        );
     }
-    /**
-     * Return the set of secret shares for a given beacon index. 
-     */
+
     /// Phase 3: Record a dealer as malicious with blame evidence.
     pub fn blame_dealer(&mut self, dealer: Replica, round: Round, reason: BlameReason) {
         let newly_flagged = self.malicious_dealers.insert(dealer);
@@ -479,12 +467,10 @@ impl CTRBCState{
         mp: &Proof,
         hf: &HashState,
     ) -> bool {
-        // 1. Check that the Merkle proof itself is valid
         if !mp.validate(hf) {
             log::warn!("[BLAME-CHECK] Merkle proof validation failed for dealer {} coin {}", dealer, coin_number);
             return false;
         }
-        // 2. Verify commitment: H(share, nonce) == proof leaf
         let commitment = hf
             .hash_batch(vec![*share], vec![*nonce])
             .into_iter()
@@ -494,7 +480,6 @@ impl CTRBCState{
             log::warn!("[BLAME-CHECK] Commitment mismatch for dealer {} coin {}", dealer, coin_number);
             return false;
         }
-        // 3. Verify Merkle root matches the committed root vector
         if let Some(root_vec) = self.comm_vectors.get(&dealer) {
             if coin_number < root_vec.len() {
                 if mp.root() != root_vec[coin_number] {
@@ -509,7 +494,9 @@ impl CTRBCState{
         true
     }
 
-
+    /**
+     * Return the set of secret shares for a given beacon index.
+     */
     pub fn secret_shares(&self, coin_number:usize)-> BatchWSSReconMsg{
         let mut shares_vector = Vec::new();
         let mut replicas = Vec::new();
@@ -551,7 +538,7 @@ impl CTRBCState{
 
     fn verify_reconstructed_root(&mut self, sec_origin: Replica, num_nodes: usize,num_faults:usize,_batch_size:usize, shard_map: HashMap<usize,Vec<u8>>,hf:&HashState)-> Option<(Hash,Vec<Hash>)>{
         let merkle_root = self.msgs.get(&sec_origin).unwrap().1.mp.root().clone();
-        let res = 
+        let res =
             reconstruct_and_return(&shard_map, num_nodes, num_faults);
         match res {
             Err(error)=> {
@@ -559,17 +546,6 @@ impl CTRBCState{
                 return None;
             },
             Ok(vec_x)=> {
-                // Further verify the merkle root generated by these hashes
-                // let mut vec_xx = vec_x;
-                // vec_xx.truncate(batch_size*32);
-                // //log::info!("Vec_x: {:?} {}",vec_xx.clone(),vec_xx.len());
-                // let split_vec:Vec<Hash> = 
-                //     vec_xx.chunks(32).into_iter()
-                //     .map(|x| {
-                //         x.try_into().unwrap()
-                //     })
-                //     .collect();
-                // let merkle_tree_master:MerkleTree<Hash,HashingAlg> = MerkleTree::from_iter(split_vec.clone().into_iter());
                 let shards = get_shards(BeaconMsg::deserialize(&vec_x.as_slice()).serialize_ctrbc(),num_faults);
                 let hashes_rbc:Vec<Hash> = shards.clone().into_iter().map(|x| do_hash(x.as_slice())).collect();
                 let merkle_tree = MerkleTree::new(hashes_rbc.clone(),hf);
@@ -583,38 +559,90 @@ impl CTRBCState{
             }
         }
     }
+
     /**
      * Check if the beacon can be reconstructed.
      * 1) All secrets for which Binary AA terminated with a non-zero weight must be reconstructed.
-     * 2) All Binary AA instances should have terminated. s
+     * 2) All Binary AA instances should have terminated.
      */
-    pub async fn coin_check(&mut self, round: Round,coin_number: usize, num_nodes: usize)->Option<Vec<u8>>{
-        log::info!("Coin check for round {} coin {}, keys appxcon: {:?}, contrib_map: {:?}",round,coin_number,self.appx_con_term_vals,self.contribution_map);
-        // Each key,value pair in the contribution_map contains a beacon_number, and a list of contributions of each node in the system. 
-        if self.contribution_map.contains_key(&coin_number) && self.appx_con_term_vals.len() == self.contribution_map.get(&coin_number).unwrap().len(){
-            let mut sum_vars = BigUint::from(0u32);
-            log::info!("Reconstruction for round {} and coin {}",round,coin_number);
-            // Contribution_map stores each node's secret's contribution to the beacon. Check our paper for details about secret aggregation and beacon generation
-            for (_rep,sec_contrib) in self.contribution_map.get(&coin_number).unwrap().clone().into_iter(){
-                sum_vars = sum_vars + sec_contrib.clone();
-                log::info!("Node's secret contribution: {}, node {}",sec_contrib.to_string(),_rep);
+    /// Pure-PPT beacon extraction:
+    /// once all ACS-decided dealers for a coin have been reconstructed,
+    /// aggregate those reconstructed secrets directly to derive the beacon value.
+    ///
+    /// This replaces the legacy appxcon-weighted contribution_map path.
+    pub async fn coin_check(&mut self, round: Round, coin_number: usize, _num_nodes: usize) -> Option<Vec<u8>> {
+        let decided = match self.acs_decided_set.clone() {
+            Some(v) if !v.is_empty() => v,
+            _ => {
+                log::debug!(
+                    "[PPT][COIN-CHECK] round {} coin {} skipped: ACS decided set not ready",
+                    round,
+                    coin_number
+                );
+                return None;
             }
-            let rand_fin = sum_vars.clone() % self.secret_domain.clone();
-            let _mod_number = self.secret_domain.clone()/(num_nodes);
-            let _leader_elected = rand_fin.clone()/_mod_number;
-            // Mark this secret as used, use the next secret from this point on
-            self.recon_secrets.insert(coin_number);
-            self.secret_shares.remove(&coin_number);
-            self.reconstructed_secrets.remove(&coin_number);
-            self.contribution_map.remove(&coin_number);
-            // for (_rep,(_appx_con, processed, _num)) in self.contribution_map.iter_mut(){
-            //     *processed = false;
-            // }
-            //log::error!("Random leader election terminated random number: sec_origin {} rand_fin{} leader_elected {}, elected leader is node",sum_vars.clone(),rand_fin.clone(),leader_elected.clone());
-            return Some(BigUint::to_bytes_be(&rand_fin));
+        };
+
+        let recon_map = match self.reconstructed_secrets.get(&coin_number) {
+            Some(m) => m,
+            None => {
+                log::debug!(
+                    "[PPT][COIN-CHECK] round {} coin {} skipped: no reconstructed secrets yet",
+                    round,
+                    coin_number
+                );
+                return None;
+            }
+        };
+
+        // Only proceed when every ACS-decided dealer has been reconstructed.
+        for dealer in decided.iter().copied() {
+            if !recon_map.contains_key(&dealer) {
+                log::debug!(
+                    "[PPT][COIN-CHECK] round {} coin {} waiting for reconstructed secret from decided dealer {}",
+                    round,
+                    coin_number,
+                    dealer
+                );
+                return None;
+            }
         }
-        return None;
+
+        // Deterministic pure-PPT aggregation:
+        // sum all ACS-decided reconstructed secrets modulo the secret domain.
+        let mut sum_vars = BigUint::from(0u32);
+        let mut decided_sorted = decided.clone();
+        decided_sorted.sort_unstable();
+
+        for dealer in decided_sorted.iter().copied() {
+            let sec = recon_map.get(&dealer).unwrap();
+            log::info!(
+                "[PPT][COIN-CHECK] round {} coin {} including dealer {} reconstructed secret {}",
+                round,
+                coin_number,
+                dealer,
+                sec.to_string()
+            );
+            sum_vars += sec.clone();
+        }
+
+        let rand_fin = sum_vars % self.secret_domain.clone();
+
+        log::info!(
+            "[PPT][COIN-CHECK] round {} coin {} pure-PPT beacon value computed (mod p)",
+            round,
+            coin_number
+        );
+
+        // Mark and clean up this coin's transient recovery state.
+        self.recon_secrets.insert(coin_number);
+        self.secret_shares.remove(&coin_number);
+        self.reconstructed_secrets.remove(&coin_number);
+        self.contribution_map.remove(&coin_number); // legacy map, kept cleared for safety
+
+        Some(BigUint::to_bytes_be(&rand_fin))
     }
+
     /**
      * Clear state after use for memory clean up
      */
@@ -626,7 +654,9 @@ impl CTRBCState{
         self.accepted_witnesses2.clear();
         self.appx_con_term_vals.clear();
         self.committee.clear();
-        self.committee_elected = true;
+        self.committee_elected = false;
+        self.ppt_round_started = false;
+        self.ppt_round_finished = false;
         self.secret_shares.clear();
         self.appxcon_vals.clear();
         self.appxcon_allround_vals.clear();
@@ -643,10 +673,21 @@ impl CTRBCState{
         self.witness2.clear();
         self.terminated_secrets.clear();
         self.post_complaint_packets.clear();
+        self.pre_acs_beacon_constructs.clear();
         self.recovered_shares_multicast_sent = false;
         self.batch_reconstruction_complete = false;
         self.post_complaint_complete = false;
         self.pending_beacon_outputs.clear();
         self.cleared = true;
+        self.node_secrets.clear();
+        self.reconstructed_secrets.clear();
+        self.recon_secrets.clear();
+        self.malicious_dealers.clear();
+        self.blame_log.clear();
+        self.ready_sent.clear();
+
+        self.send_w1 = false;
+        self.send_w2 = false;
+        self.ppt_acs_init_sent = false;
     }
 }

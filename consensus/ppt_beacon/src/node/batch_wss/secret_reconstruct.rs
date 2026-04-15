@@ -32,6 +32,38 @@ fn packet_lengths_ok(packet: &BatchWSSReconMsg) -> bool {
         && packet.f_large_shares.len() == l
 }
 
+/// Keep only ACS-decided dealers/messages inside a batch reconstruction packet.
+/// This is the key alignment with the PPT requirement:
+/// "We only reconstruct the secret chosen by ACS".
+fn filter_packet_to_decided(
+    packet: &BatchWSSReconMsg,
+    decided: &[Replica],
+) -> BatchWSSReconMsg {
+    let mut filtered = packet.clone();
+    filtered.origins.clear();
+    filtered.secrets.clear();
+    filtered.nonces.clear();
+    filtered.mps.clear();
+    filtered.mask_shares.clear();
+    filtered.f_large_shares.clear();
+
+    for idx in 0..packet.origins.len() {
+        let dealer = packet.origins[idx];
+        if decided.contains(&dealer) {
+            filtered.origins.push(dealer);
+            filtered.secrets.push(packet.secrets[idx].clone());
+            filtered.nonces.push(packet.nonces[idx].clone());
+            filtered.mps.push(packet.mps[idx].clone());
+            filtered.mask_shares.push(packet.mask_shares[idx].clone());
+            filtered
+                .f_large_shares
+                .push(packet.f_large_shares[idx].clone());
+        }
+    }
+
+    filtered
+}
+
 fn batch_ready(state: &CTRBCState, batch_size: usize) -> bool {
     let Some(extractor) = state.batch_extractor.as_ref() else {
         return false;
@@ -97,13 +129,18 @@ fn build_local_multicast(
     round: Round,
     myid: Replica,
     batch_size: usize,
+    decided: &[Replica],
 ) -> MulticastRecoveredSharesMsg {
     let mut packets = Vec::with_capacity(batch_size);
     for coin_num in 0..batch_size {
-        packets.push(RecoveredCoinSharesMsg {
-            coin_num,
-            packet: state.secret_shares(coin_num),
-        });
+        let packet = state.secret_shares(coin_num);
+        let filtered = filter_packet_to_decided(&packet, decided);
+        if !filtered.origins.is_empty() {
+            packets.push(RecoveredCoinSharesMsg {
+                coin_num,
+                packet: filtered,
+            });
+        }
     }
     MulticastRecoveredSharesMsg {
         origin: myid,
@@ -113,6 +150,26 @@ fn build_local_multicast(
 }
 
 impl Context {
+    async fn flush_pending_beacon_outputs(&mut self, round: Round, reason: &'static str) {
+        let pending = {
+            let Some(rbc_state) = self.round_state.get_mut(&round) else {
+                return;
+            };
+            std::mem::take(&mut rbc_state.pending_beacon_outputs)
+        };
+
+        for (coin_num, beacon) in pending.into_iter() {
+            log::info!(
+                "[PPT][BEACON-FLUSH] node {} round {} flushing coin {} via {}",
+                self.myid,
+                round,
+                coin_num,
+                reason,
+            );
+            self.self_coin_check_transmit(round, coin_num, beacon).await;
+        }
+    }
+
     pub async fn reconstruct_beacon(&mut self, round: Round, _coin_number: usize) {
         let now = SystemTime::now();
 
@@ -120,14 +177,22 @@ impl Context {
             let Some(rbc_state) = self.round_state.get(&round) else {
                 return;
             };
-            if rbc_state.acs_decided_set.is_none() {
+            let Some(decided) = rbc_state.acs_decided_set.clone() else {
                 return;
-            }
+            };
+
             (0..self.batch_size)
-                .map(|coin_num| {
+                .filter_map(|coin_num| {
                     let mut packet = rbc_state.secret_shares(coin_num);
                     packet.origin = self.myid;
-                    (coin_num, packet)
+
+                    // Only reconstruct ACS-decided dealers/messages.
+                    let filtered = filter_packet_to_decided(&packet, decided.as_slice());
+                    if filtered.origins.is_empty() {
+                        None
+                    } else {
+                        Some((coin_num, filtered))
+                    }
                 })
                 .collect::<Vec<_>>()
         };
@@ -143,6 +208,7 @@ impl Context {
             now.elapsed().unwrap().as_nanos(),
         );
     }
+
 
     pub async fn process_secret_shares(
         &mut self,
@@ -181,19 +247,33 @@ impl Context {
         }
 
         let decided = {
-            let rbc_state = self.round_state.get(&round).unwrap();
+            let rbc_state = self.round_state.get_mut(&round).unwrap();
+
             if rbc_state.cleared || rbc_state.batch_reconstruction_complete {
                 return;
             }
-            let Some(decided) = rbc_state.acs_decided_set.clone() else {
-                log::warn!(
-                    "[PPT][BATCH-RECV] round {} coin {} arrived before ACS finalization",
-                    round,
-                    coin_num
-                );
-                return;
-            };
-            decided
+
+            match rbc_state.acs_decided_set.clone() {
+                Some(decided) => decided,
+                None => {
+                    log::warn!(
+                        "[PPT][BATCH-CACHE] node {} caching BeaconConstruct from {} for round {} coin {} until ACS finalization",
+                        self.myid,
+                        share_sender,
+                        round,
+                        coin_num
+                    );
+                    rbc_state
+                        .pre_acs_beacon_constructs
+                        .push((recon_shares, share_sender, coin_num));
+
+                    self.add_benchmark(
+                        String::from("process_batchreconstruct"),
+                        now.elapsed().unwrap().as_nanos(),
+                    );
+                    return;
+                }
+            }
         };
 
         let theta = self.get_previous_theta(round.saturating_sub(1));
@@ -219,6 +299,7 @@ impl Context {
                 if !decided.contains(dealer) {
                     continue;
                 }
+
                 let Some(coeffs) = rbc_state
                     .degree_test_coeffs
                     .get(dealer)
@@ -277,7 +358,7 @@ impl Context {
             }
 
             log::info!(
-                "[PPT][BATCH-RECOVER] node {} round {} matrix ready, recovering {} coins in one batch",
+                "[PPT][BATCH-RECOVER] node {} round {} matrix ready, recovering ACS-decided dealers for {} coins in one batch",
                 self.myid,
                 round,
                 self.batch_size
@@ -304,7 +385,13 @@ impl Context {
 
             let multicast_msg = if !rbc_state.recovered_shares_multicast_sent {
                 rbc_state.recovered_shares_multicast_sent = true;
-                Some(build_local_multicast(rbc_state, round, self.myid, self.batch_size))
+                Some(build_local_multicast(
+                    rbc_state,
+                    round,
+                    self.myid,
+                    self.batch_size,
+                    decided.as_slice(),
+                ))
             } else {
                 None
             };
@@ -333,11 +420,18 @@ impl Context {
             }
         }
 
+        // Fast path: once batch recovery succeeds, do NOT block beacon output on
+        // full post-complaint multicast completion.
+        self.flush_pending_beacon_outputs(round, "fast-path after batch recovery")
+            .await;
+
         self.add_benchmark(
             String::from("process_batchreconstruct"),
             now.elapsed().unwrap().as_nanos(),
         );
     }
+
+
 
     pub async fn process_multicast_recovered_shares(
         &mut self,
@@ -394,6 +488,8 @@ impl Context {
                 return;
             }
 
+            // Keep the original completion rule for now, but this path no longer blocks
+            // beacon output. It is now only an asynchronous audit / blame path.
             if rbc_state.post_complaint_packets.len() < self.num_nodes {
                 return;
             }
@@ -437,6 +533,7 @@ impl Context {
                         break;
                     };
 
+                    // Only ACS-decided dealers are multicast now.
                     // Optional sender-side sanity check only: do not blame dealer for this.
                     if !crypto::aes_hash::Proof::validate_batch(&packet.mps, &self.hash_context) {
                         log::warn!(
@@ -505,25 +602,10 @@ impl Context {
                 self.myid,
                 round
             );
-
-            let pending = {
-                let rbc_state = self.round_state.get_mut(&round).unwrap();
-                std::mem::take(&mut rbc_state.pending_beacon_outputs)
-            };
-
-            for (coin_num, beacon) in pending.into_iter() {
-                log::info!(
-                    "[PPT][BEACON-FLUSH] node {} round {} flushing coin {} to syncer after post-complaint",
-                    self.myid,
-                    round,
-                    coin_num
-                );
-                self.self_coin_check_transmit(round, coin_num, beacon).await;
-            }
             return;
         }
 
-        let pending = {
+        {
             let rbc_state = self.round_state.get_mut(&round).unwrap();
             for (dealer, reason) in blame_events.into_iter() {
                 log::error!(
@@ -535,19 +617,9 @@ impl Context {
                 );
                 rbc_state.blame_dealer(dealer, round, reason);
             }
-            std::mem::take(&mut rbc_state.pending_beacon_outputs)
-        };
-
-        for (coin_num, beacon) in pending.into_iter() {
-            log::info!(
-                "[PPT][BEACON-FLUSH] node {} round {} flushing coin {} to syncer after post-blame",
-                self.myid,
-                round,
-                coin_num
-            );
-            self.self_coin_check_transmit(round, coin_num, beacon).await;
         }
     }
+
     /**
      * Beacons can be reconstructed in HashRand for two reasons:
      * a) For external consumption (which are sent to the syncer)
@@ -568,35 +640,42 @@ impl Context {
             }
 
             let committee = self.elect_committee(number.clone()).await;
-            let round_baa = round + self.rounds_aa + 3;
-            let round_baa_fin: Round = if round_baa % self.frequency == 0 {
-                round_baa
-            } else {
-                ((round_baa / self.frequency) + 1) * self.frequency
-            };
 
-            if let Some(next_state) = self.round_state.get_mut(&round_baa_fin) {
-                next_state.set_committee(committee);
-                let rbc_started_baa = next_state.started_baa;
-                log::info!(
-                    "[PPT][BEACON-FLUSH] node {} round {} future round {} exists, started_baa={}",
-                    self.myid,
-                    round,
-                    round_baa_fin,
-                    rbc_started_baa
-                );
-                if rbc_started_baa {
-                    self.check_begin_next_round(round_baa_fin).await;
+            // Pure PPT:
+            // the committee of round r directly bootstraps the next frequency round.
+            let next_round: Round = round + self.frequency;
+
+            if next_round <= self.max_rounds {
+                if !self.round_state.contains_key(&next_round) {
+                    let rbc_new_state = CTRBCState::new(self.secret_domain.clone(), self.num_nodes);
+                    self.round_state.insert(next_round, rbc_new_state);
+                    log::info!(
+                        "[PPT][ROUND-INIT] node {} round {} eagerly created future PPT round {}",
+                        self.myid,
+                        round,
+                        next_round
+                    );
                 }
-            } else {
-                log::info!(
-                    "[PPT][BEACON-FLUSH] node {} round {} future round {} not initialized yet; skip committee handoff for now",
-                    self.myid,
-                    round,
-                    round_baa_fin
-                );
+
+                {
+                    let next_state = self.round_state.get_mut(&next_round).unwrap();
+                    next_state.set_committee(committee.clone());
+                    next_state.ppt_round_started = false;
+                    log::info!(
+                        "[PPT][COMMITTEE-HANDOFF] node {} round {} stored committee {:?} into future PPT round {}",
+                        self.myid,
+                        round,
+                        committee,
+                        next_round
+                    );
+                }
+
+                self.ppt_try_start_round(next_round).await;
             }
         } else if is_last_coin {
+            if let Some(state) = self.round_state.get_mut(&round) {
+                state.ppt_round_finished = true;
+            }
             log::info!(
                 "Reconstruction ended for round {} at time {:?}",
                 round,
@@ -618,5 +697,4 @@ impl Context {
         ).await;
         self.add_cancel_handler(cancel_handler);
     }
-
 }

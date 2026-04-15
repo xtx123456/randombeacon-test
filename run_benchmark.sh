@@ -1,33 +1,36 @@
 #!/usr/bin/env bash
-# Compare BEA vs PPT over multiple batch sizes.
+# Fair BEA vs PPT benchmark for batch size = 20 only.
 #
 # Usage:
-#   bash run_benchmark.sh [duration_secs] [frequency] [batch_list_csv] [runs]
+#   bash run_benchmark.sh [duration_secs] [frequency] [runs]
 #
-# Examples:
+# Example:
 #   bash run_benchmark.sh
-#   bash run_benchmark.sh 60 10 5,10,20,50,100 3
+#   bash run_benchmark.sh 60 10 3
 #
 # Outputs:
 #   bench_results/<timestamp>/
 #     - summary.csv
 #     - *.log
 #
-# Notes:
-#   1) Throughput:
-#        - rounds/sec
-#        - reconstructions/sec
-#   2) "Latency" here is a sink-side observable proxy:
-#        - gap between consecutive "completed round" log timestamps
-#        - gap between consecutive "completed reconstruction" log timestamps
-#      This is NOT true end-to-end protocol latency.
+# Fairness principles:
+#   1) Use the SAME syncer-side event definitions for both protocols:
+#        - "All n nodes completed round X"                => one completed batch
+#        - "All n nodes completed reconstruction ... "    => one completed beacon output
+#   2) Do NOT multiply PPT rounds by frequency.
+#   3) Use completed-batch inter-arrival gaps as the main latency proxy.
+#   4) Report internal progress span separately:
+#        (last_round_id - first_round_id) / active_window
+#
+# This avoids the old unfair estimate:
+#   round_count_est_internal = round_count_raw * frequency
+# which still exists in the previous script. See current uploaded script. 
 
 set -euo pipefail
 
 DURATION="${1:-60}"
 FREQ="${2:-10}"
-BATCH_LIST_CSV="${3:-5,10,20,50,100}"
-RUNS="${4:-3}"
+RUNS="${3:-1}"
 
 ROOT="$(pwd)"
 TESTDIR="${TESTDIR:-$ROOT/testdata/cc_4}"
@@ -35,13 +38,13 @@ LOGDIR="${LOGDIR:-$ROOT/logs}"
 BIN="${BIN:-$ROOT/target/release/node}"
 TRI="${TRI:-32862}"
 
+BATCH=20
+PROTOCOLS=("bea" "ppt")
+
 STAMP="$(date +%Y%m%d_%H%M%S)"
 OUTDIR="$ROOT/bench_results/$STAMP"
 mkdir -p "$OUTDIR"
 mkdir -p "$LOGDIR"
-
-IFS=',' read -r -a BATCHES <<< "$BATCH_LIST_CSV"
-PROTOCOLS=("bea" "ppt")
 
 echo "=== Benchmark sweep start ==="
 echo "ROOT=$ROOT"
@@ -51,19 +54,21 @@ echo "BIN=$BIN"
 echo "OUTDIR=$OUTDIR"
 echo "DURATION=$DURATION"
 echo "FREQ=$FREQ"
-echo "BATCHES=${BATCHES[*]}"
+echo "BATCH=$BATCH"
 echo "RUNS=$RUNS"
 
 cleanup() {
     pkill -f "$ROOT/target/release/node" 2>/dev/null || true
     pkill -f "$ROOT/target/debug/node" 2>/dev/null || true
+    pkill -f "beacon-test.sh" 2>/dev/null || true
+    pkill -f "syncer" 2>/dev/null || true
 }
 
 write_header_if_needed() {
     local csv="$1"
     if [ ! -f "$csv" ]; then
         cat > "$csv" <<'EOF'
-protocol,batch,frequency,run,duration_sec,recon_count,recon_per_sec,round_count,round_per_sec,round_gap_count,round_gap_mean_ms,round_gap_median_ms,round_gap_p95_ms,recon_gap_count,recon_gap_mean_ms,recon_gap_median_ms,recon_gap_p95_ms,acs_trigger,acs_decide,acs_recon,batch_extract,two_field,blame,first_round_ts,last_round_ts
+protocol,batch,frequency,run,duration_sec,unique_batch_count,batch_throughput_wall,batch_active_window_sec,batch_throughput_active,first_batch_round,last_batch_round,internal_progress_span,internal_progress_units_per_sec,batch_gap_count,batch_gap_mean_ms,batch_gap_median_ms,batch_gap_p95_ms,unique_beacon_count,beacon_throughput_wall,beacon_active_window_sec,beacon_throughput_active,recon_gap_count,recon_gap_mean_ms,recon_gap_median_ms,recon_gap_p95_ms,acs_trigger,acs_decide,acs_recon,batch_recover,two_field,post_complaint,post_blame,first_batch_ts,last_batch_ts,first_beacon_ts,last_beacon_ts
 EOF
     fi
 }
@@ -73,12 +78,11 @@ write_header_if_needed "$SUMMARY_CSV"
 
 run_one_case() {
     local protocol="$1"
-    local batch="$2"
-    local run_id="$3"
+    local run_id="$2"
 
     echo
     echo "=================================================="
-    echo "Running protocol=$protocol batch=$batch freq=$FREQ run=$run_id duration=${DURATION}s"
+    echo "Running protocol=$protocol batch=$BATCH freq=$FREQ run=$run_id duration=${DURATION}s"
     echo "=================================================="
 
     cleanup
@@ -90,7 +94,6 @@ run_one_case() {
     curr_date=$(date +"%s%3N")
     local st_time=$((curr_date + 10000))
 
-    # Start syncer
     "$BIN" \
         --config "$TESTDIR/nodes-0.json" \
         --ip ip_file \
@@ -101,14 +104,13 @@ run_one_case() {
         --val 100 \
         --tri "$TRI" \
         --syncer "$TESTDIR/syncer" \
-        --batch "$batch" \
+        --batch "$BATCH" \
         --frequency "$FREQ" \
         > "$LOGDIR/syncer.log" 2>&1 &
     local SYNCER_PID=$!
 
     sleep 2
 
-    # Start 4 consensus nodes
     local NODE_PIDS=()
     for i in 0 1 2 3; do
         "$BIN" \
@@ -121,7 +123,7 @@ run_one_case() {
             --tri "$TRI" \
             --vsstype "$protocol" \
             --syncer "$TESTDIR/syncer" \
-            --batch "$batch" \
+            --batch "$BATCH" \
             --frequency "$FREQ" \
             > "$LOGDIR/${i}.log" 2>&1 &
         NODE_PIDS+=($!)
@@ -138,15 +140,13 @@ run_one_case() {
         wait "$pid" 2>/dev/null || true
     done
 
-    # Save raw logs for this case
-    local CASE_PREFIX="${protocol}_b${batch}_f${FREQ}_r${run_id}"
+    local CASE_PREFIX="${protocol}_b${BATCH}_f${FREQ}_r${run_id}"
     cp "$LOGDIR/syncer.log" "$OUTDIR/${CASE_PREFIX}_syncer.log"
     for i in 0 1 2 3; do
         [ -f "$LOGDIR/${i}.log" ] && cp "$LOGDIR/${i}.log" "$OUTDIR/${CASE_PREFIX}_node${i}.log"
     done
 
-    # Parse metrics using Python
-    python3 - "$OUTDIR/${CASE_PREFIX}_syncer.log" "$OUTDIR/${CASE_PREFIX}_node0.log" "$protocol" "$batch" "$FREQ" "$run_id" "$DURATION" "$SUMMARY_CSV" <<'PY'
+    python3 - "$OUTDIR/${CASE_PREFIX}_syncer.log" "$OUTDIR/${CASE_PREFIX}_node0.log" "$protocol" "$BATCH" "$FREQ" "$run_id" "$DURATION" "$SUMMARY_CSV" <<'PY'
 import sys, re, csv, statistics
 from datetime import datetime
 
@@ -160,8 +160,8 @@ duration = float(sys.argv[7])
 summary_csv = sys.argv[8]
 
 ts_pat = re.compile(r'^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)')
-round_pat = re.compile(r'All n nodes completed round ')
-recon_pat = re.compile(r'All n nodes completed reconstruction ')
+round_pat = re.compile(r'All n nodes completed round (\d+)')
+recon_pat = re.compile(r'All n nodes completed reconstruction for round (\d+) and index (\d+)')
 
 def parse_ts(line: str):
     m = ts_pat.search(line)
@@ -169,31 +169,25 @@ def parse_ts(line: str):
         return None
     return datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S.%fZ")
 
-round_ts = []
-recon_ts = []
+def fmt_float(x):
+    if x is None:
+        return ""
+    return f"{x:.6f}"
 
-with open(syncer_log, "r", encoding="utf-8", errors="ignore") as f:
-    for line in f:
-        t = parse_ts(line)
-        if t is None:
-            continue
-        if round_pat.search(line):
-            round_ts.append(t)
-        if recon_pat.search(line):
-            recon_ts.append(t)
+def active_window_sec(ts_list):
+    if len(ts_list) < 2:
+        return None
+    return (ts_list[-1] - ts_list[0]).total_seconds()
 
-round_count = len(round_ts)
-recon_count = len(recon_ts)
-round_per_sec = round_count / duration if duration > 0 else 0.0
-recon_per_sec = recon_count / duration if duration > 0 else 0.0
+def throughput(count, seconds):
+    if seconds is None or seconds <= 0:
+        return None
+    return count / seconds
 
 def gaps_ms(ts_list):
     if len(ts_list) < 2:
         return []
-    out = []
-    for a, b in zip(ts_list[:-1], ts_list[1:]):
-        out.append((b - a).total_seconds() * 1000.0)
-    return out
+    return [(b - a).total_seconds() * 1000.0 for a, b in zip(ts_list[:-1], ts_list[1:])]
 
 def stat_triplet(vals):
     if not vals:
@@ -201,21 +195,75 @@ def stat_triplet(vals):
     vals_sorted = sorted(vals)
     mean_v = statistics.mean(vals_sorted)
     median_v = statistics.median(vals_sorted)
-    p95_index = max(0, min(len(vals_sorted)-1, int(0.95 * (len(vals_sorted)-1))))
+    p95_index = max(0, min(len(vals_sorted) - 1, int(0.95 * (len(vals_sorted) - 1))))
     p95_v = vals_sorted[p95_index]
     return (len(vals_sorted), f"{mean_v:.6f}", f"{median_v:.6f}", f"{p95_v:.6f}")
 
-round_gaps = gaps_ms(round_ts)
+# Keep only UNIQUE syncer-confirmed events.
+round_first_ts = {}          # round_id -> first timestamp
+recon_first_ts = {}          # (round_id, coin_idx) -> first timestamp
+
+with open(syncer_log, "r", encoding="utf-8", errors="ignore") as f:
+    for line in f:
+        t = parse_ts(line)
+        if t is None:
+            continue
+
+        m_round = round_pat.search(line)
+        if m_round:
+            rid = int(m_round.group(1))
+            round_first_ts.setdefault(rid, t)
+            continue
+
+        m_recon = recon_pat.search(line)
+        if m_recon:
+            rid = int(m_recon.group(1))
+            coin = int(m_recon.group(2))
+            recon_first_ts.setdefault((rid, coin), t)
+            continue
+
+round_items = sorted(round_first_ts.items(), key=lambda kv: (kv[1], kv[0]))
+recon_items = sorted(recon_first_ts.items(), key=lambda kv: (kv[1], kv[0][0], kv[0][1]))
+
+round_ids = [rid for rid, _ in round_items]
+round_ts = [ts for _, ts in round_items]
+
+recon_keys = [k for k, _ in recon_items]
+recon_ts = [ts for _, ts in recon_items]
+
+unique_batch_count = len(round_ids)
+unique_beacon_count = len(recon_keys)
+
+batch_throughput_wall = throughput(unique_batch_count, duration)
+beacon_throughput_wall = throughput(unique_beacon_count, duration)
+
+batch_window = active_window_sec(round_ts)
+beacon_window = active_window_sec(recon_ts)
+
+batch_throughput_active = throughput(unique_batch_count, batch_window)
+beacon_throughput_active = throughput(unique_beacon_count, beacon_window)
+
+first_batch_round = round_ids[0] if round_ids else ""
+last_batch_round = round_ids[-1] if round_ids else ""
+internal_progress_span = (round_ids[-1] - round_ids[0]) if len(round_ids) >= 2 else ""
+internal_progress_units_per_sec = (
+    (round_ids[-1] - round_ids[0]) / batch_window
+    if len(round_ids) >= 2 and batch_window and batch_window > 0
+    else None
+)
+
+batch_gaps = gaps_ms(round_ts)
 recon_gaps = gaps_ms(recon_ts)
 
-round_gap_count, round_gap_mean, round_gap_median, round_gap_p95 = stat_triplet(round_gaps)
+batch_gap_count, batch_gap_mean, batch_gap_median, batch_gap_p95 = stat_triplet(batch_gaps)
 recon_gap_count, recon_gap_mean, recon_gap_median, recon_gap_p95 = stat_triplet(recon_gaps)
 
-first_round_ts = round_ts[0].strftime("%H:%M:%S.%f")[:-3] if round_ts else "N/A"
-last_round_ts = round_ts[-1].strftime("%H:%M:%S.%f")[:-3] if round_ts else "N/A"
+first_batch_ts = round_ts[0].strftime("%H:%M:%S.%f")[:-3] if round_ts else "N/A"
+last_batch_ts = round_ts[-1].strftime("%H:%M:%S.%f")[:-3] if round_ts else "N/A"
+first_beacon_ts = recon_ts[0].strftime("%H:%M:%S.%f")[:-3] if recon_ts else "N/A"
+last_beacon_ts = recon_ts[-1].strftime("%H:%M:%S.%f")[:-3] if recon_ts else "N/A"
 
-acs_trigger = acs_decide = acs_recon = batch_extract = two_field = blame = 0
-
+acs_trigger = acs_decide = acs_recon = batch_recover = two_field = post_complaint = post_blame = 0
 if protocol == "ppt":
     try:
         with open(node0_log, "r", encoding="utf-8", errors="ignore") as f:
@@ -223,9 +271,10 @@ if protocol == "ppt":
         acs_trigger = text.count("ACS-TRIGGER")
         acs_decide = text.count("ACS-DECIDE")
         acs_recon = text.count("ACS-RECON")
-        batch_extract = text.count("BATCH-EXTRACT")
+        batch_recover = text.count("BATCH-RECOVER")
         two_field = text.count("TWO-FIELD")
-        blame = text.count("BLAME")
+        post_complaint = text.count("POST-COMPLAINT")
+        post_blame = text.count("POST-BLAME")
     except FileNotFoundError:
         pass
 
@@ -235,14 +284,22 @@ row = [
     freq,
     run_id,
     int(duration),
-    recon_count,
-    f"{recon_per_sec:.6f}",
-    round_count,
-    f"{round_per_sec:.6f}",
-    round_gap_count,
-    round_gap_mean,
-    round_gap_median,
-    round_gap_p95,
+    unique_batch_count,
+    fmt_float(batch_throughput_wall),
+    fmt_float(batch_window),
+    fmt_float(batch_throughput_active),
+    first_batch_round,
+    last_batch_round,
+    internal_progress_span,
+    fmt_float(internal_progress_units_per_sec),
+    batch_gap_count,
+    batch_gap_mean,
+    batch_gap_median,
+    batch_gap_p95,
+    unique_beacon_count,
+    fmt_float(beacon_throughput_wall),
+    fmt_float(beacon_window),
+    fmt_float(beacon_throughput_active),
     recon_gap_count,
     recon_gap_mean,
     recon_gap_median,
@@ -250,11 +307,14 @@ row = [
     acs_trigger,
     acs_decide,
     acs_recon,
-    batch_extract,
+    batch_recover,
     two_field,
-    blame,
-    first_round_ts,
-    last_round_ts,
+    post_complaint,
+    post_blame,
+    first_batch_ts,
+    last_batch_ts,
+    first_beacon_ts,
+    last_beacon_ts,
 ]
 
 with open(summary_csv, "a", newline="", encoding="utf-8") as f:
@@ -266,36 +326,45 @@ print(f"Protocol: {protocol}")
 print(f"Batch size: {batch}")
 print(f"Frequency: {freq}")
 print(f"Duration (sec): {int(duration)}")
-print(f"Completed reconstructions: {recon_count}")
-print(f"Reconstructions/sec: {recon_per_sec:.6f}")
-print(f"Completed rounds: {round_count}")
-print(f"Rounds/sec: {round_per_sec:.6f}")
-print(f"Round gap count: {round_gap_count}")
-print(f"Round gap mean (ms): {round_gap_mean}")
-print(f"Round gap median (ms): {round_gap_median}")
-print(f"Round gap p95 (ms): {round_gap_p95}")
+print(f"Unique completed batches: {unique_batch_count}")
+print(f"Batch throughput (wall): {fmt_float(batch_throughput_wall)}")
+print(f"Batch active window (sec): {fmt_float(batch_window)}")
+print(f"Batch throughput (active): {fmt_float(batch_throughput_active)}")
+print(f"First batch round: {first_batch_round}")
+print(f"Last batch round: {last_batch_round}")
+print(f"Internal progress span: {internal_progress_span}")
+print(f"Internal progress units/sec: {fmt_float(internal_progress_units_per_sec)}")
+print(f"Batch gap count: {batch_gap_count}")
+print(f"Batch gap mean (ms): {batch_gap_mean}")
+print(f"Batch gap median (ms): {batch_gap_median}")
+print(f"Batch gap p95 (ms): {batch_gap_p95}")
+print(f"Unique completed beacon outputs: {unique_beacon_count}")
+print(f"Beacon throughput (wall): {fmt_float(beacon_throughput_wall)}")
+print(f"Beacon active window (sec): {fmt_float(beacon_window)}")
+print(f"Beacon throughput (active): {fmt_float(beacon_throughput_active)}")
 print(f"Recon gap count: {recon_gap_count}")
 print(f"Recon gap mean (ms): {recon_gap_mean}")
 print(f"Recon gap median (ms): {recon_gap_median}")
 print(f"Recon gap p95 (ms): {recon_gap_p95}")
-print(f"First round timestamp: {first_round_ts}")
-print(f"Last round timestamp: {last_round_ts}")
+print(f"First batch timestamp: {first_batch_ts}")
+print(f"Last batch timestamp: {last_batch_ts}")
+print(f"First beacon timestamp: {first_beacon_ts}")
+print(f"Last beacon timestamp: {last_beacon_ts}")
 if protocol == "ppt":
     print(f"ACS triggers: {acs_trigger}")
     print(f"ACS decisions: {acs_decide}")
     print(f"ACS reconstructions: {acs_recon}")
-    print(f"Batch extractions: {batch_extract}")
-    print(f"Two-field stores: {two_field}")
-    print(f"Blames: {blame}")
+    print(f"Batch recover: {batch_recover}")
+    print(f"Two-field logs: {two_field}")
+    print(f"Post-complaint logs: {post_complaint}")
+    print(f"Post-blame logs: {post_blame}")
 print("=== Case complete ===")
 PY
 }
 
 for protocol in "${PROTOCOLS[@]}"; do
-    for batch in "${BATCHES[@]}"; do
-        for run_id in $(seq 1 "$RUNS"); do
-            run_one_case "$protocol" "$batch" "$run_id"
-        done
+    for run_id in $(seq 1 "$RUNS"); do
+        run_one_case "$protocol" "$run_id"
     done
 done
 
