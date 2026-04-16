@@ -8,9 +8,6 @@ pub fn handle_local_output(
     dealers: HashSet<usize>,
     threshold: usize,
 ) -> Option<HashSet<usize>> {
-    st.record_output(from, dealers);
-    if st.try_decide_union(threshold) {
-        return st.decided_set.clone();
-    }
-    None
+    st.record_init(from, dealers);
+    st.maybe_build_output(threshold)
 }

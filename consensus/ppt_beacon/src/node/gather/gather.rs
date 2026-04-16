@@ -18,33 +18,38 @@ impl Context {
         round: u32,
     ) {
         let now = SystemTime::now();
+
         if !self.round_state.contains_key(&round) {
-            let rbc_new_state =
-                CTRBCState::new(BigUint::from_u16(0u16).unwrap(), self.num_nodes);
+            let rbc_new_state = CTRBCState::new(BigUint::from_u16(0u16).unwrap(), self.num_nodes);
             self.round_state.insert(round, rbc_new_state);
         }
+
         let rbc_state = self.round_state.get_mut(&round).unwrap();
+
         log::info!(
             "[PPT][GATHER] Received W1 from node {} for round {} with {:?}",
             echo_sender,
             round,
             wss_indices
         );
+
         if rbc_state.send_w2 {
-            log::warn!(
-                "[PPT][LEGACY-OFF] ignoring W1 from node {} for round {} because protocol already moved to W2",
+            log::debug!(
+                "[PPT][LATE-W1] dropping late W1 from node {} for round {} because local state already moved to W2",
                 echo_sender,
                 round
             );
             return;
-        } else {
-            rbc_state.witness1.insert(echo_sender, wss_indices);
-            self.add_benchmark(
-                String::from("process_gatherecho"),
-                now.elapsed().unwrap().as_nanos(),
-            );
-            self.witness_check(round).await;
         }
+
+        rbc_state.witness1.insert(echo_sender, wss_indices);
+
+        self.add_benchmark(
+            String::from("process_gatherecho"),
+            now.elapsed().unwrap().as_nanos(),
+        );
+
+        self.witness_check(round).await;
     }
 
     pub async fn process_gatherecho2(
@@ -54,23 +59,28 @@ impl Context {
         round: u32,
     ) {
         let now = SystemTime::now();
+
         if !self.round_state.contains_key(&round) {
-            let rbc_new_state =
-                CTRBCState::new(BigUint::from_u16(0u16).unwrap(), self.num_nodes);
+            let rbc_new_state = CTRBCState::new(BigUint::from_u16(0u16).unwrap(), self.num_nodes);
             self.round_state.insert(round, rbc_new_state);
         }
+
         let rbc_state = self.round_state.get_mut(&round).unwrap();
+
         log::info!(
             "[PPT][GATHER] Received W2 from node {} for round {} with {:?}",
             echo_sender,
             round,
             wss_indices
         );
+
         rbc_state.witness2.insert(echo_sender, wss_indices);
+
         self.add_benchmark(
             String::from("process_gatherecho"),
             now.elapsed().unwrap().as_nanos(),
         );
+
         self.witness_check(round).await;
     }
 
@@ -81,10 +91,12 @@ impl Context {
         }
 
         let mut msgs_to_be_sent: Vec<CoinMsg> = Vec::new();
+        let quorum = self.num_nodes - self.num_faults;
 
         {
             let rbc_state = self.round_state.get_mut(&round).unwrap();
-            let mut i = 0;
+
+            let mut satisfied = 0usize;
 
             if !rbc_state.send_w2 {
                 for (_replica, ss_inst) in rbc_state.witness1.clone().into_iter() {
@@ -92,24 +104,27 @@ impl Context {
                         .iter()
                         .all(|item| rbc_state.terminated_secrets.contains(item));
                     if check {
-                        i += 1;
+                        satisfied += 1;
                     }
                 }
 
-                if i >= self.num_nodes - self.num_faults {
+                if satisfied >= quorum {
                     log::info!(
                         "[PPT][GATHER] round {} W1 complete, local dealers = {:?}",
                         round,
                         rbc_state.terminated_secrets.clone()
                     );
 
-                    if round % self.frequency == 0 {
+                    // Pure PPT path: always advance to W2 once W1 reaches quorum.
+                    if !rbc_state.send_w2 {
                         log::info!(
-                            "[PPT][GATHER] Frequency round {}, sending W2 from node {}",
+                            "[PPT][PURE] round {} W1 quorum reached, sending W2 from node {}",
                             round,
                             self.myid
                         );
+
                         rbc_state.send_w2 = true;
+
                         msgs_to_be_sent.push(CoinMsg::GatherEcho2(
                             GatherMsg {
                                 nodes: rbc_state
@@ -121,11 +136,6 @@ impl Context {
                             self.myid,
                             round,
                         ));
-                    } else {
-                        log::info!(
-                            "[PPT][LEGACY-OFF] round {} W1 complete on non-frequency round; pure PPT does not enter BinAA/next_round_begin",
-                            round
-                        );
                     }
                 }
             } else {
@@ -134,11 +144,11 @@ impl Context {
                         .iter()
                         .all(|item| rbc_state.terminated_secrets.contains(item));
                     if check {
-                        i += 1;
+                        satisfied += 1;
                     }
                 }
 
-                if i >= self.num_nodes - self.num_faults && !rbc_state.ppt_acs_init_sent {
+                if satisfied >= quorum && !rbc_state.ppt_acs_init_sent {
                     let acs_dealers: Vec<Replica> =
                         rbc_state.terminated_secrets.clone().into_iter().collect();
 
@@ -149,11 +159,7 @@ impl Context {
                         acs_dealers.len()
                     );
 
-                    msgs_to_be_sent.push(CoinMsg::ACSInit((
-                        self.myid,
-                        round,
-                        acs_dealers,
-                    )));
+                    msgs_to_be_sent.push(CoinMsg::ACSInit((self.myid, round, acs_dealers)));
                     rbc_state.ppt_acs_init_sent = true;
                 }
             }
@@ -161,14 +167,11 @@ impl Context {
 
         for prot_msg in msgs_to_be_sent.iter() {
             self.broadcast(prot_msg.clone(), round).await;
+
             match prot_msg {
                 CoinMsg::GatherEcho2(gather, echo_sender, round_msg) => {
-                    self.process_gatherecho2(
-                        gather.nodes.clone(),
-                        *echo_sender,
-                        *round_msg,
-                    )
-                    .await;
+                    self.process_gatherecho2(gather.nodes.clone(), *echo_sender, *round_msg)
+                        .await;
                 }
                 CoinMsg::ACSInit((sender, round_msg, dealers)) => {
                     self.process_acs_init(*sender, *round_msg, dealers.clone())
