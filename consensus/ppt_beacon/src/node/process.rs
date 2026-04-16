@@ -89,14 +89,22 @@ impl Context {
             }
             CoinMsg::BeaconConstruct(shares, share_sender, coin_num, round) => {
                 log::debug!(
-                    "Received Beacon Construct message from node {} for coin number {} in round {}",
+                    "[PPT][LEGACY-BEACON-CONSTRUCT] received per-coin BeaconConstruct from node {} for coin {} in round {}",
+                    share_sender, coin_num, round
+                );
+                self.process_secret_shares(shares, share_sender, coin_num, round).await;
+            }
+
+            CoinMsg::BatchBeaconConstruct(msg, share_sender, round) => {
+                log::debug!(
+                    "[PPT][BATCH-BEACON-CONSTRUCT] received batched BeaconConstruct from node {} with {} coin-packets in round {}",
                     share_sender,
-                    coin_num,
+                    msg.packets.len(),
                     round
                 );
-                self.process_secret_shares(shares, share_sender, coin_num, round)
-                    .await;
+                self.process_batch_secret_shares(msg, share_sender, round).await;
             }
+
             CoinMsg::MulticastRecoveredShares(msg, sender, round) => {
                 log::info!(
                     "[PPT][MULTICAST-DISPATCH] node {} dispatching recovered-share multicast from {} for round {}",
@@ -104,8 +112,7 @@ impl Context {
                     sender,
                     round
                 );
-                self.process_multicast_recovered_shares(msg, sender, round)
-                    .await;
+                self.process_multicast_recovered_shares(msg, sender, round).await;
             }
             CoinMsg::ACSInit((sender, round, dealers)) => {
                 log::info!(

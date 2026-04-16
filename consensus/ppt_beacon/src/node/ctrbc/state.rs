@@ -26,6 +26,10 @@ pub enum BlameReason {
     CommitmentMismatch { coin_num: usize, expected_root: Hash, got_item: Hash },
     /// Merkle proof root mismatch during reconstruction verification
     MerkleRootMismatch { coin_num: usize, expected_root: Hash, got_root: Hash },
+    MissingDegreeTestCoeffs {
+        coin_num: usize,
+    },
+    MissingCommitmentVector,
 }
 
 use crate::node::{ShamirSecretSharing, appxcon::RoundState};
@@ -112,8 +116,18 @@ pub struct CTRBCState{
     pub post_complaint_packets: HashMap<Replica, MulticastRecoveredSharesMsg, nohash_hasher::BuildNoHashHasher<Replica>>,
     /// Have we already multicast our recovered-share disclosure for this round?
     pub recovered_shares_multicast_sent: bool,
-    /// Has the ACS-decided batch already been recovered?
+    /// Have all coins in the ACS-decided batch been fully processed?
     pub batch_reconstruction_complete: bool,
+
+    /// Coins that have already been batch-recovered.
+    pub recovered_coins: HashSet<usize,nohash_hasher::BuildNoHashHasher<usize>>,
+
+    /// Coins already exposed in our post-ACS accountability multicast snapshot.
+    pub multicast_disclosed_coins: HashSet<usize,nohash_hasher::BuildNoHashHasher<usize>>,
+
+    /// Coins whose beacon output has already been emitted / flushed.
+    pub emitted_beacon_coins: HashSet<usize,nohash_hasher::BuildNoHashHasher<usize>>,
+
     /// Has post-complaint processing completed?
     pub post_complaint_complete: bool,
     /// Beacon outputs computed by batch recovery, held back until post-complaint finishes.
@@ -169,8 +183,17 @@ impl CTRBCState{
             pre_acs_beacon_constructs: Vec::new(),
             post_complaint_packets: HashMap::default(),
             recovered_shares_multicast_sent: false,
+
             batch_reconstruction_complete: false,
+
+            recovered_coins: HashSet::default(),
+
+            multicast_disclosed_coins: HashSet::default(),
+
+            emitted_beacon_coins: HashSet::default(),
+
             post_complaint_complete: false,
+
             pending_beacon_outputs: HashMap::default(),
             round_state:HashMap::default(),
             cleared:false,
@@ -675,8 +698,17 @@ impl CTRBCState{
         self.post_complaint_packets.clear();
         self.pre_acs_beacon_constructs.clear();
         self.recovered_shares_multicast_sent = false;
+
         self.batch_reconstruction_complete = false;
+
+        self.recovered_coins.clear();
+
+        self.multicast_disclosed_coins.clear();
+
+        self.emitted_beacon_coins.clear();
+
         self.post_complaint_complete = false;
+
         self.pending_beacon_outputs.clear();
         self.cleared = true;
         self.node_secrets.clear();

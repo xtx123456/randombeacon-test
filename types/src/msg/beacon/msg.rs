@@ -157,10 +157,16 @@ pub enum CoinMsg{
     GatherEcho2(GatherMsg,Replica,Round),
     BinaryAAEcho(Vec<(Round,Vec<(Replica,Vec<u8>)>)>,Replica,Round),
     BinaryAAEcho2(Vec<(Round,Vec<(Replica,Vec<u8>)>)>,Replica,Round),
-    // The vector of shares, the source replica, the index in each batch and the round number.
+    // Legacy per-coin reconstruction message (kept for compatibility / replay paths).
     BeaconConstruct(BatchWSSReconMsg,Replica,Replica,Round),
-    // Post-ACS accountability multicast containing the sender's entire locally exposed share set.
+
+    // New batched reconstruction message: one network broadcast can carry many coin packets.
+    BatchBeaconConstruct(BatchBeaconConstructMsg,Replica,Round),
+
+    // Post-ACS accountability multicast containing the sender's locally exposed share set.
+    // In step-3 we may resend this as a growing snapshot as more coins recover.
     MulticastRecoveredShares(MulticastRecoveredSharesMsg,Replica,Round),
+
     BeaconValue(Round,Replica,u128),
     ACSInit((Replica,Round,Vec<Replica>)),
     ACSOutput((Replica,Round,Vec<Replica>)),
@@ -240,6 +246,14 @@ pub struct RecoveredCoinSharesMsg {
     pub coin_num: usize,
     pub packet: BatchWSSReconMsg,
 }
+
+#[derive(Debug,Serialize,Deserialize,Clone)]
+pub struct BatchBeaconConstructMsg {
+    pub origin: Replica,
+    pub round: Round,
+    pub packets: Vec<RecoveredCoinSharesMsg>,
+}
+
 
 #[derive(Debug,Serialize,Deserialize,Clone)]
 pub struct MulticastRecoveredSharesMsg {

@@ -1,16 +1,16 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     time::SystemTime,
 };
 
-use crypto::{
-    // aes_hash::MerkleTree,
-    hash::Hash,
-};
 use num_bigint::BigUint;
 use types::{
     beacon::{
-        BatchWSSReconMsg, CoinMsg, MulticastRecoveredSharesMsg, RecoveredCoinSharesMsg,
+        BatchBeaconConstructMsg,
+        BatchWSSReconMsg,
+        CoinMsg,
+        MulticastRecoveredSharesMsg,
+        RecoveredCoinSharesMsg,
     },
     beacon::Round,
     Replica,
@@ -64,77 +64,114 @@ fn filter_packet_to_decided(
     filtered
 }
 
-fn batch_ready(state: &CTRBCState, batch_size: usize) -> bool {
+fn ready_coins(state: &CTRBCState, batch_size: usize) -> Vec<usize> {
     let Some(extractor) = state.batch_extractor.as_ref() else {
-        return false;
+        return Vec::new();
     };
     let Some(decided) = state.acs_decided_set.as_ref() else {
-        return false;
+        return Vec::new();
     };
     if decided.is_empty() {
-        return false;
+        return Vec::new();
     }
 
+    let mut ready = Vec::new();
+
     for coin in 0..batch_size {
-        let Some(coin_map) = state.secret_shares.get(&coin) else {
-            return false;
-        };
-        for dealer in decided.iter().copied() {
-            let Some(provider_map) = coin_map.get(&dealer) else {
-                return false;
-            };
-            for eval_point in extractor.eval_points.iter().copied() {
-                let provider = eval_point - 1;
-                if !provider_map.contains_key(&provider) {
-                    return false;
-                }
-            }
+        if state.recovered_coins.contains(&coin) {
+            continue;
         }
-    }
-    true
-}
 
-fn build_batch_matrix(
-    state: &CTRBCState,
-    batch_size: usize,
-    num_nodes: usize,
-) -> HashMap<usize, HashMap<usize, BigUint>> {
-    let extractor = state.batch_extractor.as_ref().expect("batch_extractor missing");
-    let decided = state.acs_decided_set.as_ref().expect("acs_decided_set missing");
-
-    let mut shares_matrix: HashMap<usize, HashMap<usize, BigUint>> = HashMap::new();
-    for coin in 0..batch_size {
         let Some(coin_map) = state.secret_shares.get(&coin) else {
             continue;
         };
+
+        let mut coin_ready = true;
+
+        for dealer in decided.iter().copied() {
+            let Some(provider_map) = coin_map.get(&dealer) else {
+                coin_ready = false;
+                break;
+            };
+
+            for eval_point in extractor.eval_points.iter().copied() {
+                let provider = eval_point - 1;
+                if !provider_map.contains_key(&provider) {
+                    coin_ready = false;
+                    break;
+                }
+            }
+
+            if !coin_ready {
+                break;
+            }
+        }
+
+        if coin_ready {
+            ready.push(coin);
+        }
+    }
+
+    ready
+}
+
+fn build_batch_matrix_for_coins(
+    state: &CTRBCState,
+    ready_coin_nums: &[usize],
+    num_nodes: usize,
+) -> HashMap<usize, HashMap<usize, BigUint>> {
+    let extractor = state
+        .batch_extractor
+        .as_ref()
+        .expect("batch_extractor missing");
+    let decided = state
+        .acs_decided_set
+        .as_ref()
+        .expect("acs_decided_set missing");
+
+    let mut shares_matrix: HashMap<usize, HashMap<usize, BigUint>> = HashMap::new();
+
+    for coin in ready_coin_nums.iter().copied() {
+        let Some(coin_map) = state.secret_shares.get(&coin) else {
+            continue;
+        };
+
         for dealer in decided.iter().copied() {
             let Some(provider_map) = coin_map.get(&dealer) else {
                 continue;
             };
-            let mut entry = HashMap::new();
+
+            let mut entry: HashMap<usize, BigUint> = HashMap::new();
+
             for eval_point in extractor.eval_points.iter().copied() {
                 let provider = eval_point - 1;
                 if let Some(share) = provider_map.get(&provider) {
                     entry.insert(eval_point, share.clone());
                 }
             }
-            shares_matrix.insert(coin * num_nodes + dealer, entry);
+
+            if !entry.is_empty() {
+                shares_matrix.insert(coin * num_nodes + dealer, entry);
+            }
         }
     }
+
     shares_matrix
 }
 
-fn build_local_multicast(
+fn build_local_multicast_snapshot(
     state: &CTRBCState,
     round: Round,
     myid: Replica,
-    batch_size: usize,
     decided: &[Replica],
+    disclosed_coins: &[usize],
 ) -> MulticastRecoveredSharesMsg {
-    let mut packets = Vec::with_capacity(batch_size);
-    for coin_num in 0..batch_size {
+    let mut packets = Vec::with_capacity(disclosed_coins.len());
+
+    for coin_num in disclosed_coins.iter().copied() {
         let packet = state.secret_shares(coin_num);
         let filtered = filter_packet_to_decided(&packet, decided);
+
         if !filtered.origins.is_empty() {
             packets.push(RecoveredCoinSharesMsg {
                 coin_num,
@@ -142,7 +179,37 @@ fn build_local_multicast(
             });
         }
     }
+
     MulticastRecoveredSharesMsg {
+        origin: myid,
+        round,
+        packets,
+    }
+}
+
+fn build_local_batch_beacon_construct(
+    state: &CTRBCState,
+    round: Round,
+    myid: Replica,
+    batch_size: usize,
+    decided: &[Replica],
+) -> BatchBeaconConstructMsg {
+    let mut packets = Vec::with_capacity(batch_size);
+
+    for coin_num in 0..batch_size {
+        let mut packet = state.secret_shares(coin_num);
+        packet.origin = myid;
+        let filtered = filter_packet_to_decided(&packet, decided);
+
+        if !filtered.origins.is_empty() {
+            packets.push(RecoveredCoinSharesMsg {
+                coin_num,
+                packet: filtered,
+            });
+        }
+    }
+
+    BatchBeaconConstructMsg {
         origin: myid,
         round,
         packets,
@@ -170,47 +237,31 @@ impl Context {
         }
     }
 
-    pub async fn reconstruct_beacon(&mut self, round: Round, _coin_number: usize) {
-        let now = SystemTime::now();
+    pub async fn process_batch_secret_shares(
+        &mut self,
+        recovered: BatchBeaconConstructMsg,
+        sender: Replica,
+        round: Round,
+    ) {
+        log::info!(
+            "[PPT][BATCH-RECV] node {} got batched BeaconConstruct from {} for round {} with {} coin-packets",
+            self.myid,
+            sender,
+            round,
+            recovered.packets.len()
+        );
 
-        let packets = {
-            let Some(rbc_state) = self.round_state.get(&round) else {
-                return;
-            };
-            let Some(decided) = rbc_state.acs_decided_set.clone() else {
-                return;
-            };
-
-            (0..self.batch_size)
-                .filter_map(|coin_num| {
-                    let mut packet = rbc_state.secret_shares(coin_num);
-                    packet.origin = self.myid;
-
-                    // Only reconstruct ACS-decided dealers/messages.
-                    let filtered = filter_packet_to_decided(&packet, decided.as_slice());
-                    if filtered.origins.is_empty() {
-                        None
-                    } else {
-                        Some((coin_num, filtered))
-                    }
-                })
-                .collect::<Vec<_>>()
-        };
-
-        for (coin_num, packet) in packets.into_iter() {
-            let prot_msg = CoinMsg::BeaconConstruct(packet.clone(), self.myid, coin_num, round);
-            self.broadcast(prot_msg, round).await;
-            self.process_secret_shares(packet, self.myid, coin_num, round).await;
+        // Important:
+        // ingest the whole batched packet first, and only then trigger recovery ONCE.
+        // This avoids turning one batched message into 20 singleton recoveries.
+        for entry in recovered.packets.into_iter() {
+            self.ingest_secret_shares_only(entry.packet, sender, entry.coin_num, round);
         }
 
-        self.add_benchmark(
-            String::from("reconstruct_beacon"),
-            now.elapsed().unwrap().as_nanos(),
-        );
+        self.maybe_recover_ready_coins(round).await;
     }
 
-
-    pub async fn process_secret_shares(
+    fn ingest_secret_shares_only(
         &mut self,
         recon_shares: BatchWSSReconMsg,
         share_sender: Replica,
@@ -219,7 +270,7 @@ impl Context {
     ) {
         let now = SystemTime::now();
         log::info!(
-            "[PPT][BATCH-RECV] node {} got BeaconConstruct from {} for round {} coin {} origins {:?}",
+            "[PPT][BATCH-INGEST] node {} ingesting coin-packet from {} for round {} coin {} origins {:?}",
             self.myid,
             share_sender,
             round,
@@ -234,7 +285,7 @@ impl Context {
 
         if !packet_lengths_ok(&recon_shares) {
             log::warn!(
-                "[PPT][BATCH-RECV] dropping malformed packet from {} round {} coin {}",
+                "[PPT][BATCH-INGEST] dropping malformed packet from {} round {} coin {}",
                 share_sender,
                 round,
                 coin_num
@@ -249,7 +300,19 @@ impl Context {
         let decided = {
             let rbc_state = self.round_state.get_mut(&round).unwrap();
 
-            if rbc_state.cleared || rbc_state.batch_reconstruction_complete {
+            if rbc_state.cleared {
+                self.add_benchmark(
+                    String::from("process_batchreconstruct"),
+                    now.elapsed().unwrap().as_nanos(),
+                );
+                return;
+            }
+
+            if rbc_state.batch_reconstruction_complete {
+                self.add_benchmark(
+                    String::from("process_batchreconstruct"),
+                    now.elapsed().unwrap().as_nanos(),
+                );
                 return;
             }
 
@@ -284,6 +347,8 @@ impl Context {
             self.num_nodes,
         );
 
+        let mut missing_material_dealers: HashSet<Replica> = HashSet::new();
+
         {
             let rbc_state = self.round_state.get_mut(&round).unwrap();
             let use_for_batch = decided.contains(&share_sender);
@@ -305,12 +370,13 @@ impl Context {
                     .get(dealer)
                     .and_then(|coins| coins.get(coin_num))
                 else {
-                    log::warn!(
-                        "[PPT][TWO-FIELD] missing degree-test coeffs for dealer {} round {} coin {}",
+                    log::error!(
+                        "[PPT][TWO-FIELD-BLAME] missing degree-test coeffs for decided dealer {} round {} coin {}; blaming dealer and rejecting this share path",
                         dealer,
                         round,
                         coin_num
                     );
+                    missing_material_dealers.insert(*dealer);
                     continue;
                 };
 
@@ -336,18 +402,35 @@ impl Context {
                     rbc_state.add_secret_share(coin_num, *dealer, share_sender, *share);
                 }
             }
+
+            // Apply blame once per dealer for this packet/coin, instead of silently continuing.
+            for dealer in missing_material_dealers.iter().copied() {
+                rbc_state.blame_dealer(
+                    dealer,
+                    round,
+                    BlameReason::MissingDegreeTestCoeffs { coin_num },
+                );
+            }
         }
 
-        let should_recover = {
-            let rbc_state = self.round_state.get(&round).unwrap();
-            !rbc_state.batch_reconstruction_complete && batch_ready(rbc_state, self.batch_size)
+        self.add_benchmark(
+            String::from("process_batchreconstruct"),
+            now.elapsed().unwrap().as_nanos(),
+        );
+    }
+    
+    async fn maybe_recover_ready_coins(&mut self, round: Round) {
+        let ready = {
+            let Some(rbc_state) = self.round_state.get(&round) else {
+                return;
+            };
+            if rbc_state.batch_reconstruction_complete {
+                return;
+            }
+            ready_coins(rbc_state, self.batch_size)
         };
 
-        if !should_recover {
-            self.add_benchmark(
-                String::from("process_batchreconstruct"),
-                now.elapsed().unwrap().as_nanos(),
-            );
+        if ready.is_empty() {
             return;
         }
 
@@ -357,23 +440,31 @@ impl Context {
                 return;
             }
 
+            let decided = rbc_state
+                .acs_decided_set
+                .clone()
+                .expect("ACS decided set missing during ready-coin recovery");
+
             log::info!(
-                "[PPT][BATCH-RECOVER] node {} round {} matrix ready, recovering ACS-decided dealers for {} coins in one batch",
+                "[PPT][BATCH-RECOVER] node {} round {} recovering ready coins {:?}",
                 self.myid,
                 round,
-                self.batch_size
+                ready
             );
 
             let extractor = rbc_state
                 .batch_extractor
                 .clone()
                 .expect("ACS-decided BatchExtractor missing");
-            let shares_matrix = build_batch_matrix(rbc_state, self.batch_size, self.num_nodes);
+
+            let shares_matrix =
+                build_batch_matrix_for_coins(rbc_state, ready.as_slice(), self.num_nodes);
             let recovered = extractor.batch_recover(&shares_matrix);
 
             for (composite_key, secret) in recovered.into_iter() {
                 let coin = composite_key / self.num_nodes;
                 let dealer = composite_key % self.num_nodes;
+
                 rbc_state
                     .reconstructed_secrets
                     .entry(coin)
@@ -383,34 +474,48 @@ impl Context {
 
             rbc_state.sync_secret_maps().await;
 
-            let multicast_msg = if !rbc_state.recovered_shares_multicast_sent {
-                rbc_state.recovered_shares_multicast_sent = true;
-                Some(build_local_multicast(
+            let mut outputs = Vec::new();
+            for coin in ready.iter().copied() {
+                rbc_state.recovered_coins.insert(coin);
+
+                if !rbc_state.emitted_beacon_coins.contains(&coin) {
+                    if let Some(random) = rbc_state.coin_check(round, coin, self.num_nodes).await {
+                        outputs.push((coin, random));
+                    }
+                    rbc_state.emitted_beacon_coins.insert(coin);
+                }
+
+                rbc_state.multicast_disclosed_coins.insert(coin);
+            }
+
+            let mut disclosed: Vec<usize> =
+                rbc_state.multicast_disclosed_coins.iter().copied().collect();
+            disclosed.sort_unstable();
+
+            let multicast_msg = if disclosed.is_empty() {
+                None
+            } else {
+                Some(build_local_multicast_snapshot(
                     rbc_state,
                     round,
                     self.myid,
-                    self.batch_size,
                     decided.as_slice(),
+                    disclosed.as_slice(),
                 ))
-            } else {
-                None
             };
 
-            let mut outputs = Vec::new();
-            for coin in 0..self.batch_size {
-                if let Some(random) = rbc_state.coin_check(round, coin, self.num_nodes).await {
-                    outputs.push((coin, random));
-                }
+            if rbc_state.recovered_coins.len() >= self.batch_size {
+                rbc_state.batch_reconstruction_complete = true;
             }
 
-            rbc_state.batch_reconstruction_complete = true;
             (multicast_msg, outputs)
         };
 
         if let Some(msg) = multicast_msg {
             let coin_msg = CoinMsg::MulticastRecoveredShares(msg.clone(), self.myid, round);
             self.broadcast(coin_msg, round).await;
-            self.process_multicast_recovered_shares(msg, self.myid, round).await;
+            self.process_multicast_recovered_shares(msg, self.myid, round)
+                .await;
         }
 
         {
@@ -420,18 +525,61 @@ impl Context {
             }
         }
 
-        // Fast path: once batch recovery succeeds, do NOT block beacon output on
-        // full post-complaint multicast completion.
-        self.flush_pending_beacon_outputs(round, "fast-path after batch recovery")
+        self.flush_pending_beacon_outputs(round, "ready-coin fast-path")
             .await;
+    }
+    
+
+    pub async fn reconstruct_beacon(&mut self, round: Round, _coin_number: usize) {
+        let now = SystemTime::now();
+
+        let maybe_msg = {
+            let Some(rbc_state) = self.round_state.get(&round) else {
+                return;
+            };
+            let Some(decided) = rbc_state.acs_decided_set.clone() else {
+                return;
+            };
+
+            let msg = build_local_batch_beacon_construct(
+                rbc_state,
+                round,
+                self.myid,
+                self.batch_size,
+                decided.as_slice(),
+            );
+
+            if msg.packets.is_empty() {
+                None
+            } else {
+                Some(msg)
+            }
+        };
+
+        if let Some(msg) = maybe_msg {
+            let prot_msg = CoinMsg::BatchBeaconConstruct(msg.clone(), self.myid, round);
+            self.broadcast(prot_msg, round).await;
+            self.process_batch_secret_shares(msg, self.myid, round).await;
+        }
 
         self.add_benchmark(
-            String::from("process_batchreconstruct"),
+            String::from("reconstruct_beacon"),
             now.elapsed().unwrap().as_nanos(),
         );
     }
 
-
+    pub async fn process_secret_shares(
+        &mut self,
+        recon_shares: BatchWSSReconMsg,
+        share_sender: Replica,
+        coin_num: usize,
+        round: Round,
+    ) {
+        // Legacy / compatibility path:
+        // single packet ingest, then one recovery attempt.
+        self.ingest_secret_shares_only(recon_shares, share_sender, coin_num, round);
+        self.maybe_recover_ready_coins(round).await;
+    }
 
     pub async fn process_multicast_recovered_shares(
         &mut self,
@@ -449,6 +597,8 @@ impl Context {
             return;
         }
 
+        let threshold = self.num_nodes - self.num_faults;
+
         log::info!(
             "[PPT][POST-COMPLAINT-RECV] node {} round {} got recovered-share multicast from {}",
             self.myid,
@@ -456,7 +606,7 @@ impl Context {
             sender
         );
 
-        let (decided, comm_vectors, post_packets) = {
+        let (decided, comm_vectors, post_packets, audit_senders) = {
             let rbc_state = self.round_state.get_mut(&round).unwrap();
 
             if rbc_state.cleared {
@@ -469,14 +619,15 @@ impl Context {
                 return;
             }
 
+            // Latest snapshot from this sender overwrites previous one.
             rbc_state.post_complaint_packets.insert(sender, recovered);
 
             log::info!(
-                "[PPT][POST-COMPLAINT-COUNT] node {} round {} now has {}/{} recovered-share multicasts",
+                "[PPT][POST-COMPLAINT-COUNT] node {} round {} now has {}/{} recovered-share multicasts (async threshold)",
                 self.myid,
                 round,
                 rbc_state.post_complaint_packets.len(),
-                self.num_nodes
+                threshold
             );
 
             if rbc_state.post_complaint_complete {
@@ -488,17 +639,22 @@ impl Context {
                 return;
             }
 
-            // Keep the original completion rule for now, but this path no longer blocks
-            // beacon output. It is now only an asynchronous audit / blame path.
-            if rbc_state.post_complaint_packets.len() < self.num_nodes {
+            // Asynchronous completion rule: n-f snapshots are enough to run the audit.
+            if rbc_state.post_complaint_packets.len() < threshold {
                 return;
             }
 
+            let mut senders: Vec<Replica> = rbc_state.post_complaint_packets.keys().copied().collect();
+            senders.sort_unstable();
+            senders.truncate(threshold);
+
             rbc_state.post_complaint_complete = true;
+
             (
                 rbc_state.acs_decided_set.clone().unwrap_or_default(),
                 rbc_state.comm_vectors.clone(),
                 rbc_state.post_complaint_packets.clone(),
+                senders,
             )
         };
 
@@ -506,6 +662,13 @@ impl Context {
 
         for dealer in decided.into_iter() {
             let Some(root_vec) = comm_vectors.get(&dealer) else {
+                log::error!(
+                    "[PPT][POST-COMPLAINT-BLAME] node {} round {} missing commitment vector for decided dealer {}; blaming dealer",
+                    self.myid,
+                    round,
+                    dealer
+                );
+                blame_events.push((dealer, BlameReason::MissingCommitmentVector));
                 continue;
             };
 
@@ -517,7 +680,7 @@ impl Context {
                 let expected_root = root_vec[coin_num];
                 let mut complete = true;
 
-                for share_owner in 0..self.num_nodes {
+                for share_owner in audit_senders.iter().copied() {
                     let Some(packet_bundle) = post_packets.get(&share_owner) else {
                         complete = false;
                         break;
@@ -533,8 +696,6 @@ impl Context {
                         break;
                     };
 
-                    // Only ACS-decided dealers are multicast now.
-                    // Optional sender-side sanity check only: do not blame dealer for this.
                     if !crypto::aes_hash::Proof::validate_batch(&packet.mps, &self.hash_context) {
                         log::warn!(
                             "[PPT][POST-COMPLAINT-DROP] node {} round {} got invalid proof batch in multicast packet from share_owner {} for coin {}",
@@ -598,9 +759,10 @@ impl Context {
 
         if blame_events.is_empty() {
             log::info!(
-                "[PPT][POST-COMPLAINT] node {} round {} completed with no blame events",
+                "[PPT][POST-COMPLAINT] node {} round {} completed at async threshold {} with no blame events",
                 self.myid,
-                round
+                round,
+                threshold
             );
             return;
         }

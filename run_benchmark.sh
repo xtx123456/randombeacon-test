@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fair BEA vs PPT benchmark for batch size = 20 only.
+# Fair BEA vs PPT benchmark for multiple batch sizes.
 #
 # Usage:
 #   bash run_benchmark.sh [duration_secs] [frequency] [runs]
@@ -12,19 +12,6 @@
 #   bench_results/<timestamp>/
 #     - summary.csv
 #     - *.log
-#
-# Fairness principles:
-#   1) Use the SAME syncer-side event definitions for both protocols:
-#        - "All n nodes completed round X"                => one completed batch
-#        - "All n nodes completed reconstruction ... "    => one completed beacon output
-#   2) Do NOT multiply PPT rounds by frequency.
-#   3) Use completed-batch inter-arrival gaps as the main latency proxy.
-#   4) Report internal progress span separately:
-#        (last_round_id - first_round_id) / active_window
-#
-# This avoids the old unfair estimate:
-#   round_count_est_internal = round_count_raw * frequency
-# which still exists in the previous script. See current uploaded script. 
 
 set -euo pipefail
 
@@ -38,7 +25,8 @@ LOGDIR="${LOGDIR:-$ROOT/logs}"
 BIN="${BIN:-$ROOT/target/release/node}"
 TRI="${TRI:-32862}"
 
-BATCH=20
+# 定义要测试的所有 Batch Size
+BATCHES=(10 20 40 50 80 100)
 PROTOCOLS=("bea" "ppt")
 
 STAMP="$(date +%Y%m%d_%H%M%S)"
@@ -54,7 +42,7 @@ echo "BIN=$BIN"
 echo "OUTDIR=$OUTDIR"
 echo "DURATION=$DURATION"
 echo "FREQ=$FREQ"
-echo "BATCH=$BATCH"
+echo "BATCHES=${BATCHES[*]}"
 echo "RUNS=$RUNS"
 
 cleanup() {
@@ -78,7 +66,8 @@ write_header_if_needed "$SUMMARY_CSV"
 
 run_one_case() {
     local protocol="$1"
-    local run_id="$2"
+    local BATCH="$2"
+    local run_id="$3"
 
     echo
     echo "=================================================="
@@ -362,9 +351,12 @@ print("=== Case complete ===")
 PY
 }
 
+# 遍历所有协议、Batch Size和执行次数
 for protocol in "${PROTOCOLS[@]}"; do
-    for run_id in $(seq 1 "$RUNS"); do
-        run_one_case "$protocol" "$run_id"
+    for batch in "${BATCHES[@]}"; do
+        for run_id in $(seq 1 "$RUNS"); do
+            run_one_case "$protocol" "$batch" "$run_id"
+        done
     done
 done
 
