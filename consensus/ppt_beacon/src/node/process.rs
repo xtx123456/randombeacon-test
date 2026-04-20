@@ -560,6 +560,21 @@ impl Context {
         }
     }
 
+    async fn start_reconstruction_after_acs(
+        &mut self,
+        round: Round,
+        decided_vec: &[Replica],
+    ) {
+        log::info!(
+            "[PPT][ACS->RECON] node {} round {} immediately starting reconstruction for decided dealers {:?}",
+            self.myid,
+            round,
+            decided_vec
+        );
+
+        self.reconstruct_beacon(round, 0).await;
+    }
+
     #[async_recursion]
     async fn finalize_acs_round(&mut self, round: Round, mut decided_vec: Vec<Replica>) {
         decided_vec.sort_unstable();
@@ -583,6 +598,9 @@ impl Context {
             rbc_state.post_complaint_complete = false;
             rbc_state.post_complaint_packets.clear();
             rbc_state.pending_beacon_outputs.clear();
+            rbc_state.recovered_coins.clear();
+            rbc_state.multicast_disclosed_coins.clear();
+            rbc_state.emitted_beacon_coins.clear();
             rbc_state.ppt_round_finished = false;
 
             use crate::node::shamir::two_field::BatchExtractor;
@@ -606,7 +624,8 @@ impl Context {
             );
         };
 
-        self.reconstruct_beacon(round, 0).await;
+        self.start_reconstruction_after_acs(round, decided_vec.as_slice())
+            .await;
 
         let cancel_handler = self
             .sync_send
