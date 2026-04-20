@@ -79,12 +79,6 @@ impl Context {
             CoinMsg::CTRBCReconstruct(ctr, root, recon_sender) => {
                 self.process_reconstruct(ctr, root, recon_sender).await;
             }
-            CoinMsg::GatherEcho(gather, sender, round) => {
-                self.process_gatherecho(gather.nodes, sender, round).await;
-            }
-            CoinMsg::GatherEcho2(gather, sender, round) => {
-                self.process_gatherecho2(gather.nodes, sender, round).await;
-            }
             CoinMsg::BinaryAAEcho(_, echo_sender, round) => {
                 log::error!(
                     "[PPT][PURE] rejecting legacy BinaryAAEcho from {} for round {}",
@@ -125,6 +119,20 @@ impl Context {
                     round
                 );
                 self.process_multicast_recovered_shares(msg, sender, round).await;
+            }
+            CoinMsg::GatherEcho(_, sender, round) => {
+                log::warn!(
+                    "[PPT][GATHER-OFF] dropping legacy GatherEcho from {} for round {}",
+                    sender,
+                    round
+                );
+            }
+            CoinMsg::GatherEcho2(_, sender, round) => {
+                log::warn!(
+                    "[PPT][GATHER-OFF] dropping legacy GatherEcho2 from {} for round {}",
+                    sender,
+                    round
+                );
             }
             CoinMsg::ACSInit((sender, round, dealers)) => {
                 log::info!(

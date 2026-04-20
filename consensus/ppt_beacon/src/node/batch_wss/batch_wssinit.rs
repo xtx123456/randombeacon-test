@@ -100,14 +100,8 @@ impl Context {
             st.ppt_round_started = true;
             st.ppt_round_finished = false;
 
-            // Reset only the PPT runtime flags for this round.
-            st.send_w1 = false;
-            st.send_w2 = false;
-            st.ppt_acs_init_sent = false; // pure-PPT ACSInit one-shot guard // reused as ACS-trigger one-shot guard only
-            st.accepted_witnesses1.clear();
-            st.accepted_witnesses2.clear();
-            st.witness1.clear();
-            st.witness2.clear();
+            // Reset only the active PPT runtime flags for this round.
+            st.ppt_acs_init_sent = false;
 
             st.acs_decided_set = None;
             st.batch_extractor = None;

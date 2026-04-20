@@ -18,7 +18,7 @@ pub struct ACSInstanceState {
     pub round: usize,
     pub myid: usize,
 
-    /// Local completed dealers collected from the PPT gather path.
+    /// Local completed dealers collected directly from the AVSS path.
     pub completed_dealers: HashSet<usize>,
     pub proposed_set: HashSet<usize>,
 
