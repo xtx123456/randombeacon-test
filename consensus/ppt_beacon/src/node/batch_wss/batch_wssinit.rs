@@ -45,6 +45,7 @@ impl Context {
     ///
     /// Only committee members actively launch a local dealer instance.
     /// Other nodes mark the round as started passively and only receive/process messages.
+    #[async_recursion]
     pub async fn ppt_try_start_round(&mut self, target_round: Round) {
         if target_round > self.max_rounds {
             log::warn!(
@@ -142,6 +143,7 @@ impl Context {
     ///
     /// This is the PPT-native replacement for the legacy "next_round_begin" pipeline.
     /// It intentionally carries no appxcon payload.
+    #[async_recursion]
     async fn ppt_launch_exact_round(&mut self, new_round: Round) {
         let now = SystemTime::now();
 

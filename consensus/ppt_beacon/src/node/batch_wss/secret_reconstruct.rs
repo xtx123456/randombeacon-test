@@ -3,6 +3,7 @@ use std::{
     time::SystemTime,
 };
 
+use async_recursion::async_recursion;
 use num_bigint::BigUint;
 use types::{
     beacon::{
@@ -225,6 +226,7 @@ fn build_local_batch_beacon_construct(
 }
 
 impl Context {
+    #[async_recursion]
     async fn flush_pending_beacon_outputs(&mut self, round: Round, reason: &'static str) {
         let pending = {
             let rbc_state = match self.round_state.get_mut(&round) {
@@ -246,6 +248,7 @@ impl Context {
         }
     }
 
+    #[async_recursion]
     pub async fn process_batch_secret_shares(
         &mut self,
         recovered: BatchBeaconConstructMsg,
@@ -431,6 +434,7 @@ impl Context {
         );
     }
     
+    #[async_recursion]
     async fn maybe_recover_ready_coins(&mut self, round: Round) {
         let ready = {
             let rbc_state = match self.round_state.get(&round) {
@@ -543,6 +547,7 @@ impl Context {
     }
     
 
+    #[async_recursion]
     pub async fn reconstruct_beacon(&mut self, round: Round, _coin_number: usize) {
         let now = SystemTime::now();
 
@@ -817,6 +822,7 @@ impl Context {
      * We intentionally DO NOT clear round state here anymore; post-ACS complaint
      * needs the full disclosure data to remain available after batch recovery.
      */
+    #[async_recursion]
     pub async fn self_coin_check_transmit(&mut self, round: Round, coin_num: usize, number: Vec<u8>) {
         let is_last_coin = self.round_state
             .get(&round)

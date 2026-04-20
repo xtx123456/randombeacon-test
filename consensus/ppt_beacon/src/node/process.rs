@@ -1,5 +1,6 @@
 use std::{collections::HashSet, sync::Arc};
 
+use async_recursion::async_recursion;
 use crypto::hash::verf_mac;
 use num_bigint::BigUint;
 use types::{
@@ -155,6 +156,7 @@ impl Context {
         }
     }
 
+    #[async_recursion]
     pub(crate) async fn maybe_broadcast_acs_init_from_avss(&mut self, round: Round) {
         let threshold = self.num_nodes - self.num_faults;
 
@@ -351,6 +353,7 @@ impl Context {
         Some(transcript_root)
     }
 
+    #[async_recursion]
     pub async fn process_avss_send(
         &mut self,
         beacon_msg: types::beacon::BeaconMsg,
@@ -391,6 +394,7 @@ impl Context {
         }
     }
 
+    #[async_recursion]
     pub async fn process_avss_ready(
         &mut self,
         dealer: Replica,
@@ -415,6 +419,7 @@ impl Context {
         }
     }
 
+    #[async_recursion]
     pub async fn process_avss_complete(
         &mut self,
         dealer: Replica,
@@ -445,6 +450,7 @@ impl Context {
 }
 
 impl Context {
+    #[async_recursion]
     pub async fn process_acs_init(
         &mut self,
         sender: Replica,
@@ -496,6 +502,7 @@ impl Context {
         }
     }
 
+    #[async_recursion]
     pub async fn process_acs_output(
         &mut self,
         sender: Replica,
@@ -529,6 +536,7 @@ impl Context {
         }
     }
 
+    #[async_recursion]
     async fn finalize_acs_round(&mut self, round: Round, mut decided_vec: Vec<Replica>) {
         decided_vec.sort_unstable();
 
