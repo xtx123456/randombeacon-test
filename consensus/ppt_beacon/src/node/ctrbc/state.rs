@@ -620,9 +620,6 @@ impl CTRBCState{
 
         let decided = self.acs_decided_set.clone().unwrap_or_default();
         for rep in decided.into_iter() {
-            if !self.terminated_secrets.contains(&rep) {
-                continue;
-            }
             let batch_wss = match self.node_secrets.get(&rep) {
                 Some(batch_wss) => batch_wss,
                 None => continue,
