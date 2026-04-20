@@ -50,10 +50,24 @@ def fmt(x):
     return f"{x:.6f}"
 
 
-def stage_units_per_event(protocol: str, stage: str, batch_size: int) -> int:
-    if stage in ("batch_start", "batch_complete", "acs_decide", "gather_ready"):
-        return batch_size
-    if protocol == "ppt" and stage == "recon_start":
+PHASE_SOURCES = {
+    "ppt": {
+        "preprocess": "batch_complete",
+        "subset_convergence": "acs_decide",
+        "reconstruction": "recon_complete",
+        "beacon_output": "beacon_out",
+    },
+    "bea": {
+        "preprocess": "batch_complete",
+        "subset_convergence": "gather_ready",
+        "reconstruction": "recon_complete",
+        "beacon_output": "beacon_out",
+    },
+}
+
+
+def units_per_event(source: str, batch_size: int) -> int:
+    if source in ("batch_start", "batch_complete", "acs_decide", "gather_ready"):
         return batch_size
     return 1
 
@@ -99,7 +113,8 @@ def ensure_header(csv_path: Path):
         writer.writerow([
             "protocol",
             "batch",
-            "stage",
+            "phase",
+            "event_source",
             "event_count",
             "units_per_event",
             "total_units",
@@ -133,22 +148,26 @@ def main():
 
     ensure_header(out_csv)
 
+    phase_sources = PHASE_SOURCES[protocol]
+
     rows = []
-    for stage, ts_list in all_events.items():
+    for phase, source in phase_sources.items():
+        ts_list = all_events.get(source, [])
         if not ts_list:
             continue
         ts_list = sorted(ts_list)
-        units_per_event = stage_units_per_event(protocol, stage, batch_size)
-        total_units = len(ts_list) * units_per_event
+        event_units = units_per_event(source, batch_size)
+        total_units = len(ts_list) * event_units
         wall_tp = throughput(total_units, (ts_list[-1] - ts_list[0]).total_seconds() if len(ts_list) >= 2 else None)
         active_sec = active_window_sec(ts_list)
         active_tp = throughput(total_units, active_sec)
         rows.append([
             protocol,
             batch_size,
-            stage,
+            phase,
+            source,
             len(ts_list),
-            units_per_event,
+            event_units,
             total_units,
             fmt(wall_tp),
             fmt(active_sec),
@@ -163,7 +182,7 @@ def main():
 
     for row in rows:
         print(
-            f"{row[0]} batch={row[1]} stage={row[2]} events={row[3]} units={row[5]} active_tp={row[8] or 'NA'}"
+            f"{row[0]} batch={row[1]} phase={row[2]} source={row[3]} units={row[6]} active_tp={row[9] or 'NA'}"
         )
 
     return 0
