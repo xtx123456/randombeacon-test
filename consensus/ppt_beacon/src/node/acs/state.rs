@@ -77,14 +77,8 @@ impl ACSInstanceState {
     }
 
     /// Build exactly one local candidate once we have n-f ACSInit messages.
-    /// Instead of taking a raw union, only keep dealers that are supported by
-    /// at least `support_threshold` proposals. This is closer to a common-subset
-    /// style filter: Byzantine nodes cannot inject arbitrary dealers on their own.
-    pub fn maybe_build_output(
-        &mut self,
-        threshold: usize,
-        support_threshold: usize,
-    ) -> Option<HashSet<usize>> {
+    /// For performance, keep the repo's original quorum-union rule here.
+    pub fn maybe_build_output(&mut self, threshold: usize) -> Option<HashSet<usize>> {
         if let Some(existing) = self.decided_set.clone() {
             return Some(existing);
         }
@@ -93,27 +87,14 @@ impl ACSInstanceState {
             return None;
         }
 
-        let mut support_count: HashMap<usize, usize> = HashMap::new();
+        let mut union_set = HashSet::new();
         for dealers in self.outputs_seen.values() {
-            for dealer in dealers.iter().copied() {
-                *support_count.entry(dealer).or_insert(0) += 1;
-            }
+            union_set.extend(dealers.iter().copied());
         }
 
-        let decided: HashSet<usize> = support_count
-            .into_iter()
-            .filter_map(|(dealer, count)| {
-                if count >= support_threshold {
-                    Some(dealer)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        self.decided_set = Some(decided.clone());
+        self.decided_set = Some(union_set.clone());
         self.phase = ACSPhase::OutputBroadcast;
-        Some(decided)
+        Some(union_set)
     }
 
     pub fn mark_output_sent(&mut self) {

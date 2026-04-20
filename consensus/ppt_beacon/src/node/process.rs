@@ -489,7 +489,6 @@ impl Context {
         );
 
         let threshold = self.num_nodes - self.num_faults;
-        let support_threshold = self.num_faults + 1;
 
         let maybe_output = {
             let st = self
@@ -500,7 +499,7 @@ impl Context {
             let dealer_set = Self::replicas_to_set(&dealers);
             st.record_init(sender as usize, dealer_set);
 
-            let maybe = st.maybe_build_output(threshold, support_threshold);
+            let maybe = st.maybe_build_output(threshold);
             if maybe.is_some() && !st.output_sent {
                 st.mark_output_sent();
                 maybe
@@ -586,7 +585,7 @@ impl Context {
             decided_vec
         );
 
-        {
+        let replay_packets = {
             let rbc_state = self
                 .round_state
                 .entry(round)
@@ -622,10 +621,25 @@ impl Context {
                 decided_vec,
                 eval_points
             );
+            std::mem::take(&mut rbc_state.pre_acs_beacon_constructs)
         };
 
         self.start_reconstruction_after_acs(round, decided_vec.as_slice())
             .await;
+
+        if !replay_packets.is_empty() {
+            log::info!(
+                "[PPT][BATCH-REPLAY] node {} round {} replaying {} cached BeaconConstruct packets after ACS finalization",
+                self.myid,
+                round,
+                replay_packets.len()
+            );
+        }
+
+        for (packet, share_sender, coin_num) in replay_packets.into_iter() {
+            self.process_secret_shares(packet, share_sender, coin_num, round)
+                .await;
+        }
 
         let cancel_handler = self
             .sync_send
