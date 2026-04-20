@@ -155,6 +155,11 @@ impl Context {
             self.myid,
             new_round
         );
+        log::info!(
+            "[PPT][STAGE][BATCH-START] node {} round {}",
+            self.myid,
+            new_round
+        );
 
         let mut beacon_msgs = Vec::new();
 

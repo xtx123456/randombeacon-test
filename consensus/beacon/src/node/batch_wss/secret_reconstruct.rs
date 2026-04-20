@@ -10,6 +10,12 @@ impl Context{
      */
     pub async fn reconstruct_beacon(self: &mut Context, round:Round,mut coin_number:usize){
         let now = SystemTime::now();
+        log::info!(
+            "[BEA][STAGE][RECON-START] node {} round {} coin {}",
+            self.myid,
+            round,
+            coin_number
+        );
         let rbc_state = self.round_state.get_mut(&round).unwrap();
         rbc_state.sync_secret_maps().await;
         let mut vector_coins = Vec::new();
@@ -189,6 +195,12 @@ impl Context{
      * b) For internal consumption (for AnyTrust sampling and efficiency)
      */
     pub async fn self_coin_check_transmit(&mut self,round:Round,coin_num:usize,number:Vec<u8>){
+        log::info!(
+            "[BEA][STAGE][BEACON-OUT] node {} round {} coin {}",
+            self.myid,
+            round,
+            coin_num
+        );
         let rbc_state = self.round_state.get_mut(&round).unwrap();
         let recon_secrets_size = rbc_state.recon_secrets.len().clone();
         

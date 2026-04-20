@@ -96,6 +96,12 @@ impl Context {
             if i >= self.num_nodes-self.num_faults && !rbc_state.started_baa{
                 // Received n-f witness2s. Start approximate agreement from here. 
                 log::error!("Accepted n-f witness2 for node {} with set {:?}",self.myid,rbc_state.terminated_secrets.clone());
+                log::info!(
+                    "[BEA][STAGE][GATHER-READY] node {} round {} dealers {:?}",
+                    self.myid,
+                    round,
+                    rbc_state.terminated_secrets.clone()
+                );
                 rbc_state.started_baa = true;
                 // First beacon should have terminated. 
                 if round >= self.rounds_aa+3{

@@ -28,6 +28,11 @@ impl Context{
         }
         
         log::info!("Protocol started");
+        log::info!(
+            "[BEA][STAGE][BATCH-START] node {} round {}",
+            self.myid,
+            new_round
+        );
         let mut beacon_msgs = Vec::new();
         let mut rbc_vec = Vec::new();
         let vec_round_msgs:Vec<(Round,Vec<(Replica,Val)>)> = vec_round_vals.into_iter().map(|(x,y)| {

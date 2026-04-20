@@ -97,6 +97,7 @@ EOF
 
 SUMMARY_CSV="$OUTDIR/summary.csv"
 write_header_if_needed "$SUMMARY_CSV"
+STAGE_CSV="$OUTDIR/stage_summary.csv"
 
 run_one_case() {
     local protocol="$1"
@@ -397,6 +398,13 @@ if protocol == "ppt":
     print(f"Post-blame logs: {post_blame}")
 print("=== Case complete ===")
 PY
+
+    python3 "$ROOT/scripts/stage_throughput.py" \
+        "$OUTDIR/${CASE_PREFIX}_syncer.log" \
+        "$OUTDIR/${CASE_PREFIX}_node0.log" \
+        "$protocol" \
+        "$BATCH" \
+        "$STAGE_CSV"
 }
 
 for protocol in "${PROTOCOLS[@]}"; do

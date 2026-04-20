@@ -565,10 +565,21 @@ impl Context {
         decided_vec: &[Replica],
     ) {
         log::info!(
+            "[PPT][STAGE][ACS-DECIDE] node {} round {} dealers {:?}",
+            self.myid,
+            round,
+            decided_vec
+        );
+        log::info!(
             "[PPT][ACS->RECON] node {} round {} immediately starting reconstruction for decided dealers {:?}",
             self.myid,
             round,
             decided_vec
+        );
+        log::info!(
+            "[PPT][STAGE][RECON-START] node {} round {}",
+            self.myid,
+            round
         );
 
         self.reconstruct_beacon(round, 0).await;

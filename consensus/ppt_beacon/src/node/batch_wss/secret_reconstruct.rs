@@ -824,6 +824,12 @@ impl Context {
      */
     #[async_recursion]
     pub async fn self_coin_check_transmit(&mut self, round: Round, coin_num: usize, number: Vec<u8>) {
+        log::info!(
+            "[PPT][STAGE][BEACON-OUT] node {} round {} coin {}",
+            self.myid,
+            round,
+            coin_num
+        );
         let is_last_coin = self.round_state
             .get(&round)
             .map(|state| state.recon_secrets.contains(&(self.batch_size - 1)))
