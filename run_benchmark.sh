@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
-# Fair BEA vs PPT benchmark for multiple batch sizes.
+# Fair BEA vs PPT benchmark for 16-node setting, batch size = 20.
 #
 # Usage:
-#   bash run_benchmark.sh [duration_secs] [frequency] [runs]
+#   TESTDIR=/path/to/testdata/cc_16 bash run_benchmark.sh [duration_secs] [frequency] [runs]
 #
 # Example:
-#   bash run_benchmark.sh
-#   bash run_benchmark.sh 60 10 3
+#   TESTDIR="$PWD/testdata/cc_16" bash run_benchmark.sh 60 1 1
 #
 # Outputs:
 #   bench_results/<timestamp>/
@@ -16,18 +15,51 @@
 set -euo pipefail
 
 DURATION="${1:-60}"
-FREQ="${2:-10}"
+FREQ="${2:-1}"
 RUNS="${3:-1}"
 
-ROOT="$(pwd)"
-TESTDIR="${TESTDIR:-$ROOT/testdata/cc_4}"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TESTDIR="${TESTDIR:-$ROOT/testdata/cc_16}"
 LOGDIR="${LOGDIR:-$ROOT/logs}"
 BIN="${BIN:-$ROOT/target/release/node}"
 TRI="${TRI:-32862}"
+IP_FILE="${IP_FILE:-$ROOT/ip_file}"
 
-# 定义要测试的所有 Batch Size
-BATCHES=(10 20 40 50 80 100)
+# 你目前只要 batch=20
+BATCHES=(20 50 100)
 PROTOCOLS=("bea" "ppt")
+
+if [ ! -x "$BIN" ]; then
+    echo "Error: binary not found or not executable: $BIN"
+    echo "Please build first: cargo build --release"
+    exit 1
+fi
+
+if [ ! -d "$TESTDIR" ]; then
+    echo "Error: TESTDIR does not exist: $TESTDIR"
+    exit 1
+fi
+
+if [ ! -f "$IP_FILE" ]; then
+    echo "Error: ip_file not found: $IP_FILE"
+    exit 1
+fi
+
+if [ ! -f "$TESTDIR/syncer" ]; then
+    echo "Error: syncer file not found in $TESTDIR"
+    exit 1
+fi
+
+NODE_COUNT=$(find "$TESTDIR" -maxdepth 1 -type f -name 'nodes-*.json' | wc -l | tr -d ' ')
+if [ "${NODE_COUNT}" -le 0 ]; then
+    echo "Error: no nodes-*.json found in $TESTDIR"
+    exit 1
+fi
+
+if [ ! -f "$TESTDIR/nodes-0.json" ]; then
+    echo "Error: missing $TESTDIR/nodes-0.json"
+    exit 1
+fi
 
 STAMP="$(date +%Y%m%d_%H%M%S)"
 OUTDIR="$ROOT/bench_results/$STAMP"
@@ -39,7 +71,9 @@ echo "ROOT=$ROOT"
 echo "TESTDIR=$TESTDIR"
 echo "LOGDIR=$LOGDIR"
 echo "BIN=$BIN"
+echo "IP_FILE=$IP_FILE"
 echo "OUTDIR=$OUTDIR"
+echo "NODE_COUNT=$NODE_COUNT"
 echo "DURATION=$DURATION"
 echo "FREQ=$FREQ"
 echo "BATCHES=${BATCHES[*]}"
@@ -49,14 +83,14 @@ cleanup() {
     pkill -f "$ROOT/target/release/node" 2>/dev/null || true
     pkill -f "$ROOT/target/debug/node" 2>/dev/null || true
     pkill -f "beacon-test.sh" 2>/dev/null || true
-    pkill -f "syncer" 2>/dev/null || true
+    pkill -f "/syncer" 2>/dev/null || true
 }
 
 write_header_if_needed() {
     local csv="$1"
     if [ ! -f "$csv" ]; then
         cat > "$csv" <<'EOF'
-protocol,batch,frequency,run,duration_sec,unique_batch_count,batch_throughput_wall,batch_active_window_sec,batch_throughput_active,first_batch_round,last_batch_round,internal_progress_span,internal_progress_units_per_sec,batch_gap_count,batch_gap_mean_ms,batch_gap_median_ms,batch_gap_p95_ms,unique_beacon_count,beacon_throughput_wall,beacon_active_window_sec,beacon_throughput_active,recon_gap_count,recon_gap_mean_ms,recon_gap_median_ms,recon_gap_p95_ms,acs_trigger,acs_decide,acs_recon,batch_recover,two_field,post_complaint,post_blame,first_batch_ts,last_batch_ts,first_beacon_ts,last_beacon_ts
+protocol,batch,frequency,run,duration_sec,node_count,unique_batch_count,batch_throughput_wall,batch_active_window_sec,batch_throughput_active,first_batch_round,last_batch_round,internal_progress_span,internal_progress_units_per_sec,batch_gap_count,batch_gap_mean_ms,batch_gap_median_ms,batch_gap_p95_ms,unique_beacon_count,beacon_throughput_wall,beacon_active_window_sec,beacon_throughput_active,recon_gap_count,recon_gap_mean_ms,recon_gap_median_ms,recon_gap_p95_ms,acs_trigger,acs_decide,acs_recon,batch_recover,two_field,post_complaint,post_blame,first_batch_ts,last_batch_ts,first_beacon_ts,last_beacon_ts
 EOF
     fi
 }
@@ -71,7 +105,7 @@ run_one_case() {
 
     echo
     echo "=================================================="
-    echo "Running protocol=$protocol batch=$BATCH freq=$FREQ run=$run_id duration=${DURATION}s"
+    echo "Running protocol=$protocol batch=$BATCH freq=$FREQ run=$run_id duration=${DURATION}s nodes=$NODE_COUNT"
     echo "=================================================="
 
     cleanup
@@ -85,7 +119,7 @@ run_one_case() {
 
     "$BIN" \
         --config "$TESTDIR/nodes-0.json" \
-        --ip ip_file \
+        --ip "$IP_FILE" \
         --sleep "$st_time" \
         --vsstype sync \
         --epsilon 10 \
@@ -101,10 +135,10 @@ run_one_case() {
     sleep 2
 
     local NODE_PIDS=()
-    for i in 0 1 2 3; do
+    for ((i=0; i<NODE_COUNT; i++)); do
         "$BIN" \
             --config "$TESTDIR/nodes-${i}.json" \
-            --ip ip_file \
+            --ip "$IP_FILE" \
             --sleep "$st_time" \
             --epsilon 10 \
             --delta 10 \
@@ -129,13 +163,25 @@ run_one_case() {
         wait "$pid" 2>/dev/null || true
     done
 
-    local CASE_PREFIX="${protocol}_b${BATCH}_f${FREQ}_r${run_id}"
+    local CASE_PREFIX="${protocol}_n${NODE_COUNT}_b${BATCH}_f${FREQ}_r${run_id}"
     cp "$LOGDIR/syncer.log" "$OUTDIR/${CASE_PREFIX}_syncer.log"
-    for i in 0 1 2 3; do
-        [ -f "$LOGDIR/${i}.log" ] && cp "$LOGDIR/${i}.log" "$OUTDIR/${CASE_PREFIX}_node${i}.log"
+
+    for ((i=0; i<NODE_COUNT; i++)); do
+        if [ -f "$LOGDIR/${i}.log" ]; then
+            cp "$LOGDIR/${i}.log" "$OUTDIR/${CASE_PREFIX}_node${i}.log"
+        fi
     done
 
-    python3 - "$OUTDIR/${CASE_PREFIX}_syncer.log" "$OUTDIR/${CASE_PREFIX}_node0.log" "$protocol" "$BATCH" "$FREQ" "$run_id" "$DURATION" "$SUMMARY_CSV" <<'PY'
+    python3 - \
+        "$OUTDIR/${CASE_PREFIX}_syncer.log" \
+        "$OUTDIR/${CASE_PREFIX}_node0.log" \
+        "$protocol" \
+        "$BATCH" \
+        "$FREQ" \
+        "$run_id" \
+        "$DURATION" \
+        "$NODE_COUNT" \
+        "$SUMMARY_CSV" <<'PY'
 import sys, re, csv, statistics
 from datetime import datetime
 
@@ -146,7 +192,8 @@ batch = int(sys.argv[4])
 freq = int(sys.argv[5])
 run_id = int(sys.argv[6])
 duration = float(sys.argv[7])
-summary_csv = sys.argv[8]
+node_count = int(sys.argv[8])
+summary_csv = sys.argv[9]
 
 ts_pat = re.compile(r'^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)')
 round_pat = re.compile(r'All n nodes completed round (\d+)')
@@ -188,9 +235,8 @@ def stat_triplet(vals):
     p95_v = vals_sorted[p95_index]
     return (len(vals_sorted), f"{mean_v:.6f}", f"{median_v:.6f}", f"{p95_v:.6f}")
 
-# Keep only UNIQUE syncer-confirmed events.
-round_first_ts = {}          # round_id -> first timestamp
-recon_first_ts = {}          # (round_id, coin_idx) -> first timestamp
+round_first_ts = {}
+recon_first_ts = {}
 
 with open(syncer_log, "r", encoding="utf-8", errors="ignore") as f:
     for line in f:
@@ -273,6 +319,7 @@ row = [
     freq,
     run_id,
     int(duration),
+    node_count,
     unique_batch_count,
     fmt_float(batch_throughput_wall),
     fmt_float(batch_window),
@@ -312,8 +359,9 @@ with open(summary_csv, "a", newline="", encoding="utf-8") as f:
 
 print("=== Results ===")
 print(f"Protocol: {protocol}")
+print(f"Node count: {node_count}")
 print(f"Batch size: {batch}")
-print(f"Frequency: {freq}")
+print(f"Frequency arg: {freq}")
 print(f"Duration (sec): {int(duration)}")
 print(f"Unique completed batches: {unique_batch_count}")
 print(f"Batch throughput (wall): {fmt_float(batch_throughput_wall)}")
@@ -351,7 +399,6 @@ print("=== Case complete ===")
 PY
 }
 
-# 遍历所有协议、Batch Size和执行次数
 for protocol in "${PROTOCOLS[@]}"; do
     for batch in "${BATCHES[@]}"; do
         for run_id in $(seq 1 "$RUNS"); do

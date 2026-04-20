@@ -2,7 +2,7 @@ use std::{collections::HashMap, time::SystemTime};
 
 use crypto::hash::Hash;
 use num_bigint::BigUint;
-use types::{beacon::CTRBCMsg, beacon::{CoinMsg, GatherMsg, Replica}};
+use types::{beacon::CTRBCMsg, beacon::Replica};
 
 use crate::node::{Context, CTRBCState};
 
@@ -16,7 +16,6 @@ impl Context {
         let round = ctrbc.round;
         let rbc_state = self.round_state.get_mut(&ctrbc.round).unwrap();
         let sec_origin = ctrbc.origin;
-        let mut msgs_to_be_sent: Vec<CoinMsg> = Vec::new();
         log::info!(
             "Received RECON message from {} for secret from {} in round {}",
             recon_sender,
@@ -54,20 +53,6 @@ impl Context {
             Some(_res) => {
                 let beacon_msg = rbc_state.transform(sec_origin);
                 let term_secrets = rbc_state.terminated_secrets.len();
-                if term_secrets >= self.num_nodes - self.num_faults && !rbc_state.send_w1 {
-                    log::info!("Terminated n-f Batch WSSs, sending list of first n-f Batch WSSs to other nodes");
-                    log::info!("Terminated : {:?}", rbc_state.terminated_secrets);
-                    log::info!("Terminated n-f wss instances. Sending echo2 message to everyone");
-                    rbc_state.send_w1 = true;
-                    let broadcast_msg = CoinMsg::GatherEcho(
-                        GatherMsg {
-                            nodes: rbc_state.terminated_secrets.clone().into_iter().collect(),
-                        },
-                        self.myid,
-                        round,
-                    );
-                    msgs_to_be_sent.push(broadcast_msg);
-                }
                 if beacon_msg.appx_con.is_some() {
                     for (round_iter, messages) in beacon_msg.appx_con.clone().unwrap().into_iter() {
                         let appx_con_vals = messages
@@ -85,16 +70,11 @@ impl Context {
                         }
                     }
                 }
-                if term_secrets >= self.num_nodes - self.num_faults {
-                    self.witness_check(round).await;
+                let should_trigger_acs = term_secrets >= self.num_nodes - self.num_faults;
+                let _ = rbc_state;
+                if should_trigger_acs {
+                    self.maybe_broadcast_acs_init_from_avss(round).await;
                 }
-            }
-        }
-        for prot_msg in msgs_to_be_sent.iter() {
-            self.broadcast(prot_msg.clone(), round).await;
-            if let CoinMsg::GatherEcho(gather_msg, echo_sender, round) = prot_msg {
-                self.process_gatherecho(gather_msg.nodes.clone(), *echo_sender, *round).await;
-                self.witness_check(*round).await;
             }
         }
     }

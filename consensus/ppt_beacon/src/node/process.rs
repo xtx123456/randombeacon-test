@@ -7,6 +7,7 @@ use types::{
 };
 
 use crate::node::acs::state::ACSInstanceState;
+use crate::node::acs::init::build_local_proposal;
 
 use super::Context;
 
@@ -142,6 +143,62 @@ impl Context {
         if round >= self.curr_round {
             self.curr_round = round + 1;
         }
+    }
+
+    pub(crate) async fn maybe_broadcast_acs_init_from_avss(&mut self, round: Round) {
+        let threshold = self.num_nodes - self.num_faults;
+
+        let maybe_payload = {
+            let Some(rbc_state) = self.round_state.get(&round) else {
+                return;
+            };
+
+            if rbc_state.terminated_secrets.len() < threshold {
+                return;
+            }
+
+            let st = self
+                .acs_state
+                .entry(round)
+                .or_insert_with(|| ACSInstanceState::new(round as usize, self.myid));
+
+            if st.init_sent {
+                return;
+            }
+
+            st.completed_dealers.clear();
+            for dealer in rbc_state.terminated_secrets.iter().copied() {
+                st.mark_completed(dealer);
+            }
+
+            let local_dealers: Vec<Replica> = {
+                let mut dealers: Vec<Replica> = build_local_proposal(st)
+                    .into_iter()
+                    .map(|dealer| dealer as Replica)
+                    .collect();
+                dealers.sort_unstable();
+                dealers
+            };
+
+            st.init_sent = true;
+            Some(local_dealers)
+        };
+
+        let Some(local_dealers) = maybe_payload else {
+            return;
+        };
+
+        log::info!(
+            "[PPT][ACS-FASTPATH] node {} round {} AVSS completed for {} dealers; broadcasting ACSInit directly from terminated AVSS state {:?}",
+            self.myid,
+            round,
+            local_dealers.len(),
+            local_dealers
+        );
+
+        let init_msg = CoinMsg::ACSInit((self.myid, round, local_dealers.clone()));
+        self.broadcast(init_msg, round).await;
+        self.process_acs_init(self.myid, round, local_dealers).await;
     }
 }
 
