@@ -2,7 +2,7 @@ use std::{collections::{HashMap, HashSet}};
 
 use crypto::{hash::{Hash, do_hash}, aes_hash::{Proof, HashState, MerkleTree}};
 use num_bigint::{BigUint};
-use types::{Replica, appxcon::{ reconstruct_and_return, get_shards}, beacon::{WSSMsg, CTRBCMsg, Val, MulticastRecoveredSharesMsg}, beacon::{BeaconMsg, BatchWSSMsg, Round}};
+use types::{Replica, appxcon::{ reconstruct_and_return, get_shards}, beacon::{WSSMsg, CTRBCMsg, Val, BatchWSSReconMsg, MulticastRecoveredSharesMsg}, beacon::{BeaconMsg, BatchWSSMsg, Round}};
 
 use crate::node::shamir::two_field::BatchExtractor;
 
