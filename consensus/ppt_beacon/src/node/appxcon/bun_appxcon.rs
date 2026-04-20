@@ -81,7 +81,7 @@ impl Context{
         if round%self.frequency == 0{
             let mut index_returnval_vector = Vec::new();
             for index in rbc_state.committee.clone().into_iter(){
-                if !rbc_state.terminated_secrets.contains(&index) {
+                if !rbc_state.avss_completed_dealers.contains(&index) {
                     let zero = BigUint::from(0u32);
                     index_returnval_vector.push((index,zero));
                 }

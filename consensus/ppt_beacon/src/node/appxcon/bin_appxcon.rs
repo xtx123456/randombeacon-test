@@ -1,7 +1,6 @@
 use std::{time::{SystemTime}, collections::HashMap};
 
 use async_recursion::async_recursion;
-use num_bigint::BigUint;
 use types::{beacon::{ CoinMsg, Round}, Replica};
 
 use crate::node::{Context, CTRBCState, appxcon::RoundState};
