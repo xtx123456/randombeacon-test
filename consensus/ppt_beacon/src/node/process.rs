@@ -167,6 +167,7 @@ impl Context {
     #[async_recursion]
     pub(crate) async fn maybe_broadcast_acs_init_from_avss(&mut self, round: Round) {
         let threshold = self.num_nodes - self.num_faults;
+        let support_threshold = self.num_faults + 1;
 
         let maybe_payload = {
             let rbc_state = match self.round_state.get(&round) {
@@ -484,7 +485,7 @@ impl Context {
             let dealer_set = Self::replicas_to_set(&dealers);
             st.record_init(sender as usize, dealer_set);
 
-            let maybe = st.maybe_build_output(threshold);
+            let maybe = st.maybe_build_output(threshold, support_threshold);
             if maybe.is_some() && !st.output_sent {
                 st.mark_output_sent();
                 maybe
