@@ -67,17 +67,32 @@ impl Context {
             CoinMsg::AVSSComplete(dealer, transcript_root, sender, round) => {
                 self.process_avss_complete(dealer, transcript_root, sender, round).await;
             }
-            CoinMsg::CTRBCInit(beaconmsg, ctr) => {
-                self.process_rbcinit(beaconmsg, ctr).await;
+            CoinMsg::CTRBCInit(_, ctr) => {
+                log::warn!(
+                    "[PPT][CTRBC-OFF] dropping legacy CTRBCInit for round {}",
+                    ctr.round
+                );
             }
-            CoinMsg::CTRBCEcho(ctr, root, echo_sender) => {
-                self.process_echo(ctr, root, echo_sender).await;
+            CoinMsg::CTRBCEcho(ctr, _, echo_sender) => {
+                log::warn!(
+                    "[PPT][CTRBC-OFF] dropping legacy CTRBCEcho from {} for round {}",
+                    echo_sender,
+                    ctr.round
+                );
             }
-            CoinMsg::CTRBCReady(ctr, root, ready_sender) => {
-                self.process_ready(ctr, root, ready_sender).await;
+            CoinMsg::CTRBCReady(ctr, _, ready_sender) => {
+                log::warn!(
+                    "[PPT][CTRBC-OFF] dropping legacy CTRBCReady from {} for round {}",
+                    ready_sender,
+                    ctr.round
+                );
             }
-            CoinMsg::CTRBCReconstruct(ctr, root, recon_sender) => {
-                self.process_reconstruct(ctr, root, recon_sender).await;
+            CoinMsg::CTRBCReconstruct(ctr, _, recon_sender) => {
+                log::warn!(
+                    "[PPT][CTRBC-OFF] dropping legacy CTRBCReconstruct from {} for round {}",
+                    recon_sender,
+                    ctr.round
+                );
             }
             CoinMsg::BinaryAAEcho(_, echo_sender, round) => {
                 log::error!(
@@ -167,9 +182,6 @@ impl Context {
     #[async_recursion]
     pub(crate) async fn maybe_broadcast_acs_init_from_avss(&mut self, round: Round) {
         let threshold = self.num_nodes - self.num_faults;
-        let support_threshold = self.num_faults + 1;
-        let support_threshold = self.num_faults + 1;
-        let support_threshold = self.num_faults + 1;
 
         let maybe_payload = {
             let rbc_state = match self.round_state.get(&round) {
@@ -477,6 +489,7 @@ impl Context {
         );
 
         let threshold = self.num_nodes - self.num_faults;
+        let support_threshold = self.num_faults + 1;
 
         let maybe_output = {
             let st = self
@@ -558,7 +571,7 @@ impl Context {
             decided_vec
         );
 
-        let replay_packets = {
+        {
             let rbc_state = self
                 .round_state
                 .entry(round)
@@ -591,25 +604,9 @@ impl Context {
                 decided_vec,
                 eval_points
             );
-
-            std::mem::take(&mut rbc_state.pre_acs_beacon_constructs)
         };
 
         self.reconstruct_beacon(round, 0).await;
-
-        if !replay_packets.is_empty() {
-            log::info!(
-                "[PPT][BATCH-REPLAY] node {} round {} replaying {} cached BeaconConstruct packets after ACS finalization",
-                self.myid,
-                round,
-                replay_packets.len()
-            );
-        }
-
-        for (packet, share_sender, coin_num) in replay_packets.into_iter() {
-            self.process_secret_shares(packet, share_sender, coin_num, round)
-                .await;
-        }
 
         let cancel_handler = self
             .sync_send

@@ -2,7 +2,7 @@ use std::{collections::{HashMap, HashSet}};
 
 use crypto::{hash::{Hash, do_hash}, aes_hash::{Proof, HashState, MerkleTree}};
 use num_bigint::{BigUint};
-use types::{Replica, appxcon::{ reconstruct_and_return, get_shards}, beacon::{WSSMsg, CTRBCMsg, Val, BatchWSSReconMsg, MulticastRecoveredSharesMsg}, beacon::{BeaconMsg, BatchWSSMsg, Round}};
+use types::{Replica, appxcon::{ reconstruct_and_return, get_shards}, beacon::{WSSMsg, CTRBCMsg, Val, MulticastRecoveredSharesMsg}, beacon::{BeaconMsg, BatchWSSMsg, Round}};
 
 use crate::node::shamir::two_field::BatchExtractor;
 
@@ -144,9 +144,6 @@ pub struct CTRBCState{
     pub post_complaint_complete: bool,
     /// Beacon outputs computed by batch recovery, held back until post-complaint finishes.
     pub pending_beacon_outputs: HashMap<usize,Vec<u8>,nohash_hasher::BuildNoHashHasher<usize>>,
-    /// BeaconConstruct packets that arrived before ACS finalization.
-    /// Tuple = (packet, share_sender, coin_num)
-    pub pre_acs_beacon_constructs: Vec<(BatchWSSReconMsg, Replica, usize)>,
     /// Legacy Binary-AA round states (kept for compatibility during refactor; PPT path should stop using them)
     pub round_state: HashMap<Round,RoundState>,
     pub cleared:bool,
@@ -198,7 +195,6 @@ impl CTRBCState{
             acs_decided_set: None,
             malicious_dealers: HashSet::default(),
             blame_log: Vec::new(),
-            pre_acs_beacon_constructs: Vec::new(),
             post_complaint_packets: HashMap::default(),
             recovered_shares_multicast_sent: false,
 
@@ -807,7 +803,6 @@ impl CTRBCState{
         self.witness2.clear();
         self.terminated_secrets.clear();
         self.post_complaint_packets.clear();
-        self.pre_acs_beacon_constructs.clear();
         self.recovered_shares_multicast_sent = false;
 
         self.batch_reconstruction_complete = false;

@@ -345,14 +345,9 @@ impl Context {
                             self.add_cancel_handler(cancel_handler);
                         }
                         SyncState::StartRecon => {
-                            log::error!(
-                                "[PPT] Reconstruction Start time: {:?}",
-                                SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .unwrap()
-                                    .as_millis()
+                            log::warn!(
+                                "[PPT][SYNC-OFF] ignoring legacy StartRecon trigger; reconstruction now starts only after ACS finalization"
                             );
-                            self.reconstruct_beacon(0, 0).await;
                         }
                         SyncState::STOP => {
                             log::error!(

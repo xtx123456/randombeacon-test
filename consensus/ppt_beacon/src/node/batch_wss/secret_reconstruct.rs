@@ -332,15 +332,12 @@ impl Context {
                 Some(decided) => decided,
                 None => {
                     log::warn!(
-                        "[PPT][BATCH-CACHE] node {} caching BeaconConstruct from {} for round {} coin {} until ACS finalization",
+                        "[PPT][BATCH-DROP] node {} dropping pre-ACS BeaconConstruct from {} for round {} coin {}",
                         self.myid,
                         share_sender,
                         round,
                         coin_num
                     );
-                    rbc_state
-                        .pre_acs_beacon_constructs
-                        .push((recon_shares, share_sender, coin_num));
 
                     self.add_benchmark(
                         String::from("process_batchreconstruct"),
