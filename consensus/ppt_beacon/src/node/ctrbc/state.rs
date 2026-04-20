@@ -533,12 +533,30 @@ impl CTRBCState{
             if !self.terminated_secrets.contains(&rep) {
                 continue;
             }
-            let Some(batch_wss) = self.node_secrets.get(&rep) else { continue; };
-            let Some(secret) = batch_wss.secrets.get(coin_number) else { continue; };
-            let Some(nonce) = batch_wss.nonces.get(coin_number) else { continue; };
-            let Some(merkle_proof) = batch_wss.mps.get(coin_number) else { continue; };
-            let Some(mask) = self.mask_shares.get(&rep).and_then(|v| v.get(coin_number)) else { continue; };
-            let Some(f_large) = self.f_large_shares.get(&rep).and_then(|v| v.get(coin_number)) else { continue; };
+            let batch_wss = match self.node_secrets.get(&rep) {
+                Some(batch_wss) => batch_wss,
+                None => continue,
+            };
+            let secret = match batch_wss.secrets.get(coin_number) {
+                Some(secret) => secret,
+                None => continue,
+            };
+            let nonce = match batch_wss.nonces.get(coin_number) {
+                Some(nonce) => nonce,
+                None => continue,
+            };
+            let merkle_proof = match batch_wss.mps.get(coin_number) {
+                Some(merkle_proof) => merkle_proof,
+                None => continue,
+            };
+            let mask = match self.mask_shares.get(&rep).and_then(|v| v.get(coin_number)) {
+                Some(mask) => mask,
+                None => continue,
+            };
+            let f_large = match self.f_large_shares.get(&rep).and_then(|v| v.get(coin_number)) {
+                Some(f_large) => f_large,
+                None => continue,
+            };
 
             shares_vector.push(*secret);
             nonces.push(*nonce);

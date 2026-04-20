@@ -149,8 +149,9 @@ impl Context {
         let threshold = self.num_nodes - self.num_faults;
 
         let maybe_payload = {
-            let Some(rbc_state) = self.round_state.get(&round) else {
-                return;
+            let rbc_state = match self.round_state.get(&round) {
+                Some(rbc_state) => rbc_state,
+                None => return,
             };
 
             if rbc_state.terminated_secrets.len() < threshold {
@@ -184,8 +185,9 @@ impl Context {
             Some(local_dealers)
         };
 
-        let Some(local_dealers) = maybe_payload else {
-            return;
+        let local_dealers = match maybe_payload {
+            Some(local_dealers) => local_dealers,
+            None => return,
         };
 
         log::info!(

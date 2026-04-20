@@ -65,11 +65,13 @@ fn filter_packet_to_decided(
 }
 
 fn ready_coins(state: &CTRBCState, batch_size: usize) -> Vec<usize> {
-    let Some(extractor) = state.batch_extractor.as_ref() else {
-        return Vec::new();
+    let extractor = match state.batch_extractor.as_ref() {
+        Some(extractor) => extractor,
+        None => return Vec::new(),
     };
-    let Some(decided) = state.acs_decided_set.as_ref() else {
-        return Vec::new();
+    let decided = match state.acs_decided_set.as_ref() {
+        Some(decided) => decided,
+        None => return Vec::new(),
     };
     if decided.is_empty() {
         return Vec::new();
@@ -82,16 +84,20 @@ fn ready_coins(state: &CTRBCState, batch_size: usize) -> Vec<usize> {
             continue;
         }
 
-        let Some(coin_map) = state.secret_shares.get(&coin) else {
-            continue;
+        let coin_map = match state.secret_shares.get(&coin) {
+            Some(coin_map) => coin_map,
+            None => continue,
         };
 
         let mut coin_ready = true;
 
         for dealer in decided.iter().copied() {
-            let Some(provider_map) = coin_map.get(&dealer) else {
-                coin_ready = false;
-                break;
+            let provider_map = match coin_map.get(&dealer) {
+                Some(provider_map) => provider_map,
+                None => {
+                    coin_ready = false;
+                    break;
+                }
             };
 
             for eval_point in extractor.eval_points.iter().copied() {
@@ -132,13 +138,15 @@ fn build_batch_matrix_for_coins(
     let mut shares_matrix: HashMap<usize, HashMap<usize, BigUint>> = HashMap::new();
 
     for coin in ready_coin_nums.iter().copied() {
-        let Some(coin_map) = state.secret_shares.get(&coin) else {
-            continue;
+        let coin_map = match state.secret_shares.get(&coin) {
+            Some(coin_map) => coin_map,
+            None => continue,
         };
 
         for dealer in decided.iter().copied() {
-            let Some(provider_map) = coin_map.get(&dealer) else {
-                continue;
+            let provider_map = match coin_map.get(&dealer) {
+                Some(provider_map) => provider_map,
+                None => continue,
             };
 
             let mut entry: HashMap<usize, BigUint> = HashMap::new();
@@ -219,8 +227,9 @@ fn build_local_batch_beacon_construct(
 impl Context {
     async fn flush_pending_beacon_outputs(&mut self, round: Round, reason: &'static str) {
         let pending = {
-            let Some(rbc_state) = self.round_state.get_mut(&round) else {
-                return;
+            let rbc_state = match self.round_state.get_mut(&round) {
+                Some(rbc_state) => rbc_state,
+                None => return,
             };
             std::mem::take(&mut rbc_state.pending_beacon_outputs)
         };
@@ -365,19 +374,22 @@ impl Context {
                     continue;
                 }
 
-                let Some(coeffs) = rbc_state
+                let coeffs = match rbc_state
                     .degree_test_coeffs
                     .get(dealer)
                     .and_then(|coins| coins.get(coin_num))
-                else {
-                    log::error!(
-                        "[PPT][TWO-FIELD-BLAME] missing degree-test coeffs for decided dealer {} round {} coin {}; blaming dealer and rejecting this share path",
-                        dealer,
-                        round,
-                        coin_num
-                    );
-                    missing_material_dealers.insert(*dealer);
-                    continue;
+                {
+                    Some(coeffs) => coeffs,
+                    None => {
+                        log::error!(
+                            "[PPT][TWO-FIELD-BLAME] missing degree-test coeffs for decided dealer {} round {} coin {}; blaming dealer and rejecting this share path",
+                            dealer,
+                            round,
+                            coin_num
+                        );
+                        missing_material_dealers.insert(*dealer);
+                        continue;
+                    }
                 };
 
                 let f_large = BigUint::from_bytes_be(f_large_share);
@@ -421,8 +433,9 @@ impl Context {
     
     async fn maybe_recover_ready_coins(&mut self, round: Round) {
         let ready = {
-            let Some(rbc_state) = self.round_state.get(&round) else {
-                return;
+            let rbc_state = match self.round_state.get(&round) {
+                Some(rbc_state) => rbc_state,
+                None => return,
             };
             if rbc_state.batch_reconstruction_complete {
                 return;
@@ -534,11 +547,13 @@ impl Context {
         let now = SystemTime::now();
 
         let maybe_msg = {
-            let Some(rbc_state) = self.round_state.get(&round) else {
-                return;
+            let rbc_state = match self.round_state.get(&round) {
+                Some(rbc_state) => rbc_state,
+                None => return,
             };
-            let Some(decided) = rbc_state.acs_decided_set.clone() else {
-                return;
+            let decided = match rbc_state.acs_decided_set.clone() {
+                Some(decided) => decided,
+                None => return,
             };
 
             let msg = build_local_batch_beacon_construct(
@@ -661,15 +676,18 @@ impl Context {
         let mut blame_events: Vec<(Replica, BlameReason)> = Vec::new();
 
         for dealer in decided.into_iter() {
-            let Some(root_vec) = comm_vectors.get(&dealer) else {
-                log::error!(
-                    "[PPT][POST-COMPLAINT-BLAME] node {} round {} missing commitment vector for decided dealer {}; blaming dealer",
-                    self.myid,
-                    round,
-                    dealer
-                );
-                blame_events.push((dealer, BlameReason::MissingCommitmentVector));
-                continue;
+            let root_vec = match comm_vectors.get(&dealer) {
+                Some(root_vec) => root_vec,
+                None => {
+                    log::error!(
+                        "[PPT][POST-COMPLAINT-BLAME] node {} round {} missing commitment vector for decided dealer {}; blaming dealer",
+                        self.myid,
+                        round,
+                        dealer
+                    );
+                    blame_events.push((dealer, BlameReason::MissingCommitmentVector));
+                    continue;
+                }
             };
 
             for coin_num in 0..self.batch_size {
@@ -681,19 +699,25 @@ impl Context {
                 let mut complete = true;
 
                 for share_owner in audit_senders.iter().copied() {
-                    let Some(packet_bundle) = post_packets.get(&share_owner) else {
-                        complete = false;
-                        break;
+                    let packet_bundle = match post_packets.get(&share_owner) {
+                        Some(packet_bundle) => packet_bundle,
+                        None => {
+                            complete = false;
+                            break;
+                        }
                     };
 
-                    let Some(packet) = packet_bundle
+                    let packet = match packet_bundle
                         .packets
                         .iter()
                         .find(|entry| entry.coin_num == coin_num)
                         .map(|entry| &entry.packet)
-                    else {
-                        complete = false;
-                        break;
+                    {
+                        Some(packet) => packet,
+                        None => {
+                            complete = false;
+                            break;
+                        }
                     };
 
                     if !crypto::aes_hash::Proof::validate_batch(&packet.mps, &self.hash_context) {
@@ -708,9 +732,12 @@ impl Context {
                         break;
                     }
 
-                    let Some(idx) = packet.origins.iter().position(|origin| *origin == dealer) else {
-                        complete = false;
-                        break;
+                    let idx = match packet.origins.iter().position(|origin| *origin == dealer) {
+                        Some(idx) => idx,
+                        None => {
+                            complete = false;
+                            break;
+                        }
                     };
 
                     let share = packet.secrets[idx];
