@@ -7,7 +7,8 @@ pub fn handle_local_output(
     from: usize,
     dealers: HashSet<usize>,
     threshold: usize,
+    support_threshold: usize,
 ) -> Option<HashSet<usize>> {
     st.record_init(from, dealers);
-    st.maybe_build_output(threshold)
+    st.maybe_build_output(threshold, support_threshold)
 }

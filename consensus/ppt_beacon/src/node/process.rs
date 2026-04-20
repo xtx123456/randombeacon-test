@@ -168,6 +168,7 @@ impl Context {
     pub(crate) async fn maybe_broadcast_acs_init_from_avss(&mut self, round: Round) {
         let threshold = self.num_nodes - self.num_faults;
         let support_threshold = self.num_faults + 1;
+        let support_threshold = self.num_faults + 1;
 
         let maybe_payload = {
             let rbc_state = match self.round_state.get(&round) {
