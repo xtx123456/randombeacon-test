@@ -169,6 +169,7 @@ impl Context {
         let threshold = self.num_nodes - self.num_faults;
         let support_threshold = self.num_faults + 1;
         let support_threshold = self.num_faults + 1;
+        let support_threshold = self.num_faults + 1;
 
         let maybe_payload = {
             let rbc_state = match self.round_state.get(&round) {
