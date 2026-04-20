@@ -3,7 +3,7 @@ use std::{ time::SystemTime};
 use async_recursion::async_recursion;
 use crypto::{hash::{do_hash, Hash}, aes_hash::MerkleTree};
 use num_bigint::{BigUint, RandBigInt};
-use types::{appxcon::get_shards, beacon::{BatchWSSMsg, CoinMsg, CTRBCMsg, WrapperMsg, Val}, Replica, beacon::{Round, BeaconMsg}};
+use types::{beacon::{BatchWSSMsg, CoinMsg, WrapperMsg, Val}, Replica, beacon::{Round, BeaconMsg}};
 
 use crate::node::{Context, ShamirSecretSharing, CTRBCState};
 use crate::node::shamir::two_field::TwoFieldDealer;
@@ -161,7 +161,6 @@ impl Context {
         );
 
         let mut beacon_msgs = Vec::new();
-        let mut rbc_vec = Vec::new();
 
         // Pure PPT: no legacy appxcon payload.
         let vec_round_msgs: Vec<(Round,Vec<(Replica,Val)>)> = Vec::new();
@@ -285,31 +284,19 @@ impl Context {
                 mask_shares_per_node[idx].clone(),
                 f_large_per_node[idx].clone(),
             );
-            if rep == 1 {
-                rbc_vec = beacon_msg.clone().serialize_ctrbc();
-            }
             beacon_msgs.push((rep, beacon_msg));
         }
-
-        let shards = get_shards(rbc_vec, self.num_faults);
-        let hashes_rbc: Vec<Hash> = shards.clone().into_iter().map(|x| do_hash(x.as_slice())).collect();
-        let merkle_tree = MerkleTree::new(hashes_rbc, &self.hash_context);
 
         for (rep, beacon_msg) in beacon_msgs.into_iter() {
             let replica = rep - 1;
             let sec_key = self.sec_key_map.get(&replica).unwrap().clone();
-            let ctrbc_msg = CTRBCMsg::new(
-                shards[replica].clone(),
-                merkle_tree.gen_proof(replica),
-                new_round,
-                self.myid
-            );
+            let transcript_root = do_hash(beacon_msg.serialize_ctrbc().as_slice());
             if replica != self.myid {
-                let beacon_init = CoinMsg::CTRBCInit(beacon_msg, ctrbc_msg);
+                let beacon_init = CoinMsg::AVSSSend(beacon_msg, transcript_root, self.myid, new_round);
                 let wrapper_msg = WrapperMsg::new(beacon_init, self.myid, &sec_key, new_round);
                 self.send(replica, wrapper_msg).await;
             } else {
-                self.process_rbcinit(beacon_msg, ctrbc_msg).await;
+                self.process_avss_send(beacon_msg, transcript_root, self.myid, new_round).await;
             }
         }
 

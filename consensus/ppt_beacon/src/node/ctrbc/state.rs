@@ -56,6 +56,16 @@ pub struct CTRBCState{
     pub recon_msgs:HashMap<Replica,HashMap<Replica,Vec<u8>>,nohash_hasher::BuildNoHashHasher<Replica>>,
     /// Root Commitment vector for a BAwVSS instance instantiated by node i
     pub comm_vectors:HashMap<Replica,Vec<Hash>,nohash_hasher::BuildNoHashHasher<Replica>>,
+    /// Public hash transcript commitment for each dealer's AVSS instance.
+    pub avss_transcript_roots: HashMap<Replica, Hash, nohash_hasher::BuildNoHashHasher<Replica>>,
+    /// Nodes that locally verified a dealer's AVSS packet.
+    pub avss_local_valid: HashSet<Replica,nohash_hasher::BuildNoHashHasher<Replica>>,
+    /// sender -> transcript_root votes for AVSS ready.
+    pub avss_ready_votes: HashMap<Replica,HashMap<Replica,Hash>,nohash_hasher::BuildNoHashHasher<Replica>>,
+    /// sender -> transcript_root votes for AVSS complete.
+    pub avss_complete_votes: HashMap<Replica,HashMap<Replica,Hash>,nohash_hasher::BuildNoHashHasher<Replica>>,
+    /// Have we already broadcast AVSSComplete for this dealer?
+    pub avss_complete_sent: HashSet<Replica,nohash_hasher::BuildNoHashHasher<Replica>>,
     /// List of all secrets whose BAwVSS instances have been terminated
     pub terminated_secrets: HashSet<Replica,nohash_hasher::BuildNoHashHasher<Replica>>,
     /// Secret shares for secret reconstruction. Each node shares a secret for which multiple nodes can sent secret shares
@@ -151,6 +161,11 @@ impl CTRBCState{
             ready_sent:HashSet::default(),
             recon_msgs:HashMap::default(),
             comm_vectors:HashMap::default(),
+            avss_transcript_roots: HashMap::default(),
+            avss_local_valid: HashSet::default(),
+            avss_ready_votes: HashMap::default(),
+            avss_complete_votes: HashMap::default(),
+            avss_complete_sent: HashSet::default(),
             secret_shares:HashMap::default(),
             reconstructed_secrets:HashMap::default(),
             witness1:HashMap::default(),
@@ -204,6 +219,78 @@ impl CTRBCState{
         let sec_origin = beacon_msg.origin;
         // Message Validation happens in the method calling this method.
         self.msgs.insert(sec_origin, (beacon_msg,ctr));
+    }
+
+    pub fn store_avss_packet(&mut self, dealer: Replica, beacon_msg: BeaconMsg, transcript_root: Hash) {
+        self.avss_transcript_roots.insert(dealer, transcript_root);
+
+        if beacon_msg.appx_con.is_some(){
+            let appxcon_msgs: Vec<(u32, Vec<(usize, [u8; 32])>)> = beacon_msg.appx_con.clone().unwrap();
+            let appx_con_vals:Vec<(u32,Vec<(Replica,BigUint)>)> = appxcon_msgs.into_iter().map(|(x,y)|{
+                let mut vec_values = Vec::new();
+                for (rep,value) in y.into_iter(){
+                    vec_values.push((rep,BigUint::from_bytes_be(&value)));
+                }
+                (x,vec_values)
+            }).collect();
+            let mut hashmap_vals = HashMap::default();
+            for (round,vals) in appx_con_vals.into_iter(){
+                hashmap_vals.insert(round, vals);
+            }
+            self.appxcon_allround_vals.insert(beacon_msg.origin.clone(), hashmap_vals);
+        }
+
+        if let Some(ref dtc) = beacon_msg.degree_test_coeffs {
+            self.degree_test_coeffs.insert(dealer, dtc.clone());
+        }
+        if let Some(ref mask) = beacon_msg.mask_shares {
+            self.mask_shares.insert(dealer, mask.clone());
+        }
+        if let Some(ref f_large) = beacon_msg.f_large_shares {
+            self.f_large_shares.insert(dealer, f_large.clone());
+        }
+        if let Some(ref batch_wssmsg) = beacon_msg.wss {
+            self.node_secrets.insert(dealer, batch_wssmsg.clone());
+        }
+        if let Some(ref root_vec) = beacon_msg.root_vec {
+            self.comm_vectors.insert(dealer, root_vec.clone());
+        }
+    }
+
+    pub fn add_avss_ready_vote(&mut self, dealer: Replica, sender: Replica, transcript_root: Hash) {
+        self.avss_ready_votes
+            .entry(dealer)
+            .or_default()
+            .insert(sender, transcript_root);
+    }
+
+    pub fn add_avss_complete_vote(&mut self, dealer: Replica, sender: Replica, transcript_root: Hash) {
+        self.avss_complete_votes
+            .entry(dealer)
+            .or_default()
+            .insert(sender, transcript_root);
+    }
+
+    pub fn matching_avss_ready_count(&self, dealer: Replica) -> usize {
+        let transcript_root = match self.avss_transcript_roots.get(&dealer) {
+            Some(root) => root,
+            None => return 0,
+        };
+        match self.avss_ready_votes.get(&dealer) {
+            Some(votes) => votes.values().filter(|root| **root == *transcript_root).count(),
+            None => 0,
+        }
+    }
+
+    pub fn matching_avss_complete_count(&self, dealer: Replica) -> usize {
+        let transcript_root = match self.avss_transcript_roots.get(&dealer) {
+            Some(root) => root,
+            None => return 0,
+        };
+        match self.avss_complete_votes.get(&dealer) {
+            Some(votes) => votes.values().filter(|root| **root == *transcript_root).count(),
+            None => 0,
+        }
     }
 
     pub fn set_committee(&mut self,committee:Vec<Replica>){
@@ -703,6 +790,11 @@ impl CTRBCState{
         self.appxcon_allround_vals.clear();
         self.recon_msgs.clear();
         self.comm_vectors.clear();
+        self.avss_transcript_roots.clear();
+        self.avss_local_valid.clear();
+        self.avss_ready_votes.clear();
+        self.avss_complete_votes.clear();
+        self.avss_complete_sent.clear();
         self.degree_test_coeffs.clear();
         self.mask_shares.clear();
         self.f_large_shares.clear();

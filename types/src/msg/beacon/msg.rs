@@ -149,6 +149,9 @@ impl CTRBCMsg {
 
 #[derive(Debug,Serialize,Deserialize,Clone)]
 pub enum CoinMsg{
+    AVSSSend(BeaconMsg, Hash, Replica, Round),
+    AVSSReady(Replica, Hash, Replica, Round),
+    AVSSComplete(Replica, Hash, Replica, Round),
     CTRBCInit(BeaconMsg,CTRBCMsg),
     CTRBCEcho(CTRBCMsg,Hash,Replica),
     CTRBCReady(CTRBCMsg,Hash,Replica),

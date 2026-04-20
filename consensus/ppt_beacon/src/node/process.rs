@@ -1,6 +1,7 @@
 use std::{collections::HashSet, sync::Arc};
 
 use crypto::hash::verf_mac;
+use num_bigint::BigUint;
 use types::{
     beacon::{CoinMsg, WrapperMsg},
     Replica, Round, SyncMsg, SyncState,
@@ -56,6 +57,15 @@ impl Context {
 
     pub(crate) async fn choose_fn(self: &mut Context, wrapper_msg: WrapperMsg) {
         match wrapper_msg.clone().protmsg {
+            CoinMsg::AVSSSend(beaconmsg, transcript_root, dealer, round) => {
+                self.process_avss_send(beaconmsg, transcript_root, dealer, round).await;
+            }
+            CoinMsg::AVSSReady(dealer, transcript_root, sender, round) => {
+                self.process_avss_ready(dealer, transcript_root, sender, round).await;
+            }
+            CoinMsg::AVSSComplete(dealer, transcript_root, sender, round) => {
+                self.process_avss_complete(dealer, transcript_root, sender, round).await;
+            }
             CoinMsg::CTRBCInit(beaconmsg, ctr) => {
                 self.process_rbcinit(beaconmsg, ctr).await;
             }
@@ -201,6 +211,236 @@ impl Context {
         let init_msg = CoinMsg::ACSInit((self.myid, round, local_dealers.clone()));
         self.broadcast(init_msg, round).await;
         self.process_acs_init(self.myid, round, local_dealers).await;
+    }
+
+    fn avss_local_packet_valid(
+        &self,
+        beacon_msg: &types::beacon::BeaconMsg,
+        transcript_root: &crypto::hash::Hash,
+        dealer: Replica,
+        round: Round,
+    ) -> bool {
+        let public_root = crypto::hash::do_hash(beacon_msg.serialize_ctrbc().as_slice());
+        if public_root != *transcript_root {
+            log::warn!(
+                "[PPT][AVSS] transcript root mismatch for dealer {} round {}",
+                dealer,
+                round
+            );
+            return false;
+        }
+
+        if !beacon_msg.verify_proofs(&self.hash_context) {
+            log::warn!(
+                "[PPT][AVSS] invalid Merkle/share proof for dealer {} round {}",
+                dealer,
+                round
+            );
+            return false;
+        }
+
+        let degree_test_coeffs = match beacon_msg.degree_test_coeffs.as_ref() {
+            Some(coeffs) => coeffs,
+            None => return false,
+        };
+        let mask_shares = match beacon_msg.mask_shares.as_ref() {
+            Some(mask_shares) => mask_shares,
+            None => return false,
+        };
+        let f_large_shares = match beacon_msg.f_large_shares.as_ref() {
+            Some(f_large_shares) => f_large_shares,
+            None => return false,
+        };
+
+        if degree_test_coeffs.len() != self.batch_size
+            || mask_shares.len() != self.batch_size
+            || f_large_shares.len() != self.batch_size
+        {
+            log::warn!(
+                "[PPT][AVSS] malformed two-field batch lengths from dealer {} round {}",
+                dealer,
+                round
+            );
+            return false;
+        }
+
+        let verifier = crate::node::shamir::two_field::TwoFieldDealer::new(
+            self.secret_domain.clone(),
+            self.nonce_domain.clone(),
+            self.num_faults + 1,
+            self.num_nodes,
+        );
+        let theta = self.get_previous_theta(round.saturating_sub(1));
+
+        for coin_num in 0..self.batch_size {
+            let coeffs = &degree_test_coeffs[coin_num];
+            let h_coeffs: Vec<BigUint> = coeffs
+                .iter()
+                .map(|bytes| BigUint::from_bytes_be(bytes.as_slice()))
+                .collect();
+            let f_large = BigUint::from_bytes_be(f_large_shares[coin_num].as_slice());
+            let g_share = BigUint::from_bytes_be(mask_shares[coin_num].as_slice());
+
+            if !verifier.verify_share(self.myid + 1, &f_large, &g_share, &h_coeffs, &theta) {
+                log::warn!(
+                    "[PPT][AVSS] degree-test failed for dealer {} round {} coin {} at node {}",
+                    dealer,
+                    round,
+                    coin_num,
+                    self.myid
+                );
+                return false;
+            }
+        }
+
+        true
+    }
+
+    fn maybe_mark_dealer_completed(&mut self, round: Round, dealer: Replica) -> bool {
+        let threshold = self.num_nodes - self.num_faults;
+        let rbc_state = match self.round_state.get_mut(&round) {
+            Some(rbc_state) => rbc_state,
+            None => return false,
+        };
+
+        if rbc_state.terminated_secrets.contains(&dealer) {
+            return false;
+        }
+
+        if !rbc_state.avss_local_valid.contains(&dealer) {
+            return false;
+        }
+
+        if rbc_state.matching_avss_complete_count(dealer) < threshold {
+            return false;
+        }
+
+        rbc_state.terminated_secrets.insert(dealer);
+        true
+    }
+
+    fn maybe_prepare_avss_complete(
+        &mut self,
+        round: Round,
+        dealer: Replica,
+    ) -> Option<crypto::hash::Hash> {
+        let threshold = self.num_nodes - self.num_faults;
+        let rbc_state = match self.round_state.get_mut(&round) {
+            Some(rbc_state) => rbc_state,
+            None => return None,
+        };
+
+        if !rbc_state.avss_local_valid.contains(&dealer) {
+            return None;
+        }
+
+        if rbc_state.avss_complete_sent.contains(&dealer) {
+            return None;
+        }
+
+        if rbc_state.matching_avss_ready_count(dealer) < threshold {
+            return None;
+        }
+
+        let transcript_root = match rbc_state.avss_transcript_roots.get(&dealer) {
+            Some(root) => *root,
+            None => return None,
+        };
+
+        rbc_state.avss_complete_sent.insert(dealer);
+        Some(transcript_root)
+    }
+
+    pub async fn process_avss_send(
+        &mut self,
+        beacon_msg: types::beacon::BeaconMsg,
+        transcript_root: crypto::hash::Hash,
+        dealer: Replica,
+        round: Round,
+    ) {
+        if !self.round_state.contains_key(&round) {
+            let rbc_new_state = crate::node::CTRBCState::new(self.secret_domain.clone(), self.num_nodes);
+            self.round_state.insert(round, rbc_new_state);
+        }
+
+        if !self.avss_local_packet_valid(&beacon_msg, &transcript_root, dealer, round) {
+            return;
+        }
+
+        {
+            let rbc_state = self.round_state.get_mut(&round).unwrap();
+            if rbc_state.avss_local_valid.contains(&dealer) {
+                return;
+            }
+            rbc_state.store_avss_packet(dealer, beacon_msg, transcript_root);
+            rbc_state.avss_local_valid.insert(dealer);
+            rbc_state.add_avss_ready_vote(dealer, self.myid, transcript_root);
+        }
+
+        let ready_msg = CoinMsg::AVSSReady(dealer, transcript_root, self.myid, round);
+        self.broadcast(ready_msg, round).await;
+
+        if let Some(complete_root) = self.maybe_prepare_avss_complete(round, dealer) {
+            let complete_msg = CoinMsg::AVSSComplete(dealer, complete_root, self.myid, round);
+            self.broadcast(complete_msg, round).await;
+            self.process_avss_complete(dealer, complete_root, self.myid, round).await;
+        }
+
+        if self.maybe_mark_dealer_completed(round, dealer) {
+            self.maybe_broadcast_acs_init_from_avss(round).await;
+        }
+    }
+
+    pub async fn process_avss_ready(
+        &mut self,
+        dealer: Replica,
+        transcript_root: crypto::hash::Hash,
+        sender: Replica,
+        round: Round,
+    ) {
+        if !self.round_state.contains_key(&round) {
+            let rbc_new_state = crate::node::CTRBCState::new(self.secret_domain.clone(), self.num_nodes);
+            self.round_state.insert(round, rbc_new_state);
+        }
+
+        {
+            let rbc_state = self.round_state.get_mut(&round).unwrap();
+            rbc_state.add_avss_ready_vote(dealer, sender, transcript_root);
+        }
+
+        if let Some(complete_root) = self.maybe_prepare_avss_complete(round, dealer) {
+            let complete_msg = CoinMsg::AVSSComplete(dealer, complete_root, self.myid, round);
+            self.broadcast(complete_msg, round).await;
+            self.process_avss_complete(dealer, complete_root, self.myid, round).await;
+        }
+    }
+
+    pub async fn process_avss_complete(
+        &mut self,
+        dealer: Replica,
+        transcript_root: crypto::hash::Hash,
+        sender: Replica,
+        round: Round,
+    ) {
+        if !self.round_state.contains_key(&round) {
+            let rbc_new_state = crate::node::CTRBCState::new(self.secret_domain.clone(), self.num_nodes);
+            self.round_state.insert(round, rbc_new_state);
+        }
+
+        {
+            let rbc_state = self.round_state.get_mut(&round).unwrap();
+            rbc_state.add_avss_complete_vote(dealer, sender, transcript_root);
+        }
+
+        if self.maybe_mark_dealer_completed(round, dealer) {
+            log::info!(
+                "[PPT][AVSS-COMPLETE] node {} round {} dealer {} marked completed",
+                self.myid,
+                round,
+                dealer
+            );
+            self.maybe_broadcast_acs_init_from_avss(round).await;
+        }
     }
 }
 
