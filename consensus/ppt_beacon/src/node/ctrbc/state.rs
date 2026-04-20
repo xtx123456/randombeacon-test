@@ -66,6 +66,8 @@ pub struct CTRBCState{
     pub avss_complete_votes: HashMap<Replica,HashMap<Replica,Hash>,nohash_hasher::BuildNoHashHasher<Replica>>,
     /// Have we already broadcast AVSSComplete for this dealer?
     pub avss_complete_sent: HashSet<Replica,nohash_hasher::BuildNoHashHasher<Replica>>,
+    /// Dealers whose AVSS instance has completed and can be fed into ACS.
+    pub avss_completed_dealers: HashSet<Replica,nohash_hasher::BuildNoHashHasher<Replica>>,
     /// List of all secrets whose BAwVSS instances have been terminated
     pub terminated_secrets: HashSet<Replica,nohash_hasher::BuildNoHashHasher<Replica>>,
     /// Secret shares for secret reconstruction. Each node shares a secret for which multiple nodes can sent secret shares
@@ -166,6 +168,7 @@ impl CTRBCState{
             avss_ready_votes: HashMap::default(),
             avss_complete_votes: HashMap::default(),
             avss_complete_sent: HashSet::default(),
+            avss_completed_dealers: HashSet::default(),
             secret_shares:HashMap::default(),
             reconstructed_secrets:HashMap::default(),
             witness1:HashMap::default(),
@@ -795,6 +798,7 @@ impl CTRBCState{
         self.avss_ready_votes.clear();
         self.avss_complete_votes.clear();
         self.avss_complete_sent.clear();
+        self.avss_completed_dealers.clear();
         self.degree_test_coeffs.clear();
         self.mask_shares.clear();
         self.f_large_shares.clear();

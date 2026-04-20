@@ -174,7 +174,7 @@ impl Context {
                 None => return,
             };
 
-            if rbc_state.terminated_secrets.len() < threshold {
+            if rbc_state.avss_completed_dealers.len() < threshold {
                 return;
             }
 
@@ -188,7 +188,7 @@ impl Context {
             }
 
             st.completed_dealers.clear();
-            for dealer in rbc_state.terminated_secrets.iter().copied() {
+            for dealer in rbc_state.avss_completed_dealers.iter().copied() {
                 st.mark_completed(dealer);
             }
 
@@ -211,7 +211,7 @@ impl Context {
         };
 
         log::info!(
-            "[PPT][ACS-FASTPATH] node {} round {} AVSS completed for {} dealers; broadcasting ACSInit directly from terminated AVSS state {:?}",
+            "[PPT][ACS-FASTPATH] node {} round {} AVSS completed for {} dealers; broadcasting ACSInit directly from completed dealer set {:?}",
             self.myid,
             round,
             local_dealers.len(),
@@ -313,7 +313,7 @@ impl Context {
             None => return false,
         };
 
-        if rbc_state.terminated_secrets.contains(&dealer) {
+        if rbc_state.avss_completed_dealers.contains(&dealer) {
             return false;
         }
 
@@ -325,7 +325,7 @@ impl Context {
             return false;
         }
 
-        rbc_state.terminated_secrets.insert(dealer);
+        rbc_state.avss_completed_dealers.insert(dealer);
         true
     }
 
