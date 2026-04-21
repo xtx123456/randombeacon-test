@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import csv
 import re
+import statistics
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -22,6 +23,22 @@ BEA_STAGE_PATS = {
     "gather_ready": re.compile(r"\[BEA\]\[STAGE\]\[GATHER-READY\].*round (\d+)"),
     "recon_start": re.compile(r"\[BEA\]\[STAGE\]\[RECON-START\].*round (\d+) coin (\d+)"),
     "beacon_out": re.compile(r"\[BEA\]\[STAGE\]\[BEACON-OUT\].*round (\d+) coin (\d+)"),
+}
+
+
+PHASE_CONFIG = {
+    "ppt": {
+        "preprocess": {"source": "batch_complete", "anchor": "batch_start"},
+        "subset_convergence": {"source": "acs_decide", "anchor": "batch_start"},
+        "reconstruction": {"source": "recon_complete", "anchor": "recon_start"},
+        "beacon_output": {"source": "beacon_out", "anchor": "recon_start"},
+    },
+    "bea": {
+        "preprocess": {"source": "batch_complete", "anchor": "batch_start"},
+        "subset_convergence": {"source": "gather_ready", "anchor": "batch_start"},
+        "reconstruction": {"source": "recon_complete", "anchor": "recon_start"},
+        "beacon_output": {"source": "beacon_out", "anchor": "recon_start"},
+    },
 }
 
 
@@ -50,26 +67,36 @@ def fmt(x):
     return f"{x:.6f}"
 
 
-PHASE_SOURCES = {
-    "ppt": {
-        "preprocess": "batch_complete",
-        "subset_convergence": "acs_decide",
-        "reconstruction": "recon_complete",
-        "beacon_output": "beacon_out",
-    },
-    "bea": {
-        "preprocess": "batch_complete",
-        "subset_convergence": "gather_ready",
-        "reconstruction": "recon_complete",
-        "beacon_output": "beacon_out",
-    },
-}
-
-
 def units_per_event(source: str, batch_size: int) -> int:
     if source in ("batch_start", "batch_complete", "acs_decide", "gather_ready"):
         return batch_size
     return 1
+
+
+def percentile(sorted_vals, p: float):
+    if not sorted_vals:
+        return None
+    idx = max(0, min(len(sorted_vals) - 1, int(p * (len(sorted_vals) - 1))))
+    return sorted_vals[idx]
+
+
+def duration_stats(seconds_list):
+    if not seconds_list:
+        return {
+            "matched_count": 0,
+            "mean": None,
+            "median": None,
+            "p95": None,
+            "max": None,
+        }
+    vals = sorted(seconds_list)
+    return {
+        "matched_count": len(vals),
+        "mean": statistics.mean(vals),
+        "median": statistics.median(vals),
+        "p95": percentile(vals, 0.95),
+        "max": vals[-1],
+    }
 
 
 def collect_syncer_events(syncer_log: Path):
@@ -82,11 +109,18 @@ def collect_syncer_events(syncer_log: Path):
             ts = parse_ts(line)
             if ts is None:
                 continue
-            if SYNC_BATCH_PAT.search(line):
-                out["batch_complete"].append(ts)
+
+            m = SYNC_BATCH_PAT.search(line)
+            if m:
+                round_id = int(m.group(1))
+                out["batch_complete"].append(((round_id,), ts))
                 continue
-            if SYNC_RECON_PAT.search(line):
-                out["recon_complete"].append(ts)
+
+            m = SYNC_RECON_PAT.search(line)
+            if m:
+                round_id = int(m.group(1))
+                coin = int(m.group(2))
+                out["recon_complete"].append(((round_id, coin), ts))
     return out
 
 
@@ -99,9 +133,17 @@ def collect_node_events(node_log: Path, protocol: str):
             if ts is None:
                 continue
             for stage, pat in patterns.items():
-                if pat.search(line):
-                    out[stage].append(ts)
-                    break
+                m = pat.search(line)
+                if not m:
+                    continue
+                if stage in ("beacon_out",):
+                    round_id = int(m.group(1))
+                    coin = int(m.group(2))
+                    out[stage].append(((round_id, coin), ts))
+                else:
+                    round_id = int(m.group(1))
+                    out[stage].append(((round_id,), ts))
+                break
     return out
 
 
@@ -115,15 +157,45 @@ def ensure_header(csv_path: Path):
             "batch",
             "phase",
             "event_source",
+            "anchor_source",
             "event_count",
             "units_per_event",
             "total_units",
             "wall_throughput",
             "active_window_sec",
             "active_throughput",
+            "matched_latency_count",
+            "latency_mean_sec",
+            "latency_median_sec",
+            "latency_p95_sec",
+            "latency_max_sec",
             "first_ts",
             "last_ts",
         ])
+
+
+def build_anchor_lookup(anchor_events):
+    exact = {}
+    by_round = {}
+    for key, ts in anchor_events:
+        exact.setdefault(key, ts)
+        by_round.setdefault((key[0],), ts)
+    return exact, by_round
+
+
+def match_latency_seconds(source_events, anchor_events):
+    exact_anchor, round_anchor = build_anchor_lookup(anchor_events)
+    deltas = []
+    for key, source_ts in source_events:
+        anchor_ts = exact_anchor.get(key)
+        if anchor_ts is None:
+            anchor_ts = round_anchor.get((key[0],))
+        if anchor_ts is None:
+            continue
+        delta = (source_ts - anchor_ts).total_seconds()
+        if delta >= 0:
+            deltas.append(delta)
+    return deltas
 
 
 def main():
@@ -148,30 +220,45 @@ def main():
 
     ensure_header(out_csv)
 
-    phase_sources = PHASE_SOURCES[protocol]
-
     rows = []
-    for phase, source in phase_sources.items():
-        ts_list = all_events.get(source, [])
-        if not ts_list:
+    for phase, cfg in PHASE_CONFIG[protocol].items():
+        source = cfg["source"]
+        anchor = cfg["anchor"]
+        event_pairs = all_events.get(source, [])
+        if not event_pairs:
             continue
-        ts_list = sorted(ts_list)
+
+        ts_list = sorted(ts for _, ts in event_pairs)
         event_units = units_per_event(source, batch_size)
         total_units = len(ts_list) * event_units
-        wall_tp = throughput(total_units, (ts_list[-1] - ts_list[0]).total_seconds() if len(ts_list) >= 2 else None)
+        wall_tp = throughput(
+            total_units,
+            (ts_list[-1] - ts_list[0]).total_seconds() if len(ts_list) >= 2 else None,
+        )
         active_sec = active_window_sec(ts_list)
         active_tp = throughput(total_units, active_sec)
+
+        latency = duration_stats(
+            match_latency_seconds(event_pairs, all_events.get(anchor, []))
+        )
+
         rows.append([
             protocol,
             batch_size,
             phase,
             source,
+            anchor,
             len(ts_list),
             event_units,
             total_units,
             fmt(wall_tp),
             fmt(active_sec),
             fmt(active_tp),
+            latency["matched_count"],
+            fmt(latency["mean"]),
+            fmt(latency["median"]),
+            fmt(latency["p95"]),
+            fmt(latency["max"]),
             ts_list[0].isoformat() + "Z",
             ts_list[-1].isoformat() + "Z",
         ])
@@ -182,7 +269,7 @@ def main():
 
     for row in rows:
         print(
-            f"{row[0]} batch={row[1]} phase={row[2]} source={row[3]} units={row[6]} active_tp={row[9] or 'NA'}"
+            f"{row[0]} batch={row[1]} phase={row[2]} source={row[3]} active_tp={row[10] or 'NA'} latency_mean={row[12] or 'NA'} matched={row[11]}"
         )
 
     return 0
