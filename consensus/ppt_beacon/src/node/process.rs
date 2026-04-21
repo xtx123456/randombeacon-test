@@ -68,52 +68,51 @@ impl Context {
                 self.process_avss_complete(dealer, transcript_root, sender, round).await;
             }
             CoinMsg::CTRBCInit(_, ctr) => {
-                log::warn!(
+                log::debug!(
                     "[PPT][CTRBC-OFF] dropping legacy CTRBCInit for round {}",
                     ctr.round
                 );
             }
             CoinMsg::CTRBCEcho(ctr, _, echo_sender) => {
-                log::warn!(
+                log::debug!(
                     "[PPT][CTRBC-OFF] dropping legacy CTRBCEcho from {} for round {}",
                     echo_sender,
                     ctr.round
                 );
             }
             CoinMsg::CTRBCReady(ctr, _, ready_sender) => {
-                log::warn!(
+                log::debug!(
                     "[PPT][CTRBC-OFF] dropping legacy CTRBCReady from {} for round {}",
                     ready_sender,
                     ctr.round
                 );
             }
             CoinMsg::CTRBCReconstruct(ctr, _, recon_sender) => {
-                log::warn!(
+                log::debug!(
                     "[PPT][CTRBC-OFF] dropping legacy CTRBCReconstruct from {} for round {}",
                     recon_sender,
                     ctr.round
                 );
             }
             CoinMsg::BinaryAAEcho(_, echo_sender, round) => {
-                log::error!(
+                log::debug!(
                     "[PPT][PURE] rejecting legacy BinaryAAEcho from {} for round {}",
                     echo_sender,
                     round
                 );
             }
             CoinMsg::BinaryAAEcho2(_, echo2_sender, round) => {
-                log::error!(
+                log::debug!(
                     "[PPT][PURE] rejecting legacy BinaryAAEcho2 from {} for round {}",
                     echo2_sender,
                     round
                 );
             }
-            CoinMsg::BeaconConstruct(shares, share_sender, coin_num, round) => {
+            CoinMsg::BeaconConstruct(_, share_sender, coin_num, round) => {
                 log::debug!(
-                    "[PPT][LEGACY-BEACON-CONSTRUCT] received per-coin BeaconConstruct from node {} for coin {} in round {}",
+                    "[PPT][LEGACY-DROP] ignoring per-coin BeaconConstruct from node {} for coin {} in round {}; pure PPT only accepts BatchBeaconConstruct",
                     share_sender, coin_num, round
                 );
-                self.process_secret_shares(shares, share_sender, coin_num, round).await;
             }
 
             CoinMsg::BatchBeaconConstruct(msg, share_sender, round) => {
@@ -136,14 +135,14 @@ impl Context {
                 self.process_multicast_recovered_shares(msg, sender, round).await;
             }
             CoinMsg::GatherEcho(_, sender, round) => {
-                log::warn!(
+                log::debug!(
                     "[PPT][GATHER-OFF] dropping legacy GatherEcho from {} for round {}",
                     sender,
                     round
                 );
             }
             CoinMsg::GatherEcho2(_, sender, round) => {
-                log::warn!(
+                log::debug!(
                     "[PPT][GATHER-OFF] dropping legacy GatherEcho2 from {} for round {}",
                     sender,
                     round

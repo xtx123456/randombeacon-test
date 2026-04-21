@@ -40,6 +40,7 @@ fn filter_packet_to_decided(
     packet: &BatchWSSReconMsg,
     decided: &[Replica],
 ) -> BatchWSSReconMsg {
+    let decided_set: HashSet<Replica> = decided.iter().copied().collect();
     let mut filtered = packet.clone();
     filtered.origins.clear();
     filtered.secrets.clear();
@@ -50,7 +51,7 @@ fn filter_packet_to_decided(
 
     for idx in 0..packet.origins.len() {
         let dealer = packet.origins[idx];
-        if decided.contains(&dealer) {
+        if decided_set.contains(&dealer) {
             filtered.origins.push(dealer);
             filtered.secrets.push(packet.secrets[idx].clone());
             filtered.nonces.push(packet.nonces[idx].clone());

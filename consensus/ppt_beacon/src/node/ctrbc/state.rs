@@ -227,22 +227,6 @@ impl CTRBCState{
     pub fn store_avss_packet(&mut self, dealer: Replica, beacon_msg: BeaconMsg, transcript_root: Hash) {
         self.avss_transcript_roots.insert(dealer, transcript_root);
 
-        if beacon_msg.appx_con.is_some(){
-            let appxcon_msgs: Vec<(u32, Vec<(usize, [u8; 32])>)> = beacon_msg.appx_con.clone().unwrap();
-            let appx_con_vals:Vec<(u32,Vec<(Replica,BigUint)>)> = appxcon_msgs.into_iter().map(|(x,y)|{
-                let mut vec_values = Vec::new();
-                for (rep,value) in y.into_iter(){
-                    vec_values.push((rep,BigUint::from_bytes_be(&value)));
-                }
-                (x,vec_values)
-            }).collect();
-            let mut hashmap_vals = HashMap::default();
-            for (round,vals) in appx_con_vals.into_iter(){
-                hashmap_vals.insert(round, vals);
-            }
-            self.appxcon_allround_vals.insert(beacon_msg.origin.clone(), hashmap_vals);
-        }
-
         if let Some(ref dtc) = beacon_msg.degree_test_coeffs {
             self.degree_test_coeffs.insert(dealer, dtc.clone());
         }
@@ -345,22 +329,6 @@ impl CTRBCState{
      */
     pub fn transform(&mut self, terminated_index:Replica)->BeaconMsg{
         let beacon_msg = self.msgs.get(&terminated_index).unwrap().0.clone();
-        if beacon_msg.appx_con.is_some(){
-            let appxcon_msgs: Vec<(u32, Vec<(usize, [u8; 32])>)> = beacon_msg.appx_con.clone().unwrap();
-            let appx_con_vals:Vec<(u32,Vec<(Replica,BigUint)>)> = appxcon_msgs.into_iter().map(|(x,y)|{
-                let mut vec_values = Vec::new();
-                for (rep,value) in y.into_iter(){
-                    vec_values.push((rep,BigUint::from_bytes_be(&value)));
-                }
-                (x,vec_values)
-            }).collect();
-            let mut hashmap_vals = HashMap::default();
-            for (round,vals) in appx_con_vals.into_iter(){
-                hashmap_vals.insert(round, vals);
-            }
-            self.appxcon_allround_vals.insert(beacon_msg.origin.clone(), hashmap_vals);
-        }
-
         // Phase 4B: Store degree-test data before consuming the message.
         if let Some(ref dtc) = beacon_msg.degree_test_coeffs {
             self.degree_test_coeffs.insert(terminated_index, dtc.clone());
@@ -766,7 +734,7 @@ impl CTRBCState{
         self.recon_secrets.insert(coin_number);
         self.secret_shares.remove(&coin_number);
         self.reconstructed_secrets.remove(&coin_number);
-        self.contribution_map.remove(&coin_number); // legacy map, kept cleared for safety
+        self.contribution_map.remove(&coin_number);
 
         Some(BigUint::to_bytes_be(&rand_fin))
     }
