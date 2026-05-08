@@ -79,6 +79,62 @@ echo "FREQ=$FREQ"
 echo "BATCHES=${BATCHES[*]}"
 echo "RUNS=$RUNS"
 
+# ---------------------------------------------------------------
+# Optional CPU pinning (Level 0).
+# Multi-core machines (e.g. i9-12900 with 24 logical CPUs) benefit
+# substantially from pinning each node process to its own slice of
+# CPUs: the per-process L2/L3 cache stops being thrashed by the
+# other co-located node processes, and tokio's worker pool stays
+# on a stable set of cores.
+#
+# We auto-detect:
+#   - whether `taskset` is available;
+#   - how many logical CPUs the host has (via `nproc`);
+#   - and partition them evenly across NODE_COUNT + 1 (the +1 is
+#     for the syncer process which gets its own dedicated slice).
+#
+# Disable by exporting NO_TASKSET=1.
+# Override the per-process slice width by exporting CPUS_PER_NODE=N.
+# ---------------------------------------------------------------
+USE_TASKSET=1
+if [ "${NO_TASKSET:-0}" = "1" ] || ! command -v taskset >/dev/null 2>&1; then
+    USE_TASKSET=0
+fi
+
+TOTAL_CPUS=$(nproc 2>/dev/null || echo 0)
+if [ "$USE_TASKSET" = "1" ] && [ "$TOTAL_CPUS" -gt 0 ]; then
+    PARTITIONS=$((NODE_COUNT + 1))
+    CPUS_PER_NODE_DEFAULT=$(( TOTAL_CPUS / PARTITIONS ))
+    [ "$CPUS_PER_NODE_DEFAULT" -lt 1 ] && CPUS_PER_NODE_DEFAULT=1
+    CPUS_PER_NODE="${CPUS_PER_NODE:-$CPUS_PER_NODE_DEFAULT}"
+    echo "TASKSET=yes  TOTAL_CPUS=$TOTAL_CPUS  CPUS_PER_NODE=$CPUS_PER_NODE  (override with CPUS_PER_NODE=N or NO_TASKSET=1)"
+else
+    USE_TASKSET=0
+    echo "TASKSET=no   (taskset unavailable, NO_TASKSET=1, or nproc returned 0)"
+fi
+
+# Compute the CPU range string for slot `i` (0 = syncer, 1..NODE_COUNT = nodes).
+cpu_slice_for_slot() {
+    local slot="$1"
+    local first=$(( slot * CPUS_PER_NODE ))
+    local last=$(( first + CPUS_PER_NODE - 1 ))
+    local cap=$(( TOTAL_CPUS - 1 ))
+    [ "$last" -gt "$cap" ] && last="$cap"
+    echo "${first}-${last}"
+}
+
+# Run a command, optionally wrapped in `taskset -c <range>`.
+run_pinned() {
+    local slot="$1"; shift
+    if [ "$USE_TASKSET" = "1" ]; then
+        local range
+        range=$(cpu_slice_for_slot "$slot")
+        taskset -c "$range" "$@"
+    else
+        "$@"
+    fi
+}
+
 cleanup() {
     pkill -f "$ROOT/target/release/node" 2>/dev/null || true
     pkill -f "$ROOT/target/debug/node" 2>/dev/null || true
@@ -90,7 +146,7 @@ write_header_if_needed() {
     local csv="$1"
     if [ ! -f "$csv" ]; then
         cat > "$csv" <<'EOF'
-protocol,batch,frequency,run,duration_sec,node_count,unique_batch_count,batch_throughput_wall,batch_active_window_sec,batch_throughput_active,first_batch_round,last_batch_round,internal_progress_span,internal_progress_units_per_sec,batch_gap_count,batch_gap_mean_ms,batch_gap_median_ms,batch_gap_p95_ms,unique_beacon_count,beacon_throughput_wall,beacon_active_window_sec,beacon_throughput_active,recon_gap_count,recon_gap_mean_ms,recon_gap_median_ms,recon_gap_p95_ms,acs_trigger,acs_decide,acs_recon,batch_recover,two_field,post_complaint,post_blame,first_batch_ts,last_batch_ts,first_beacon_ts,last_beacon_ts
+protocol,batch,frequency,run,duration_sec,node_count,unique_batch_count,batch_throughput_wall,batch_active_window_sec,batch_throughput_active,first_batch_round,last_batch_round,internal_progress_span,internal_progress_units_per_sec,batch_gap_count,batch_gap_mean_ms,batch_gap_median_ms,batch_gap_p95_ms,unique_beacon_count,beacon_throughput_wall,beacon_active_window_sec,beacon_throughput_active,recon_gap_count,recon_gap_mean_ms,recon_gap_median_ms,recon_gap_p95_ms,acs_trigger,acs_decide,acs_recon,batch_recover,two_field,post_complaint,post_blame,first_batch_ts,last_batch_ts,first_beacon_ts,last_beacon_ts,complete_round_count_uniform,round_throughput_wall_uniform,round_throughput_active_uniform,round_span_mean_ms_uniform,round_span_p95_ms_uniform,round_e2e_latency_mean_ms_uniform,round_e2e_latency_p95_ms_uniform
 EOF
     fi
 }
@@ -118,7 +174,8 @@ run_one_case() {
     curr_date=$(date +"%s%3N")
     local st_time=$((curr_date + 10000))
 
-    "$BIN" \
+    # syncer goes on slot 0 (its own CPU slice).
+    run_pinned 0 "$BIN" \
         --config "$TESTDIR/nodes-0.json" \
         --ip "$IP_FILE" \
         --sleep "$st_time" \
@@ -137,7 +194,9 @@ run_one_case() {
 
     local NODE_PIDS=()
     for ((i=0; i<NODE_COUNT; i++)); do
-        "$BIN" \
+        # Node i goes on slot (i+1) so that the syncer doesn't share
+        # a CPU slice with any node.
+        run_pinned $((i + 1)) "$BIN" \
             --config "$TESTDIR/nodes-${i}.json" \
             --ip "$IP_FILE" \
             --sleep "$st_time" \
@@ -199,6 +258,15 @@ summary_csv = sys.argv[9]
 ts_pat = re.compile(r'^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)')
 round_pat = re.compile(r'All n nodes completed round (\d+)')
 recon_pat = re.compile(r'All n nodes completed reconstruction for round (\d+) and index (\d+)')
+# Uniform per-protocol round-start log lines (for end-to-end latency).
+# BEA emits "[BEA][STAGE][BATCH-START] node X round R", PPT emits
+# "[PPT][ROUND-START] node X launching round R as PPT dealer".
+ppt_round_start_pat = re.compile(
+    r'\[PPT\]\[ROUND-START\] node \d+ launching round (\d+) as PPT dealer'
+)
+bea_round_start_pat = re.compile(
+    r'\[BEA\]\[STAGE\]\[BATCH-START\] node \d+ round (\d+)'
+)
 
 def parse_ts(line: str):
     m = ts_pat.search(line)
@@ -258,6 +326,25 @@ with open(syncer_log, "r", encoding="utf-8", errors="ignore") as f:
             recon_first_ts.setdefault((rid, coin), t)
             continue
 
+# Per-protocol round-start timestamps from node0 (used for end-to-end
+# latency in the uniform metric). These are the real moment that node 0
+# kicked off a given protocol-round, regardless of whether the protocol
+# is BEA or PPT — both produce batch_size beacons per round, so this is
+# directly comparable.
+round_start_ts = {}
+try:
+    with open(node0_log, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            t = parse_ts(line)
+            if t is None:
+                continue
+            m = ppt_round_start_pat.search(line) or bea_round_start_pat.search(line)
+            if m:
+                rid = int(m.group(1))
+                round_start_ts.setdefault(rid, t)
+except FileNotFoundError:
+    pass
+
 round_items = sorted(round_first_ts.items(), key=lambda kv: (kv[1], kv[0]))
 recon_items = sorted(recon_first_ts.items(), key=lambda kv: (kv[1], kv[0][0], kv[0][1]))
 
@@ -314,6 +401,68 @@ if protocol == "ppt":
     except FileNotFoundError:
         pass
 
+# ============================================================
+# Uniform metrics (cross-protocol comparable).
+#
+# A "complete round" is defined uniformly as: a round R for which
+# ALL `batch` (R, I) pairs have been agreed by all n nodes (i.e.
+# the syncer has emitted "All n completed reconstruction" for every
+# I in 0..batch). This is the same notion of "one finished beacon
+# round" for both BEA and PPT, since both produce `batch` beacons
+# per protocol round. The legacy `unique_batch_count` column is
+# NOT comparable across protocols (BEA counts AA-internal rounds,
+# PPT counts full-protocol rounds), so we add new columns rather
+# than overwrite the old ones.
+# ============================================================
+
+# Group recon (round, coin) -> first-seen ts by round.
+coins_by_round = {}
+for (rid, coin), ts in recon_first_ts.items():
+    coins_by_round.setdefault(rid, {})[coin] = ts
+
+# A round is uniformly "complete" when all batch_size coins have a ts.
+complete_rounds = []
+for rid, coin_map in coins_by_round.items():
+    if len(coin_map) >= batch:
+        first_coin_ts = min(coin_map.values())
+        last_coin_ts = max(coin_map.values())
+        complete_rounds.append((rid, first_coin_ts, last_coin_ts))
+
+complete_round_count = len(complete_rounds)
+complete_rounds.sort(key=lambda r: r[1])  # sort by first_coin_ts
+
+# Wall-clock throughput: rounds per total benchmark second.
+round_throughput_wall_uniform = throughput(complete_round_count, duration)
+
+# Active throughput: rounds per (last_round_finish - first_round_start).
+if len(complete_rounds) >= 2:
+    active_window = (complete_rounds[-1][2] - complete_rounds[0][1]).total_seconds()
+    round_throughput_active_uniform = throughput(complete_round_count, active_window)
+else:
+    round_throughput_active_uniform = None
+
+# Round span = last_coin_ts - first_coin_ts within the same round
+# (how tightly batched the coins of a single round arrive).
+round_spans_ms = [
+    (last - first).total_seconds() * 1000.0
+    for _, first, last in complete_rounds
+]
+_, round_span_mean_str, _, round_span_p95_str = stat_triplet(round_spans_ms)
+
+# End-to-end round latency = last_coin_ts - node0_round_start_ts
+# (from when node 0 launched the protocol-round to when the syncer
+# saw all n nodes complete every coin of that round). Only counted
+# for rounds that BOTH have node-0 start ts AND are uniformly complete.
+e2e_latencies_ms = []
+for rid, _, last_coin_ts in complete_rounds:
+    start_ts = round_start_ts.get(rid)
+    if start_ts is None:
+        continue
+    delta = (last_coin_ts - start_ts).total_seconds() * 1000.0
+    if delta >= 0:
+        e2e_latencies_ms.append(delta)
+_, round_e2e_lat_mean_str, _, round_e2e_lat_p95_str = stat_triplet(e2e_latencies_ms)
+
 row = [
     protocol,
     batch,
@@ -352,6 +501,14 @@ row = [
     last_batch_ts,
     first_beacon_ts,
     last_beacon_ts,
+    # ---- Uniform metrics (cross-protocol comparable) ----
+    complete_round_count,
+    fmt_float(round_throughput_wall_uniform),
+    fmt_float(round_throughput_active_uniform),
+    round_span_mean_str,
+    round_span_p95_str,
+    round_e2e_lat_mean_str,
+    round_e2e_lat_p95_str,
 ]
 
 with open(summary_csv, "a", newline="", encoding="utf-8") as f:
@@ -396,6 +553,14 @@ if protocol == "ppt":
     print(f"Two-field logs: {two_field}")
     print(f"Post-complaint logs: {post_complaint}")
     print(f"Post-blame logs: {post_blame}")
+print("=== Uniform metrics (cross-protocol comparable) ===")
+print(f"Complete rounds (uniform):      {complete_round_count}")
+print(f"Round throughput wall (r/s):    {fmt_float(round_throughput_wall_uniform)}")
+print(f"Round throughput active (r/s):  {fmt_float(round_throughput_active_uniform)}")
+print(f"Round span mean (ms):           {round_span_mean_str}")
+print(f"Round span p95 (ms):            {round_span_p95_str}")
+print(f"Round E2E latency mean (ms):    {round_e2e_lat_mean_str}")
+print(f"Round E2E latency p95 (ms):     {round_e2e_lat_p95_str}")
 print("=== Case complete ===")
 PY
 

@@ -171,8 +171,35 @@ pub enum CoinMsg{
     MulticastRecoveredShares(MulticastRecoveredSharesMsg,Replica,Round),
 
     BeaconValue(Round,Replica,u128),
+
+    /// Legacy quasi-ACS messages from the early refactor. New code MUST NOT
+    /// use these; they are kept only so that older binaries can still
+    /// parse the wire format. The PPT path now uses the
+    /// `ACSPropose / ACSWitness1 / ACSWitness2` triple below.
     ACSInit((Replica,Round,Vec<Replica>)),
     ACSOutput((Replica,Round,Vec<Replica>)),
+
+    /// PPT ACS Phase 1 — PROPOSE.
+    /// `(round, sender, dealers)`: the sender publishes the set of dealers it
+    /// has locally observed as AVSS-completed. Receivers buffer/validate the
+    /// proposal: a proposal is *externally valid* iff every dealer in
+    /// `dealers` is also AVSS-completed in the receiver's local view (by AVSS
+    /// totality this becomes true eventually for any honest proposer).
+    ACSPropose(Round, Replica, Vec<Replica>),
+
+    /// PPT ACS Phase 2 — WITNESS1.
+    /// `(round, sender, validated_proposers)`: after delivering n-f valid
+    /// proposals, the sender publishes the set of *proposer IDs* whose
+    /// proposals it has validated.
+    ACSWitness1(Round, Replica, Vec<Replica>),
+
+    /// PPT ACS Phase 3 — WITNESS2.
+    /// `(round, sender, witnessed_w1_senders)`: after delivering n-f
+    /// `Witness1` messages whose proposer-sets are subsets of the local
+    /// validated set, the sender publishes the IDs of those Witness1 senders.
+    /// Once a node sees n-f matching Witness2 messages it finalizes the ACS
+    /// decision deterministically (see `acs::decide`).
+    ACSWitness2(Round, Replica, Vec<Replica>),
 }
 
 #[derive(Debug,Serialize,Deserialize,Clone)]

@@ -227,6 +227,38 @@ fn build_local_batch_beacon_construct(
 }
 
 impl Context {
+    /// Release a round's transient state once it is fully done:
+    ///   - every coin in the batch has emitted its beacon output
+    ///     (`recon_secrets.contains(batch_size - 1)`), AND
+    ///   - the post-ACS audit quorum (n-f recovered-share multicasts)
+    ///     has completed (`post_complaint_complete == true`).
+    ///
+    /// Calling this in place (rather than removing the entry from
+    /// `round_state`) keeps the `cleared` sentinel so any very-late
+    /// arriving messages are safely ignored by the ingest paths.
+    pub(crate) fn maybe_release_round(&mut self, round: Round) {
+        let should_release = match self.round_state.get(&round) {
+            Some(state) => {
+                state.recon_secrets.contains(&(self.batch_size - 1))
+                    && state.post_complaint_complete
+                    && !state.cleared
+            }
+            None => false,
+        };
+        if !should_release {
+            return;
+        }
+
+        if let Some(state) = self.round_state.get_mut(&round) {
+            log::info!(
+                "[PPT][ROUND-RELEASE] node {} round {} releasing transient state (batch + audit complete)",
+                self.myid,
+                round
+            );
+            state.clear();
+        }
+    }
+
     #[async_recursion]
     async fn flush_pending_beacon_outputs(&mut self, round: Round, reason: &'static str) {
         let pending = {
@@ -352,7 +384,31 @@ impl Context {
             }
         };
 
-        let theta = self.get_previous_theta(round.saturating_sub(1));
+        // θ for this round MUST be available by the time we reach
+        // ingest: ACS-decide implies AVSS-validate, which implies
+        // theta_for_round(round) was Some at AVSS time, which is
+        // monotone (θ is only ever inserted, never removed). If it
+        // is somehow None here, refuse to validate any share rather
+        // than panicking — dropping the packet is safe (the dealer
+        // can re-announce later via the recovered-share multicast)
+        // and we surface the anomaly via [PPT][THETA-MISS].
+        let theta = match self.theta_for_round(round) {
+            Some(t) => t,
+            None => {
+                log::error!(
+                    "[PPT][THETA-MISS] node {} ingest_secret_shares_only: θ for round {} not yet recorded; dropping packet from {} coin {}",
+                    self.myid,
+                    round,
+                    share_sender,
+                    coin_num
+                );
+                self.add_benchmark(
+                    String::from("process_batchreconstruct"),
+                    now.elapsed().unwrap().as_nanos(),
+                );
+                return;
+            }
+        };
         let verifier = TwoFieldDealer::new(
             self.secret_domain.clone(),
             self.nonce_domain.clone(),
@@ -361,10 +417,11 @@ impl Context {
         );
 
         let mut missing_material_dealers: HashSet<Replica> = HashSet::new();
+        let banned = self.banned_dealers.clone();
 
         {
             let rbc_state = self.round_state.get_mut(&round).unwrap();
-            let use_for_batch = decided.contains(&share_sender);
+            let use_for_batch = decided.contains(&share_sender) && !banned.contains(&share_sender);
 
             for ((((dealer, share), _nonce), mask_share), f_large_share) in recon_shares
                 .origins
@@ -374,7 +431,7 @@ impl Context {
                 .zip(recon_shares.mask_shares.iter())
                 .zip(recon_shares.f_large_shares.iter())
             {
-                if !decided.contains(dealer) {
+                if !decided.contains(dealer) || banned.contains(dealer) {
                     continue;
                 }
 
@@ -427,6 +484,9 @@ impl Context {
                     BlameReason::MissingDegreeTestCoeffs { coin_num },
                 );
             }
+        }
+        for dealer in missing_material_dealers.into_iter() {
+            self.ban_dealer_global(dealer);
         }
 
         self.add_benchmark(
@@ -797,9 +857,14 @@ impl Context {
                 round,
                 threshold
             );
+            // The audit just transitioned to complete; if every
+            // coin was already emitted before audit completion,
+            // release the round's transient state now.
+            self.maybe_release_round(round);
             return;
         }
 
+        let mut to_ban: HashSet<Replica> = HashSet::new();
         {
             let rbc_state = self.round_state.get_mut(&round).unwrap();
             for (dealer, reason) in blame_events.into_iter() {
@@ -811,17 +876,35 @@ impl Context {
                     reason
                 );
                 rbc_state.blame_dealer(dealer, round, reason);
+                to_ban.insert(dealer);
             }
         }
+        // Permanently kick the dealer out of every future round.
+        // This is the missing half of the PPT "kick out corrupted
+        // leader" research path (slides pg 17-25): blame is now
+        // wired into Context::banned_dealers, which the AVSS, ACS
+        // and reconstruction paths all consult.
+        for dealer in to_ban.into_iter() {
+            self.ban_dealer_global(dealer);
+        }
+        // Same idempotent release after the blame path runs.
+        self.maybe_release_round(round);
     }
 
     /**
-     * Beacons can be reconstructed in HashRand for two reasons:
-     * a) For external consumption (which are sent to the syncer)
-     * b) For internal consumption (for AnyTrust sampling and efficiency)
+     * Pure-PPT beacon emit path:
+     *   - record the round-r coin-0 beacon as the source of θ for round r+1
+     *     (PPT slide pg 28: dealer must not be able to predict θ);
+     *   - bootstrap round r+1 immediately (full-committee mode, no anytrust
+     *     sampling — every honest node is always a dealer);
+     *   - emit the beacon to the syncer for external consumption;
+     *   - if `coin_num` is the canonical first-matched coin
+     *     (see `Context::first_matched_coin_value`), additionally tag the
+     *     emit so consumers that need a uniform [1,n] sample (slide pg 32)
+     *     can pick it deterministically.
      *
-     * We intentionally DO NOT clear round state here anymore; post-ACS complaint
-     * needs the full disclosure data to remain available after batch recovery.
+     * We intentionally DO NOT clear round state here; the post-ACS audit
+     * still needs the full disclosure data to remain available.
      */
     #[async_recursion]
     pub async fn self_coin_check_transmit(&mut self, round: Round, coin_num: usize, number: Vec<u8>) {
@@ -836,16 +919,30 @@ impl Context {
             .map(|state| state.recon_secrets.contains(&(self.batch_size - 1)))
             .unwrap_or(false);
 
+        // Memory-bound: once every coin in the round has been emitted
+        // AND the post-ACS audit quorum (n-f recovered-share
+        // multicasts) has fired, this round is fully done. Wipe the
+        // round's transient state in place so a long-running beacon
+        // doesn't accumulate unbounded round_state entries.
+        if is_last_coin {
+            self.maybe_release_round(round);
+        }
+
         if coin_num == 0 {
-            if let Some(state) = self.round_state.get_mut(&round) {
-                state.committee_elected = true;
-            }
+            // PPT pg 28: θ for the next round is derived from this round's
+            // coin-0 beacon, which the next round's dealer cannot influence.
+            self.record_beacon_output_for_theta(round, number.as_slice());
 
-            let committee = self.elect_committee(number.clone()).await;
-
-            // Pure PPT:
-            // the committee of round r directly bootstraps the next frequency round.
+            // Pure PPT: every node is always a dealer in the next round.
             let next_round: Round = round + self.frequency;
+
+            // Now that θ(next_round) is in the cache, replay any
+            // AVSSSend packets that arrived for `next_round` BEFORE
+            // we had θ available (the async race window between fast
+            // and slow peers). This is the live-path fix for the
+            // "[PPT][THETA] requested theta but no previous-round
+            // beacon recorded" panic that used to crash slow nodes.
+            self.drain_pending_avss_for(next_round).await;
 
             if next_round <= self.max_rounds {
                 if !self.round_state.contains_key(&next_round) {
@@ -855,19 +952,6 @@ impl Context {
                         "[PPT][ROUND-INIT] node {} round {} eagerly created future PPT round {}",
                         self.myid,
                         round,
-                        next_round
-                    );
-                }
-
-                {
-                    let next_state = self.round_state.get_mut(&next_round).unwrap();
-                    next_state.set_committee(committee.clone());
-                    next_state.ppt_round_started = false;
-                    log::info!(
-                        "[PPT][COMMITTEE-HANDOFF] node {} round {} stored committee {:?} into future PPT round {}",
-                        self.myid,
-                        round,
-                        committee,
                         next_round
                     );
                 }
@@ -887,6 +971,21 @@ impl Context {
                     .as_millis()
             );
             log::info!("Number of messages passed between nodes: {}", self.num_messages);
+        }
+
+        // PPT pg 30-32 first-match optimisation: report whether this
+        // particular coin lies in the rejection-sampling "good range",
+        // so a downstream BFT consumer that wants a uniform [1,n] beacon
+        // can deterministically pick the first matched coin in batch
+        // order across all reconstructed coins.
+        let matched_in_range = self.coin_value_matches_uniform_range(number.as_slice());
+        if matched_in_range {
+            log::info!(
+                "[PPT][FIRST-MATCH] node {} round {} coin {} value lies in the uniform-sample range [0, n*floor(p/n))",
+                self.myid,
+                round,
+                coin_num
+            );
         }
 
         let cancel_handler = self.sync_send.send(

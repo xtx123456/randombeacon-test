@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     net::{SocketAddr, SocketAddrV4},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -6,6 +7,7 @@ use std::{
 use anyhow::{anyhow, Result};
 use config::Node;
 use crypto::aes_hash::HashState;
+use crypto::hash::Hash;
 use fnv::FnvHashMap;
 use fnv::FnvHashMap as HashMap;
 use network::{
@@ -13,84 +15,98 @@ use network::{
     Acknowledgement,
 };
 use num_bigint::BigUint;
-use tokio::{
-    sync::{mpsc::unbounded_channel, mpsc::UnboundedReceiver, oneshot},
-};
+use tokio::sync::{mpsc, oneshot};
+
+/// Bounded inbound channel capacity.
+///
+/// Replaces the original `unbounded_channel`. Bounded queues apply
+/// backpressure: when this node's consensus task can't keep up with
+/// the inbound rate, `Sender::send().await` blocks instead of growing
+/// unbounded memory; that backpressure propagates back to the TCP
+/// kernel buffer of the peer, which naturally throttles the sender.
+///
+/// Picked so that one round's-worth of n=64 broadcasts (~64 * 8 ≈ 512
+/// messages) easily fits even at high batch sizes, but a single slow
+/// task can't accumulate more than ~16 round-equivalents before
+/// senders start to block.
+pub const PPT_INBOUND_CHANNEL_CAPACITY: usize = 8192;
 
 use types::{
-    beacon::{CoinMsg, Replica, WrapperMsg},
+    beacon::{BeaconMsg, CoinMsg, Replica, WrapperMsg},
     Round, SyncMsg, SyncState,
 };
 
 use super::{CTRBCState, Handler, SyncHandler};
 
-/// This artifact implements the PPT-style asynchronous random beacon path.
-/// The current refactor explicitly runs in pure-PPT mode:
-/// - frequency is forced to 1
-/// - legacy Binary-AA is disabled on the main path
-pub struct Context {
-    /// Networking context
-    pub net_send: TcpReliableSender<Replica, WrapperMsg, Acknowledgement>,
-    pub net_recv: UnboundedReceiver<WrapperMsg>,
-    pub sync_send: TcpReliableSender<Replica, SyncMsg, Acknowledgement>,
-    pub sync_recv: UnboundedReceiver<SyncMsg>,
+/// Public, deterministic seed used to derive the round-0 degree-test
+/// challenge θ. Every node uses this, so dealers and verifiers agree
+/// without a previous beacon being available.
+pub const PPT_GENESIS_THETA_SEED: &[u8] = b"PPT_BEACON_GENESIS_THETA_v1";
 
-    /// Data context
+/// PPT random-beacon node context (pure-PPT mode: frequency φ = 1,
+/// every honest node is always a dealer, no anytrust committee, no
+/// legacy Binary-AA / Gather / CTRBC paths).
+pub struct Context {
+    // ---- Networking ----
+    pub net_send: TcpReliableSender<Replica, WrapperMsg, Acknowledgement>,
+    pub net_recv: mpsc::Receiver<WrapperMsg>,
+    pub sync_send: TcpReliableSender<Replica, SyncMsg, Acknowledgement>,
+    pub sync_recv: mpsc::Receiver<SyncMsg>,
+
+    // ---- Identity / sizing ----
     pub num_nodes: usize,
     pub myid: usize,
     pub num_faults: usize,
-    pub payload: usize,
-
-    /// Replica -> secret key
     pub sec_key_map: HashMap<Replica, Vec<u8>>,
 
-    /// Hardware acceleration context
+    // ---- Crypto context ----
     pub hash_context: HashState,
-
-    /// Secret-sharing domains
     pub secret_domain: BigUint,
     pub nonce_domain: BigUint,
 
-    /// Approximate-agreement parameters inherited from the old codebase.
-    /// They remain in the struct for compatibility, but the pure PPT path
-    /// no longer uses Binary-AA as a live protocol path.
-    pub rounds_aa: u32,
-    pub epsilon: u32,
-
+    // ---- Round bookkeeping ----
     pub curr_round: u32,
-    pub recon_round: u32,
-
-    /// Benchmarking
-    pub num_messages: u32,
     pub max_rounds: u32,
-    pub committee_size: usize,
-
-    /// Batch size β in the paper
     pub batch_size: usize,
-
-    /// Pure PPT mode forces frequency φ = 1.
+    /// Pure-PPT mode forces frequency φ = 1.
     pub frequency: Round,
-
-    /// Round state
     pub round_state: HashMap<Round, CTRBCState>,
 
-    /// Benchmarking individual pieces
-    pub bench: HashMap<String, u128>,
-
-    /// Legacy switch kept only to avoid cascading type churn.
-    pub bin_bun_aa: bool,
-
-    /// Exit protocol
-    exit_rx: oneshot::Receiver<()>,
-
-    /// ACS local state
+    // ---- ACS state ----
     pub acs_state: std::collections::HashMap<Round, crate::node::acs::state::ACSInstanceState>,
 
-    /// Queue for future messages
-    pub wrapper_msg_queue: HashMap<Round, Vec<WrapperMsg>>,
+    /// Round → degree-test challenge θ (large field). Populated when
+    /// each round's beacon output is finalised; consumed by the next
+    /// round's AVSS dealer / verifier path.
+    pub theta_per_round: HashMap<Round, BigUint>,
 
-    /// Cancel handlers
+    /// Globally banned dealers (across rounds). A dealer is banned
+    /// the moment any honest node detects a protocol-level violation
+    /// (invalid AVSS packet, equivocating ACS proposal,
+    /// Merkle/commitment mismatch in the post-ACS audit). Once
+    /// banned, the dealer is rejected from every future round's
+    /// AVSS, ACS, and reconstruction paths.
+    pub banned_dealers: HashSet<Replica>,
+
+    /// AVSSSend packets received before this node had θ for that
+    /// round. They are deferred (NOT dropped, NOT banned) and
+    /// replayed by `drain_pending_avss_for(round)` once
+    /// `record_beacon_output_for_theta` populates θ.
+    ///
+    /// This race window exists in pure PPT mode because round-r+1's
+    /// AVSSSend can reach a slow node before that node has finished
+    /// reconstructing round-r's coin 0 (which is the source of
+    /// θ(r+1)). Without buffering, the slow node would drop or
+    /// (worse) panic on the early packet and never recover the
+    /// dealer for round r+1.
+    pub pending_avss_for_theta:
+        HashMap<Round, Vec<(BeaconMsg, Hash, Replica)>>,
+
+    // ---- Diagnostics / lifecycle ----
+    pub num_messages: u32,
+    pub bench: HashMap<String, u128>,
     pub cancel_handlers: HashMap<Round, Vec<CancelHandler<Acknowledgement>>>,
+    exit_rx: oneshot::Receiver<()>,
 }
 
 impl Context {
@@ -115,20 +131,8 @@ impl Context {
         let mut syncer_map: FnvHashMap<Replica, SocketAddr> = FnvHashMap::default();
         syncer_map.insert(0, config.client_addr);
 
-        let committee_sizes: HashMap<usize, usize> = [
-            (4, 3),
-            (16, 11),
-            (40, 27),
-            (64, 43),
-            (112, 49),
-            (136, 51),
-            (160, 54),
-        ]
-        .iter()
-        .cloned()
-        .collect();
-
-        let (tx_net_to_consensus, rx_net_to_consensus) = unbounded_channel();
+        let (tx_net_to_consensus, rx_net_to_consensus) =
+            mpsc::channel::<WrapperMsg>(PPT_INBOUND_CHANNEL_CAPACITY);
         TcpReceiver::<Acknowledgement, WrapperMsg, _>::spawn(
             my_address,
             Handler::new(tx_net_to_consensus),
@@ -137,7 +141,8 @@ impl Context {
         let syncer_listen_port = config.client_port;
         let syncer_l_address = to_socket_address("0.0.0.0", syncer_listen_port);
 
-        let (tx_net_to_client, rx_net_from_client) = unbounded_channel();
+        let (tx_net_to_client, rx_net_from_client) =
+            mpsc::channel::<SyncMsg>(PPT_INBOUND_CHANNEL_CAPACITY);
         TcpReceiver::<Acknowledgement, SyncMsg, _>::spawn(
             syncer_l_address,
             SyncHandler::new(tx_net_to_client),
@@ -164,9 +169,6 @@ impl Context {
             )
             .unwrap();
 
-            let epsilon: u32 = ((1024 * 1024) / (config.num_nodes * config.num_faults)) as u32;
-            let rounds = (65.0 - ((epsilon as f32).log2().ceil())) as u32;
-
             let key0 = [5u8; 16];
             let key1 = [29u8; 16];
             let key2 = [23u8; 16];
@@ -181,8 +183,6 @@ impl Context {
                 );
             }
 
-            log::error!("[PPT] Appx consensus rounds: {}", rounds);
-
             let mut c = Context {
                 net_send: consensus_net,
                 net_recv: rx_net_to_consensus,
@@ -193,34 +193,26 @@ impl Context {
                 sec_key_map: HashMap::default(),
                 myid: config.id,
                 num_faults: config.num_faults,
-                payload: config.payload,
 
                 hash_context: hashstate,
                 secret_domain: prime.clone(),
                 nonce_domain: nonce_prime.clone(),
 
-                rounds_aa: rounds,
-                epsilon,
-
                 curr_round: 0,
-                recon_round: 20000,
-
-                num_messages: 0,
                 max_rounds: 20000,
-
-                bin_bun_aa: false,
-                committee_size: *committee_sizes.get(&config.num_nodes).unwrap(),
-
-                round_state: HashMap::default(),
                 batch_size: batch,
                 frequency: pure_ppt_frequency,
-                bench: HashMap::default(),
-
-                exit_rx,
-                cancel_handlers: HashMap::default(),
+                round_state: HashMap::default(),
 
                 acs_state: std::collections::HashMap::new(),
-                wrapper_msg_queue: HashMap::default(),
+                theta_per_round: HashMap::default(),
+                banned_dealers: HashSet::new(),
+                pending_avss_for_theta: HashMap::default(),
+
+                num_messages: 0,
+                bench: HashMap::default(),
+                cancel_handlers: HashMap::default(),
+                exit_rx,
             };
 
             for (id, sk_data) in config.sk_map.clone() {
@@ -246,6 +238,166 @@ impl Context {
         } else {
             self.bench.insert(func, elapsed_time);
         }
+    }
+
+    /// Mark a dealer as banned and propagate to every live ACS
+    /// instance.
+    pub fn ban_dealer_global(&mut self, dealer: Replica) {
+        if self.banned_dealers.insert(dealer) {
+            log::error!(
+                "[PPT][BAN] node {} permanently banning dealer {}",
+                self.myid,
+                dealer
+            );
+            for st in self.acs_state.values_mut() {
+                st.ban_dealer(dealer);
+            }
+        }
+    }
+
+    pub fn permanently_banned_dealers(&self) -> HashSet<Replica> {
+        self.banned_dealers.clone()
+    }
+
+    /// Locally AVSS-completed dealers for `round`, with banned
+    /// dealers filtered out.
+    pub fn local_completed_dealers(&self, round: Round) -> HashSet<Replica> {
+        let banned = &self.banned_dealers;
+        match self.round_state.get(&round) {
+            Some(rbc_state) => rbc_state
+                .avss_completed_dealers
+                .iter()
+                .copied()
+                .filter(|d| !banned.contains(d))
+                .collect(),
+            None => HashSet::new(),
+        }
+    }
+
+    /// θ for round `round` — the degree-test challenge that
+    /// dealers commit to and verifiers re-evaluate. The PPT
+    /// scheme requires θ to be unpredictable to the dealer at
+    /// commit time. We therefore derive it from the *previous
+    /// round's reconstructed beacon* (large field), which the
+    /// dealer cannot influence by the time it shares its round-r
+    /// secret.
+    ///
+    /// For round 0 we use a fixed public seed so all nodes agree
+    /// without a previous beacon being available.
+    ///
+    /// Returns `None` for round > 0 when the previous round's
+    /// beacon has not yet been recorded locally. This happens
+    /// naturally in async networks: a fast peer may broadcast its
+    /// round-(r+1) AVSSSend before this node has finished
+    /// reconstructing round-r's coin 0. The caller MUST handle
+    /// `None` by *deferring* the action (typically by buffering
+    /// the AVSSSend in `pending_avss_for_theta`) — never by
+    /// dropping or banning the dealer, since this is a transient
+    /// race window, not a protocol violation.
+    pub fn theta_for_round(&self, round: Round) -> Option<BigUint> {
+        if round == 0 {
+            return Some(Self::theta_from_bytes(
+                PPT_GENESIS_THETA_SEED,
+                &self.nonce_domain,
+            ));
+        }
+        self.theta_per_round.get(&round).cloned()
+    }
+
+    /// Record this round's beacon output as the source of the
+    /// next round's degree-test challenge. `output_bytes` is the
+    /// reconstructed beacon value (arbitrary-length); we hash it
+    /// into the large field so θ has full large-field entropy
+    /// rather than being constrained to the small secret field.
+    pub fn record_beacon_output_for_theta(&mut self, round: Round, output_bytes: &[u8]) {
+        let theta = Self::theta_from_bytes(output_bytes, &self.nonce_domain);
+        self.theta_per_round.insert(round + 1, theta);
+    }
+
+    /// Buffer an AVSSSend that arrived before its θ was available.
+    /// The packet is replayed by `drain_pending_avss_for(round)`
+    /// once `record_beacon_output_for_theta` populates θ for that
+    /// round.
+    pub fn buffer_avss_for_theta(
+        &mut self,
+        round: Round,
+        beacon_msg: BeaconMsg,
+        transcript_root: Hash,
+        dealer: Replica,
+    ) {
+        log::info!(
+            "[PPT][THETA-DEFER] node {} buffering AVSSSend from dealer {} for round {} until θ becomes available",
+            self.myid,
+            dealer,
+            round
+        );
+        self.pending_avss_for_theta
+            .entry(round)
+            .or_default()
+            .push((beacon_msg, transcript_root, dealer));
+    }
+
+    /// Take (move out) every buffered AVSSSend for `round`.
+    /// Caller is expected to immediately re-process each entry
+    /// via `process_avss_send`.
+    pub fn take_pending_avss_for(
+        &mut self,
+        round: Round,
+    ) -> Vec<(BeaconMsg, Hash, Replica)> {
+        self.pending_avss_for_theta.remove(&round).unwrap_or_default()
+    }
+
+    /// PPT slide pg 30-32 "first-match" rejection-sampling rule.
+    ///
+    /// A reconstructed coin value `v ∈ [0, p)` is *uniformly usable*
+    /// as a sample in `[0, n)` (e.g. for BFT leader election) iff
+    /// `v < n * floor(p / n)`. Coins outside the cutoff are biased
+    /// and must be discarded by the consumer; the protocol picks the
+    /// *first* coin (in batch order) that satisfies the rule.
+    ///
+    /// This helper just answers the boolean check; the iteration
+    /// over the batch is done by the consumer (e.g. the syncer or a
+    /// downstream BFT module) so that the protocol does not silently
+    /// drop coins that some other consumer may still want for
+    /// non-uniform purposes.
+    pub fn coin_value_matches_uniform_range(&self, coin_bytes: &[u8]) -> bool {
+        Self::coin_value_matches_uniform_range_with(
+            coin_bytes,
+            &self.secret_domain,
+            self.num_nodes,
+        )
+    }
+
+    pub(crate) fn theta_from_bytes(seed: &[u8], large_field: &BigUint) -> BigUint {
+        // Wide-reduction so the result is statistically indistinguishable
+        // from uniform in [0, q): hash twice and concatenate. This gives
+        // 64 bytes of output ≫ |q| ≈ 32 bytes, then reduce mod q.
+        let h1 = crypto::hash::do_hash(seed);
+        let mut prefix = b"PPT_BEACON_THETA_v1::".to_vec();
+        prefix.extend_from_slice(&h1);
+        let h2 = crypto::hash::do_hash(prefix.as_slice());
+        let mut wide = Vec::with_capacity(h1.len() + h2.len());
+        wide.extend_from_slice(&h1);
+        wide.extend_from_slice(&h2);
+        BigUint::from_bytes_be(&wide) % large_field
+    }
+
+    /// Pure helper used by the first-match selector. Exposed for
+    /// tests; production code goes through
+    /// `coin_value_matches_uniform_range`.
+    pub(crate) fn coin_value_matches_uniform_range_with(
+        coin_bytes: &[u8],
+        secret_domain: &BigUint,
+        num_nodes: usize,
+    ) -> bool {
+        if num_nodes == 0 {
+            return false;
+        }
+        let n = BigUint::from(num_nodes as u64);
+        let cutoff: BigUint = (secret_domain / &n) * &n;
+        let v = BigUint::from_bytes_be(coin_bytes);
+        let v_mod = &v % secret_domain;
+        v_mod < cutoff
     }
 
     /// Broadcast a message to all nodes.
@@ -301,23 +453,16 @@ impl Context {
                 }
                 msg = self.net_recv.recv() => {
                     let msg = msg.ok_or_else(|| anyhow!("Networking layer has closed"))?;
-
-                    match &msg.protmsg {
-                        CoinMsg::ACSInit((sender, round, dealers)) => {
-                            log::error!(
-                                "[PPT][ACS-INGRESS] node {} got wrapper ACSInit: payload-sender={} payload-round={} dealers={:?} wrapper-sender={} wrapper-round={}",
-                                self.myid,
-                                sender,
-                                round,
-                                dealers,
-                                msg.sender,
-                                msg.round
-                            );
-                        }
-                        _ => {}
-                    }
-
                     self.process_msg(msg).await;
+                    // Yield after every inbound message so a single
+                    // expensive `process_msg` (e.g. ingest of a
+                    // batch_size=100 BatchBeaconConstruct + cascade
+                    // of n broadcasts) doesn't starve the rest of
+                    // the tokio worker. Without this, head-of-line
+                    // blocking under high round-rate (batch=20 case)
+                    // would let the inbound queue grow until the
+                    // protocol stalled.
+                    tokio::task::yield_now().await;
                 }
                 sync_msg = self.sync_recv.recv() => {
                     let sync_msg = sync_msg.ok_or_else(|| anyhow!("Networking layer has closed"))?;
@@ -373,4 +518,72 @@ impl Context {
 pub fn to_socket_address(ip_str: &str, port: u16) -> SocketAddr {
     let addr = SocketAddrV4::new(ip_str.parse().unwrap(), port);
     addr.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use num_bigint::BigUint;
+
+    #[test]
+    fn theta_is_in_large_field_and_uses_full_entropy() {
+        // A small large field for testability.
+        let q = BigUint::from(1_000_003u64);
+        // Two distinct seeds must produce two distinct θ values
+        // (probability of clash here is ~1/q which is well below the
+        // statistical threshold for this test).
+        let t1 = Context::theta_from_bytes(b"seed-A", &q);
+        let t2 = Context::theta_from_bytes(b"seed-B", &q);
+        assert!(t1 < q);
+        assert!(t2 < q);
+        assert_ne!(t1, t2);
+    }
+
+    #[test]
+    fn theta_is_not_round_predictable() {
+        // The buggy old implementation hashed only the round number,
+        // so any honest seed-derivation with the SAME round produced
+        // the same θ. The new implementation must take the full
+        // beacon-output bytes into account.
+        let q = BigUint::from(1_000_003u64);
+        let beacon_a = b"\x00\x00\x00\x05BEACON_OUTPUT_A".to_vec();
+        let beacon_b = b"\x00\x00\x00\x05BEACON_OUTPUT_B".to_vec();
+        let theta_a = Context::theta_from_bytes(&beacon_a, &q);
+        let theta_b = Context::theta_from_bytes(&beacon_b, &q);
+        assert_ne!(theta_a, theta_b);
+    }
+
+    #[test]
+    fn first_match_uniform_range_check() {
+        // p = 11, n = 4 ⇒ cutoff = 4 * floor(11/4) = 4 * 2 = 8
+        // values in [0, 8) accept; [8, 11) reject.
+        let p = BigUint::from(11u32);
+        for v in 0u32..8 {
+            let bytes = BigUint::from(v).to_bytes_be();
+            assert!(
+                Context::coin_value_matches_uniform_range_with(&bytes, &p, 4),
+                "v={} should match",
+                v
+            );
+        }
+        for v in 8u32..11 {
+            let bytes = BigUint::from(v).to_bytes_be();
+            assert!(
+                !Context::coin_value_matches_uniform_range_with(&bytes, &p, 4),
+                "v={} should NOT match",
+                v
+            );
+        }
+    }
+
+    #[test]
+    fn first_match_handles_oversized_input_via_mod_p() {
+        let p = BigUint::from(11u32);
+        // 19 mod 11 = 8, which is the rejection boundary.
+        let bytes = BigUint::from(19u32).to_bytes_be();
+        assert!(!Context::coin_value_matches_uniform_range_with(&bytes, &p, 4));
+        // 18 mod 11 = 7, accepted.
+        let bytes = BigUint::from(18u32).to_bytes_be();
+        assert!(Context::coin_value_matches_uniform_range_with(&bytes, &p, 4));
+    }
 }
