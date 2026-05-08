@@ -2,6 +2,7 @@ pub mod shamir;
 pub use shamir::*;
 
 pub mod batch_wss;
+#[allow(unused_imports)]
 pub use batch_wss::*;
 
 pub mod context;
@@ -17,6 +18,4 @@ pub use process::*;
 pub mod ctrbc;
 pub use ctrbc::*;
 
-pub mod appxcon;
 pub mod acs;
-pub mod gather;
