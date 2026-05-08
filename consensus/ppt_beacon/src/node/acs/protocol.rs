@@ -41,23 +41,41 @@ impl Context {
     /// driver reflects that into the ACS state machine and runs a
     /// full cascade so any downstream phase that became eligible
     /// fires immediately.
+    ///
+    /// Order matters here:
+    /// 1. Apply bans / new completions.
+    /// 2. Re-validate buffered proposals (can grow `validated_proposers`).
+    /// 3. Re-rate cached W1 senders against the new
+    ///    `validated_proposers` (can grow `w1_ratified`).
+    /// 4. Re-rate cached W2 senders against the new `w1_ratified`
+    ///    (can grow `w2_ratified`).
+    /// 5. Cascade — try to send our own Propose / W1 / W2 / Decide.
+    ///
+    /// Without steps 3 and 4, cached W1 / W2 messages from peers
+    /// that arrived BEFORE we had validated the proposers they
+    /// reference would never be re-evaluated, and ACS would stall
+    /// forever in any execution where some dealer's AVSS completes
+    /// at one node noticeably later than at another.
     #[async_recursion]
     pub async fn acs_note_local_change(&mut self, round: Round) {
         let local_completed = self.local_completed_dealers(round);
         let banned: Vec<Replica> = self.permanently_banned_dealers().into_iter().collect();
 
-        let st = self
-            .acs_state
-            .entry(round)
-            .or_insert_with(|| ACSInstanceState::new(round as usize, self.myid));
-        for d in banned.into_iter() {
-            st.ban_dealer(d);
+        {
+            let st = self
+                .acs_state
+                .entry(round)
+                .or_insert_with(|| ACSInstanceState::new(round as usize, self.myid));
+            for d in banned.into_iter() {
+                st.ban_dealer(d);
+            }
+            for d in local_completed.into_iter() {
+                st.note_completed(d);
+            }
+            st.revalidate_pending();
+            st.rerate_w1();
+            st.rerate_w2();
         }
-        for d in local_completed.into_iter() {
-            st.note_completed(d);
-        }
-        // Newly completed dealers may unlock buffered proposals.
-        st.revalidate_pending();
 
         self.acs_try_send_propose(round).await;
         self.acs_cascade(round).await;
@@ -204,18 +222,31 @@ impl Context {
         let local_completed = self.local_completed_dealers(round);
         let banned: Vec<Replica> = self.permanently_banned_dealers().into_iter().collect();
 
-        let st = self
-            .acs_state
-            .entry(round)
-            .or_insert_with(|| ACSInstanceState::new(round as usize, self.myid));
-        for d in banned.into_iter() {
-            st.ban_dealer(d);
-        }
-        for d in local_completed.into_iter() {
-            st.note_completed(d);
-        }
+        {
+            let st = self
+                .acs_state
+                .entry(round)
+                .or_insert_with(|| ACSInstanceState::new(round as usize, self.myid));
+            for d in banned.into_iter() {
+                st.ban_dealer(d);
+            }
+            for d in local_completed.into_iter() {
+                st.note_completed(d);
+            }
 
-        st.record_propose(sender, dealers);
+            // If `record_propose` newly validates `sender`, it grows
+            // `validated_proposers`. Re-rate cached W1 / W2 messages
+            // so any peer that previously couldn't be ratified
+            // (because they referenced this proposer) becomes
+            // ratifiable now. Without this, peers that sent W1
+            // referencing `sender` BEFORE we received `sender`'s
+            // proposal would stay un-ratified and ACS would stall.
+            let newly_validated = st.record_propose(sender, dealers);
+            if newly_validated {
+                st.rerate_w1();
+                st.rerate_w2();
+            }
+        }
 
         self.acs_cascade(round).await;
     }
@@ -237,12 +268,21 @@ impl Context {
             return;
         }
 
-        let st = self
-            .acs_state
-            .entry(round)
-            .or_insert_with(|| ACSInstanceState::new(round as usize, self.myid));
+        {
+            let st = self
+                .acs_state
+                .entry(round)
+                .or_insert_with(|| ACSInstanceState::new(round as usize, self.myid));
 
-        st.record_w1(sender, validated);
+            // If this Witness1 is newly ratifiable, `w1_ratified`
+            // grows; re-rate cached W2 messages because a peer that
+            // previously couldn't be ratified (because they
+            // referenced this W1 sender) becomes ratifiable now.
+            let newly_ratified = st.record_w1(sender, validated);
+            if newly_ratified {
+                st.rerate_w2();
+            }
+        }
 
         self.acs_cascade(round).await;
     }
@@ -264,12 +304,13 @@ impl Context {
             return;
         }
 
-        let st = self
-            .acs_state
-            .entry(round)
-            .or_insert_with(|| ACSInstanceState::new(round as usize, self.myid));
-
-        st.record_w2(sender, witnessed);
+        {
+            let st = self
+                .acs_state
+                .entry(round)
+                .or_insert_with(|| ACSInstanceState::new(round as usize, self.myid));
+            st.record_w2(sender, witnessed);
+        }
 
         self.acs_cascade(round).await;
     }

@@ -544,6 +544,72 @@ mod tests {
     }
 
     #[test]
+    fn rerate_w1_unblocks_after_late_proposal_validates() {
+        // Scenario: this node receives Witness1 from peer A whose
+        // V_k includes proposer P, BEFORE this node has validated
+        // P's proposal locally. With re-rating, A's W1 must become
+        // ratified the moment P's proposal validates.
+        let mut st = fresh(3, &[10, 11, 12]);
+
+        // Peer A has already sent its W1 with V_k = {0, 1, 2, 3}.
+        // We have not yet seen any of those proposers' proposals.
+        let a = 7 as Replica;
+        let v_k: Vec<Replica> = vec![0, 1, 2, 3];
+        let newly_ratified = st.record_w1(a, v_k.clone());
+        assert!(!newly_ratified, "no proposer is validated yet");
+        assert!(!st.w1_ratified.contains(&a));
+
+        // Now proposers 0..3 send their proposals; each has dealers
+        // = our locally completed set, so each validates immediately.
+        for p in 0..4u32 {
+            let _ = st.record_propose(p as Replica, vec![10, 11, 12]);
+        }
+        assert_eq!(st.validated_proposers.len(), 4);
+
+        // A's W1 was buffered; rerate must now ratify it.
+        let newly = st.rerate_w1();
+        assert!(newly.contains(&a));
+        assert!(st.w1_ratified.contains(&a));
+    }
+
+    #[test]
+    fn rerate_w2_unblocks_after_late_w1_ratifies() {
+        // Scenario: this node receives Witness2 from peer B whose
+        // W2 references W1 sender X, BEFORE X's W1 has been
+        // ratified locally. Once X's W1 ratifies, rerate_w2 must
+        // make B's W2 ratifiable.
+        let threshold = 3;
+        let mut st = fresh(threshold, &[10, 11, 12]);
+
+        // 3 proposals validate immediately.
+        for p in 0..3u32 {
+            let _ = st.record_propose(p as Replica, vec![10, 11, 12]);
+        }
+        assert!(st.ready_to_send_w1(threshold));
+
+        // Peer X sends W1 with V_x = {0, 1, 2}. Validates immediately.
+        let x = 5 as Replica;
+        let _ = st.record_w1(x, vec![0, 1, 2]);
+        assert!(st.w1_ratified.contains(&x));
+
+        // Peer B sends W2 referencing some W1 sender Y whom we
+        // haven't received yet.
+        let b = 6 as Replica;
+        let y = 9 as Replica;
+        let _ = st.record_w2(b, vec![x, y]);
+        assert!(!st.w2_ratified.contains(&b), "Y not ratified yet");
+
+        // Y's W1 finally arrives and ratifies.
+        let _ = st.record_w1(y, vec![0, 1, 2]);
+        assert!(st.w1_ratified.contains(&y));
+
+        // rerate_w2 must now ratify B (its w_set ⊆ w1_ratified).
+        let newly = st.rerate_w2();
+        assert!(newly.contains(&b));
+        assert!(st.w2_ratified.contains(&b));
+    }
+
+    #[test]
     fn finalize_skips_banned_dealers() {
         let threshold = 3;
         let completed = vec![10, 11, 12, 13];
