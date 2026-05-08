@@ -1,7 +1,6 @@
-
 use async_trait::async_trait;
 use futures_util::SinkExt;
-use network::{Acknowledgement};
+use network::Acknowledgement;
 use tokio::sync::mpsc::UnboundedSender;
 use types::{beacon::WrapperMsg, SyncMsg};
 
@@ -17,24 +16,27 @@ impl Handler {
 }
 
 #[async_trait]
-impl network::Handler<Acknowledgement, WrapperMsg>
-    for Handler
-{
+impl network::Handler<Acknowledgement, WrapperMsg> for Handler {
     async fn dispatch(
         &self,
         msg: WrapperMsg,
         writer: &mut network::Writer<Acknowledgement>,
     ) {
-        // Forward the message
-        self.consensus_tx
-            .send(msg)
-            .expect("Failed to send message to the consensus channel");
+        // Forward the message to the consensus task. If the consensus
+        // task has died (channel receiver dropped), DO NOT panic — that
+        // would kill the network task too and turn a single-task crash
+        // into a node-wide crash. Just log and drop the inbound message.
+        if let Err(e) = self.consensus_tx.send(msg) {
+            log::error!(
+                "[PPT][NET] consensus channel closed; dropping inbound msg ({})",
+                e
+            );
+            return;
+        }
 
-        // Acknowledge
-        writer
-            .send(Acknowledgement::Pong)
-            .await
-            .expect("Failed to send an acknowledgement");
+        if let Err(e) = writer.send(Acknowledgement::Pong).await {
+            log::warn!("[PPT][NET] failed to send ack to peer: {}", e);
+        }
     }
 }
 
@@ -50,23 +52,23 @@ impl SyncHandler {
 }
 
 #[async_trait]
-impl network::Handler<Acknowledgement, SyncMsg>
-    for SyncHandler
-{
+impl network::Handler<Acknowledgement, SyncMsg> for SyncHandler {
     async fn dispatch(
         &self,
         msg: SyncMsg,
         writer: &mut network::Writer<Acknowledgement>,
     ) {
-        // Forward the message
-        self.consensus_tx
-            .send(msg)
-            .expect("Failed to send message to the consensus channel");
+        // Same graceful-close behaviour as `Handler::dispatch` above.
+        if let Err(e) = self.consensus_tx.send(msg) {
+            log::error!(
+                "[PPT][NET-SYNC] sync channel closed; dropping inbound sync msg ({})",
+                e
+            );
+            return;
+        }
 
-        // Acknowledge
-        writer
-            .send(Acknowledgement::Pong)
-            .await
-            .expect("Failed to send an acknowledgement");
+        if let Err(e) = writer.send(Acknowledgement::Pong).await {
+            log::warn!("[PPT][NET-SYNC] failed to send ack to syncer: {}", e);
+        }
     }
 }
