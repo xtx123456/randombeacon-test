@@ -30,86 +30,56 @@ use super::{CTRBCState, Handler, SyncHandler};
 /// without a previous beacon being available.
 pub const PPT_GENESIS_THETA_SEED: &[u8] = b"PPT_BEACON_GENESIS_THETA_v1";
 
-/// This artifact implements the PPT-style asynchronous random beacon path.
-/// The current refactor explicitly runs in pure-PPT mode:
-/// - frequency is forced to 1
-/// - legacy Binary-AA is disabled on the main path
+/// PPT random-beacon node context (pure-PPT mode: frequency φ = 1,
+/// every honest node is always a dealer, no anytrust committee, no
+/// legacy Binary-AA / Gather / CTRBC paths).
 pub struct Context {
-    /// Networking context
+    // ---- Networking ----
     pub net_send: TcpReliableSender<Replica, WrapperMsg, Acknowledgement>,
     pub net_recv: UnboundedReceiver<WrapperMsg>,
     pub sync_send: TcpReliableSender<Replica, SyncMsg, Acknowledgement>,
     pub sync_recv: UnboundedReceiver<SyncMsg>,
 
-    /// Data context
+    // ---- Identity / sizing ----
     pub num_nodes: usize,
     pub myid: usize,
     pub num_faults: usize,
-    pub payload: usize,
-
-    /// Replica -> secret key
     pub sec_key_map: HashMap<Replica, Vec<u8>>,
 
-    /// Hardware acceleration context
+    // ---- Crypto context ----
     pub hash_context: HashState,
-
-    /// Secret-sharing domains
     pub secret_domain: BigUint,
     pub nonce_domain: BigUint,
 
-    /// Approximate-agreement parameters inherited from the old codebase.
-    /// They remain in the struct for compatibility, but the pure PPT path
-    /// no longer uses Binary-AA as a live protocol path.
-    pub rounds_aa: u32,
-    pub epsilon: u32,
-
+    // ---- Round bookkeeping ----
     pub curr_round: u32,
-    pub recon_round: u32,
-
-    /// Benchmarking
-    pub num_messages: u32,
     pub max_rounds: u32,
-    pub committee_size: usize,
-
-    /// Batch size β in the paper
     pub batch_size: usize,
-
-    /// Pure PPT mode forces frequency φ = 1.
+    /// Pure-PPT mode forces frequency φ = 1.
     pub frequency: Round,
-
-    /// Round state
     pub round_state: HashMap<Round, CTRBCState>,
 
-    /// Benchmarking individual pieces
-    pub bench: HashMap<String, u128>,
-
-    /// Legacy switch kept only to avoid cascading type churn.
-    pub bin_bun_aa: bool,
-
-    /// Exit protocol
-    exit_rx: oneshot::Receiver<()>,
-
-    /// ACS local state
+    // ---- ACS state ----
     pub acs_state: std::collections::HashMap<Round, crate::node::acs::state::ACSInstanceState>,
 
-    /// Round → degree-test challenge θ (large field). Populated as
-    /// each round's beacon output is finalised; consumed by the
-    /// next round's AVSS dealer / verifier path.
+    /// Round → degree-test challenge θ (large field). Populated when
+    /// each round's beacon output is finalised; consumed by the next
+    /// round's AVSS dealer / verifier path.
     pub theta_per_round: HashMap<Round, BigUint>,
 
     /// Globally banned dealers (across rounds). A dealer is banned
-    /// the moment any honest node detects a protocol-level
-    /// violation: an invalid AVSS packet, an equivocating ACS
-    /// proposal, or a Merkle/commitment mismatch in the post-ACS
-    /// audit. Once banned, the dealer is rejected from every
-    /// future round's AVSS, ACS, and reconstruction paths.
+    /// the moment any honest node detects a protocol-level violation
+    /// (invalid AVSS packet, equivocating ACS proposal,
+    /// Merkle/commitment mismatch in the post-ACS audit). Once
+    /// banned, the dealer is rejected from every future round's
+    /// AVSS, ACS, and reconstruction paths.
     pub banned_dealers: HashSet<Replica>,
 
-    /// Queue for future messages
-    pub wrapper_msg_queue: HashMap<Round, Vec<WrapperMsg>>,
-
-    /// Cancel handlers
+    // ---- Diagnostics / lifecycle ----
+    pub num_messages: u32,
+    pub bench: HashMap<String, u128>,
     pub cancel_handlers: HashMap<Round, Vec<CancelHandler<Acknowledgement>>>,
+    exit_rx: oneshot::Receiver<()>,
 }
 
 impl Context {
@@ -133,13 +103,6 @@ impl Context {
 
         let mut syncer_map: FnvHashMap<Replica, SocketAddr> = FnvHashMap::default();
         syncer_map.insert(0, config.client_addr);
-
-        // Pure PPT mode: every node is always a dealer; there is no
-        // anytrust committee selection. `committee_size` is kept
-        // only because some downstream metrics still read it; we
-        // pin it to `num_nodes` so any code path that still touches
-        // it observes the full set.
-        let committee_size: usize = config.num_nodes;
 
         let (tx_net_to_consensus, rx_net_to_consensus) = unbounded_channel();
         TcpReceiver::<Acknowledgement, WrapperMsg, _>::spawn(
@@ -177,9 +140,6 @@ impl Context {
             )
             .unwrap();
 
-            let epsilon: u32 = ((1024 * 1024) / (config.num_nodes * config.num_faults)) as u32;
-            let rounds = (65.0 - ((epsilon as f32).log2().ceil())) as u32;
-
             let key0 = [5u8; 16];
             let key1 = [29u8; 16];
             let key2 = [23u8; 16];
@@ -194,8 +154,6 @@ impl Context {
                 );
             }
 
-            log::error!("[PPT] Appx consensus rounds: {}", rounds);
-
             let mut c = Context {
                 net_send: consensus_net,
                 net_recv: rx_net_to_consensus,
@@ -206,37 +164,25 @@ impl Context {
                 sec_key_map: HashMap::default(),
                 myid: config.id,
                 num_faults: config.num_faults,
-                payload: config.payload,
 
                 hash_context: hashstate,
                 secret_domain: prime.clone(),
                 nonce_domain: nonce_prime.clone(),
 
-                rounds_aa: rounds,
-                epsilon,
-
                 curr_round: 0,
-                recon_round: 20000,
-
-                num_messages: 0,
                 max_rounds: 20000,
-
-                bin_bun_aa: false,
-                committee_size,
-
-                round_state: HashMap::default(),
                 batch_size: batch,
                 frequency: pure_ppt_frequency,
-                bench: HashMap::default(),
-
-                exit_rx,
-                cancel_handlers: HashMap::default(),
+                round_state: HashMap::default(),
 
                 acs_state: std::collections::HashMap::new(),
-                wrapper_msg_queue: HashMap::default(),
-
                 theta_per_round: HashMap::default(),
                 banned_dealers: HashSet::new(),
+
+                num_messages: 0,
+                bench: HashMap::default(),
+                cancel_handlers: HashMap::default(),
+                exit_rx,
             };
 
             for (id, sk_data) in config.sk_map.clone() {
@@ -444,22 +390,6 @@ impl Context {
                 }
                 msg = self.net_recv.recv() => {
                     let msg = msg.ok_or_else(|| anyhow!("Networking layer has closed"))?;
-
-                    match &msg.protmsg {
-                        CoinMsg::ACSInit((sender, round, dealers)) => {
-                            log::error!(
-                                "[PPT][ACS-INGRESS] node {} got wrapper ACSInit: payload-sender={} payload-round={} dealers={:?} wrapper-sender={} wrapper-round={}",
-                                self.myid,
-                                sender,
-                                round,
-                                dealers,
-                                msg.sender,
-                                msg.round
-                            );
-                        }
-                        _ => {}
-                    }
-
                     self.process_msg(msg).await;
                 }
                 sync_msg = self.sync_recv.recv() => {
