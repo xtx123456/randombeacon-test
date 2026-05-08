@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     net::{SocketAddr, SocketAddrV4},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -23,6 +24,11 @@ use types::{
 };
 
 use super::{CTRBCState, Handler, SyncHandler};
+
+/// Public, deterministic seed used to derive the round-0 degree-test
+/// challenge θ. Every node uses this, so dealers and verifiers agree
+/// without a previous beacon being available.
+pub const PPT_GENESIS_THETA_SEED: &[u8] = b"PPT_BEACON_GENESIS_THETA_v1";
 
 /// This artifact implements the PPT-style asynchronous random beacon path.
 /// The current refactor explicitly runs in pure-PPT mode:
@@ -86,6 +92,19 @@ pub struct Context {
     /// ACS local state
     pub acs_state: std::collections::HashMap<Round, crate::node::acs::state::ACSInstanceState>,
 
+    /// Round → degree-test challenge θ (large field). Populated as
+    /// each round's beacon output is finalised; consumed by the
+    /// next round's AVSS dealer / verifier path.
+    pub theta_per_round: HashMap<Round, BigUint>,
+
+    /// Globally banned dealers (across rounds). A dealer is banned
+    /// the moment any honest node detects a protocol-level
+    /// violation: an invalid AVSS packet, an equivocating ACS
+    /// proposal, or a Merkle/commitment mismatch in the post-ACS
+    /// audit. Once banned, the dealer is rejected from every
+    /// future round's AVSS, ACS, and reconstruction paths.
+    pub banned_dealers: HashSet<Replica>,
+
     /// Queue for future messages
     pub wrapper_msg_queue: HashMap<Round, Vec<WrapperMsg>>,
 
@@ -115,18 +134,12 @@ impl Context {
         let mut syncer_map: FnvHashMap<Replica, SocketAddr> = FnvHashMap::default();
         syncer_map.insert(0, config.client_addr);
 
-        let committee_sizes: HashMap<usize, usize> = [
-            (4, 3),
-            (16, 11),
-            (40, 27),
-            (64, 43),
-            (112, 49),
-            (136, 51),
-            (160, 54),
-        ]
-        .iter()
-        .cloned()
-        .collect();
+        // Pure PPT mode: every node is always a dealer; there is no
+        // anytrust committee selection. `committee_size` is kept
+        // only because some downstream metrics still read it; we
+        // pin it to `num_nodes` so any code path that still touches
+        // it observes the full set.
+        let committee_size: usize = config.num_nodes;
 
         let (tx_net_to_consensus, rx_net_to_consensus) = unbounded_channel();
         TcpReceiver::<Acknowledgement, WrapperMsg, _>::spawn(
@@ -209,7 +222,7 @@ impl Context {
                 max_rounds: 20000,
 
                 bin_bun_aa: false,
-                committee_size: *committee_sizes.get(&config.num_nodes).unwrap(),
+                committee_size,
 
                 round_state: HashMap::default(),
                 batch_size: batch,
@@ -221,6 +234,9 @@ impl Context {
 
                 acs_state: std::collections::HashMap::new(),
                 wrapper_msg_queue: HashMap::default(),
+
+                theta_per_round: HashMap::default(),
+                banned_dealers: HashSet::new(),
             };
 
             for (id, sk_data) in config.sk_map.clone() {
@@ -246,6 +262,133 @@ impl Context {
         } else {
             self.bench.insert(func, elapsed_time);
         }
+    }
+
+    /// Mark a dealer as banned and propagate to every live ACS
+    /// instance.
+    pub fn ban_dealer_global(&mut self, dealer: Replica) {
+        if self.banned_dealers.insert(dealer) {
+            log::error!(
+                "[PPT][BAN] node {} permanently banning dealer {}",
+                self.myid,
+                dealer
+            );
+            for st in self.acs_state.values_mut() {
+                st.ban_dealer(dealer);
+            }
+        }
+    }
+
+    pub fn permanently_banned_dealers(&self) -> HashSet<Replica> {
+        self.banned_dealers.clone()
+    }
+
+    /// Locally AVSS-completed dealers for `round`, with banned
+    /// dealers filtered out.
+    pub fn local_completed_dealers(&self, round: Round) -> HashSet<Replica> {
+        let banned = &self.banned_dealers;
+        match self.round_state.get(&round) {
+            Some(rbc_state) => rbc_state
+                .avss_completed_dealers
+                .iter()
+                .copied()
+                .filter(|d| !banned.contains(d))
+                .collect(),
+            None => HashSet::new(),
+        }
+    }
+
+    /// θ for round `round` — the degree-test challenge that
+    /// dealers commit to and verifiers re-evaluate. The PPT
+    /// scheme requires θ to be unpredictable to the dealer at
+    /// commit time. We therefore derive it from the *previous
+    /// round's reconstructed beacon* (large field), which the
+    /// dealer cannot influence by the time it shares its round-r
+    /// secret.
+    ///
+    /// For round 0 we use a fixed public seed so all nodes agree
+    /// without a previous beacon being available.
+    pub fn theta_for_round(&self, round: Round) -> BigUint {
+        if round == 0 {
+            return Self::theta_from_bytes(PPT_GENESIS_THETA_SEED, &self.nonce_domain);
+        }
+        if let Some(theta) = self.theta_per_round.get(&round) {
+            return theta.clone();
+        }
+        // Round-r dealer / verifier should always have round-(r-1)'s
+        // beacon recorded before they touch this method. If not, we
+        // refuse to fall back to a predictable value: returning a
+        // distinguished sentinel θ would silently reintroduce the
+        // hash(round) bug. Instead, we panic loudly so the bug is
+        // caught in testing rather than reducing the security
+        // parameter at runtime.
+        panic!(
+            "[PPT][THETA] round {} requested theta but no previous-round beacon recorded",
+            round
+        );
+    }
+
+    /// Record this round's beacon output as the source of the
+    /// next round's degree-test challenge. `output_bytes` is the
+    /// reconstructed beacon value (arbitrary-length); we hash it
+    /// into the large field so θ has full large-field entropy
+    /// rather than being constrained to the small secret field.
+    pub fn record_beacon_output_for_theta(&mut self, round: Round, output_bytes: &[u8]) {
+        let theta = Self::theta_from_bytes(output_bytes, &self.nonce_domain);
+        self.theta_per_round.insert(round + 1, theta);
+    }
+
+    /// PPT slide pg 30-32 "first-match" rejection-sampling rule.
+    ///
+    /// A reconstructed coin value `v ∈ [0, p)` is *uniformly usable*
+    /// as a sample in `[0, n)` (e.g. for BFT leader election) iff
+    /// `v < n * floor(p / n)`. Coins outside the cutoff are biased
+    /// and must be discarded by the consumer; the protocol picks the
+    /// *first* coin (in batch order) that satisfies the rule.
+    ///
+    /// This helper just answers the boolean check; the iteration
+    /// over the batch is done by the consumer (e.g. the syncer or a
+    /// downstream BFT module) so that the protocol does not silently
+    /// drop coins that some other consumer may still want for
+    /// non-uniform purposes.
+    pub fn coin_value_matches_uniform_range(&self, coin_bytes: &[u8]) -> bool {
+        Self::coin_value_matches_uniform_range_with(
+            coin_bytes,
+            &self.secret_domain,
+            self.num_nodes,
+        )
+    }
+
+    pub(crate) fn theta_from_bytes(seed: &[u8], large_field: &BigUint) -> BigUint {
+        // Wide-reduction so the result is statistically indistinguishable
+        // from uniform in [0, q): hash twice and concatenate. This gives
+        // 64 bytes of output ≫ |q| ≈ 32 bytes, then reduce mod q.
+        let h1 = crypto::hash::do_hash(seed);
+        let mut prefix = b"PPT_BEACON_THETA_v1::".to_vec();
+        prefix.extend_from_slice(&h1);
+        let h2 = crypto::hash::do_hash(prefix.as_slice());
+        let mut wide = Vec::with_capacity(h1.len() + h2.len());
+        wide.extend_from_slice(&h1);
+        wide.extend_from_slice(&h2);
+        BigUint::from_bytes_be(&wide) % large_field
+    }
+
+    /// Pure helper used by the first-match selector. Exposed for
+    /// tests; production code goes through
+    /// `coin_value_matches_uniform_range`.
+    pub(crate) fn coin_value_matches_uniform_range_with(
+        coin_bytes: &[u8],
+        secret_domain: &BigUint,
+        num_nodes: usize,
+    ) -> bool {
+        if num_nodes == 0 {
+            return false;
+        }
+        let n = BigUint::from(num_nodes as u64);
+        let cutoff: BigUint = (secret_domain / &n) * &n;
+        let v = BigUint::from_bytes_be(coin_bytes);
+        let v_mod = &v % secret_domain;
+        v_mod < cutoff
     }
 
     /// Broadcast a message to all nodes.
@@ -373,4 +516,72 @@ impl Context {
 pub fn to_socket_address(ip_str: &str, port: u16) -> SocketAddr {
     let addr = SocketAddrV4::new(ip_str.parse().unwrap(), port);
     addr.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use num_bigint::BigUint;
+
+    #[test]
+    fn theta_is_in_large_field_and_uses_full_entropy() {
+        // A small large field for testability.
+        let q = BigUint::from(1_000_003u64);
+        // Two distinct seeds must produce two distinct θ values
+        // (probability of clash here is ~1/q which is well below the
+        // statistical threshold for this test).
+        let t1 = Context::theta_from_bytes(b"seed-A", &q);
+        let t2 = Context::theta_from_bytes(b"seed-B", &q);
+        assert!(t1 < q);
+        assert!(t2 < q);
+        assert_ne!(t1, t2);
+    }
+
+    #[test]
+    fn theta_is_not_round_predictable() {
+        // The buggy old implementation hashed only the round number,
+        // so any honest seed-derivation with the SAME round produced
+        // the same θ. The new implementation must take the full
+        // beacon-output bytes into account.
+        let q = BigUint::from(1_000_003u64);
+        let beacon_a = b"\x00\x00\x00\x05BEACON_OUTPUT_A".to_vec();
+        let beacon_b = b"\x00\x00\x00\x05BEACON_OUTPUT_B".to_vec();
+        let theta_a = Context::theta_from_bytes(&beacon_a, &q);
+        let theta_b = Context::theta_from_bytes(&beacon_b, &q);
+        assert_ne!(theta_a, theta_b);
+    }
+
+    #[test]
+    fn first_match_uniform_range_check() {
+        // p = 11, n = 4 ⇒ cutoff = 4 * floor(11/4) = 4 * 2 = 8
+        // values in [0, 8) accept; [8, 11) reject.
+        let p = BigUint::from(11u32);
+        for v in 0u32..8 {
+            let bytes = BigUint::from(v).to_bytes_be();
+            assert!(
+                Context::coin_value_matches_uniform_range_with(&bytes, &p, 4),
+                "v={} should match",
+                v
+            );
+        }
+        for v in 8u32..11 {
+            let bytes = BigUint::from(v).to_bytes_be();
+            assert!(
+                !Context::coin_value_matches_uniform_range_with(&bytes, &p, 4),
+                "v={} should NOT match",
+                v
+            );
+        }
+    }
+
+    #[test]
+    fn first_match_handles_oversized_input_via_mod_p() {
+        let p = BigUint::from(11u32);
+        // 19 mod 11 = 8, which is the rejection boundary.
+        let bytes = BigUint::from(19u32).to_bytes_be();
+        assert!(!Context::coin_value_matches_uniform_range_with(&bytes, &p, 4));
+        // 18 mod 11 = 7, accepted.
+        let bytes = BigUint::from(18u32).to_bytes_be();
+        assert!(Context::coin_value_matches_uniform_range_with(&bytes, &p, 4));
+    }
 }

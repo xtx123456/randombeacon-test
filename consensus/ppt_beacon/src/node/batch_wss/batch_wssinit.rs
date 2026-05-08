@@ -12,12 +12,13 @@ use crate::node::shamir::two_field::TwoFieldDealer;
  * Phase B:
  * PPT-native round bootstrap using SS-AVSS only.
  *
- * This file no longer serves as a legacy "next_round_begin" companion for PPT.
- * Instead:
- *   - round 0 is bootstrapped with the full committee
- *   - future frequency rounds are started directly from committee handoff
- *   - only committee members actively launch local SS-AVSS dealer instances
- *   - non-committee nodes create/passively hold the round state and receive RBC
+ * Pure-PPT mode (this file):
+ *   - every honest node is *always* a dealer; there is no anytrust
+ *     committee selection;
+ *   - banned dealers (i.e. those that previously sent an invalid
+ *     AVSS packet, equivocated in ACS, or failed the post-ACS audit)
+ *     do not launch their own AVSS instance and are rejected from
+ *     every receiver's view (see Context::ban_dealer_global).
  */
 impl Context {
     /// Legacy-compatible entry point, now redirected to PPT-native bootstrap.
@@ -25,8 +26,6 @@ impl Context {
     /// The caller may still use the old convention:
     ///   - round == 20000 => bootstrap logical round 0
     ///   - otherwise      => bootstrap exact round (round + 1)
-    ///
-    /// In pure PPT mode we only start frequency rounds (and round 0).
     #[async_recursion]
     pub async fn start_new_round(
         &mut self,
@@ -39,12 +38,10 @@ impl Context {
 
     /// PPT-native bootstrap gate.
     ///
-    /// A round may start when:
-    ///   - it is round 0 (bootstrap with all nodes as committee), or
-    ///   - its committee has already been handed off by a previous beacon round.
-    ///
-    /// Only committee members actively launch a local dealer instance.
-    /// Other nodes mark the round as started passively and only receive/process messages.
+    /// In pure PPT mode every node is a dealer in every round, so
+    /// the only blocker is whether this node has already started
+    /// the round (idempotency) and whether it is itself banned
+    /// (refuse to act as a dealer once banned).
     #[async_recursion]
     pub async fn ppt_try_start_round(&mut self, target_round: Round) {
         if target_round > self.max_rounds {
@@ -71,66 +68,59 @@ impl Context {
             self.round_state.insert(target_round, rbc_new_state);
         }
 
-        let launch_as_dealer = {
+        let already_started = {
             let st = self.round_state.get_mut(&target_round).unwrap();
-
             if st.ppt_round_started {
                 log::info!(
                     "[PPT][ROUND-START] node {} round {} already started; skip duplicate bootstrap",
                     self.myid,
                     target_round
                 );
-                return;
-            }
-
-            if target_round == 0 {
+                true
+            } else {
+                // Pure PPT: every node is always a dealer. We mirror
+                // that into per-round state for diagnostic purposes,
+                // but no path actually consults `committee` anymore.
                 st.committee = (0..self.num_nodes).collect();
                 st.committee_elected = true;
+                st.ppt_round_started = true;
+                st.ppt_round_finished = false;
+                st.ppt_acs_init_sent = false;
+                st.acs_decided_set = None;
+                st.batch_extractor = None;
+                st.recovered_shares_multicast_sent = false;
+                st.batch_reconstruction_complete = false;
+                st.post_complaint_complete = false;
+                st.post_complaint_packets.clear();
+                st.pending_beacon_outputs.clear();
+                // `malicious_dealers` is *global* in `Context.banned_dealers`
+                // now; the per-round copy is still cleared so nothing else
+                // mutates it.
+                st.malicious_dealers.clear();
+                st.blame_log.clear();
+                false
             }
-
-            if !st.committee_elected {
-                log::info!(
-                    "[PPT][ROUND-START] node {} round {} not ready yet; committee not handed off",
-                    self.myid,
-                    target_round
-                );
-                return;
-            }
-
-            st.ppt_round_started = true;
-            st.ppt_round_finished = false;
-
-            // Reset only the active PPT runtime flags for this round.
-            st.ppt_acs_init_sent = false;
-
-            st.acs_decided_set = None;
-            st.batch_extractor = None;
-            st.recovered_shares_multicast_sent = false;
-            st.batch_reconstruction_complete = false;
-            st.post_complaint_complete = false;
-            st.post_complaint_packets.clear();
-            st.pending_beacon_outputs.clear();
-            st.malicious_dealers.clear();
-            st.blame_log.clear();
-
-            let committee = st.committee.clone();
-            committee.contains(&self.myid)
         };
 
-        if launch_as_dealer {
-            log::info!(
-                "[PPT][ROUND-START] node {} actively launching round {} as committee member",
-                self.myid,
-                target_round
-            );
-            self.ppt_launch_exact_round(target_round).await;
-        } else {
-            log::info!(
-                "[PPT][ROUND-START] node {} passively opened round {} (not in committee)",
-                self.myid,
-                target_round
-            );
+        if already_started {
+            return;
         }
+
+        if self.banned_dealers.contains(&self.myid) {
+            log::error!(
+                "[PPT][ROUND-START] node {} is permanently banned; not launching round {} as dealer",
+                self.myid,
+                target_round
+            );
+            return;
+        }
+
+        log::info!(
+            "[PPT][ROUND-START] node {} launching round {} as PPT dealer (full-committee mode)",
+            self.myid,
+            target_round
+        );
+        self.ppt_launch_exact_round(target_round).await;
     }
 
     /// Launch one exact PPT frequency round using SS-AVSS / Two-Field sharing.
@@ -179,7 +169,11 @@ impl Context {
             3 * faults + 1,  // share_amount n = 3f+1
         );
 
-        let theta = self.get_previous_theta(new_round.saturating_sub(1));
+        // PPT degree-test challenge θ for this round. For round 0 this
+        // is a fixed public seed; for round r > 0 it is derived from
+        // round r-1's reconstructed beacon (which the dealer cannot
+        // influence at commit time). See Context::theta_for_round.
+        let theta = self.theta_for_round(new_round);
 
         let mut share_vec: Vec<[u8;32]> = Vec::new();
         let mut nonce_share_vec: Vec<[u8;32]> = Vec::new();
@@ -303,18 +297,6 @@ impl Context {
 
         self.increment_round(new_round).await;
         self.add_benchmark(String::from("ppt_start_round"), now.elapsed().unwrap().as_nanos());
-    }
-
-    /// Phase 4B: Get theta (previous round's beacon output) for degree testing.
-    /// Returns 0 if no previous beacon is available.
-    pub(crate) fn get_previous_theta(&self, round: Round) -> BigUint {
-        if round == 0 {
-            BigUint::from(0u32)
-        } else {
-            let round_bytes = round.to_be_bytes();
-            let hash = crypto::hash::do_hash(&round_bytes);
-            BigUint::from_bytes_be(&hash) % &self.secret_domain
-        }
     }
 
     pub fn pad_shares(inp:BigUint)->[u8;32]{
