@@ -227,6 +227,38 @@ fn build_local_batch_beacon_construct(
 }
 
 impl Context {
+    /// Release a round's transient state once it is fully done:
+    ///   - every coin in the batch has emitted its beacon output
+    ///     (`recon_secrets.contains(batch_size - 1)`), AND
+    ///   - the post-ACS audit quorum (n-f recovered-share multicasts)
+    ///     has completed (`post_complaint_complete == true`).
+    ///
+    /// Calling this in place (rather than removing the entry from
+    /// `round_state`) keeps the `cleared` sentinel so any very-late
+    /// arriving messages are safely ignored by the ingest paths.
+    pub(crate) fn maybe_release_round(&mut self, round: Round) {
+        let should_release = match self.round_state.get(&round) {
+            Some(state) => {
+                state.recon_secrets.contains(&(self.batch_size - 1))
+                    && state.post_complaint_complete
+                    && !state.cleared
+            }
+            None => false,
+        };
+        if !should_release {
+            return;
+        }
+
+        if let Some(state) = self.round_state.get_mut(&round) {
+            log::info!(
+                "[PPT][ROUND-RELEASE] node {} round {} releasing transient state (batch + audit complete)",
+                self.myid,
+                round
+            );
+            state.clear();
+        }
+    }
+
     #[async_recursion]
     async fn flush_pending_beacon_outputs(&mut self, round: Round, reason: &'static str) {
         let pending = {
@@ -801,6 +833,10 @@ impl Context {
                 round,
                 threshold
             );
+            // The audit just transitioned to complete; if every
+            // coin was already emitted before audit completion,
+            // release the round's transient state now.
+            self.maybe_release_round(round);
             return;
         }
 
@@ -827,6 +863,8 @@ impl Context {
         for dealer in to_ban.into_iter() {
             self.ban_dealer_global(dealer);
         }
+        // Same idempotent release after the blame path runs.
+        self.maybe_release_round(round);
     }
 
     /**
@@ -856,6 +894,15 @@ impl Context {
             .get(&round)
             .map(|state| state.recon_secrets.contains(&(self.batch_size - 1)))
             .unwrap_or(false);
+
+        // Memory-bound: once every coin in the round has been emitted
+        // AND the post-ACS audit quorum (n-f recovered-share
+        // multicasts) has fired, this round is fully done. Wipe the
+        // round's transient state in place so a long-running beacon
+        // doesn't accumulate unbounded round_state entries.
+        if is_last_coin {
+            self.maybe_release_round(round);
+        }
 
         if coin_num == 0 {
             // PPT pg 28: θ for the next round is derived from this round's

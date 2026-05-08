@@ -1,12 +1,15 @@
-use std::{ time::SystemTime};
+use std::time::SystemTime;
 
 use async_recursion::async_recursion;
-use crypto::{hash::{do_hash, Hash}, aes_hash::MerkleTree};
+use crypto::{aes_hash::MerkleTree, hash::{do_hash, Hash}};
 use num_bigint::{BigUint, RandBigInt};
-use types::{beacon::{BatchWSSMsg, CoinMsg, WrapperMsg, Val}, Replica, beacon::{Round, BeaconMsg}};
+use types::{
+    beacon::{BatchWSSMsg, BeaconMsg, CoinMsg, Round, Val, WrapperMsg},
+    Replica,
+};
 
-use crate::node::{Context, ShamirSecretSharing, CTRBCState};
 use crate::node::shamir::two_field::TwoFieldDealer;
+use crate::node::{CTRBCState, Context, ShamirSecretSharing};
 
 /**
  * Phase B:
@@ -78,14 +81,12 @@ impl Context {
                 );
                 true
             } else {
-                // Pure PPT: every node is always a dealer. We mirror
-                // that into per-round state for diagnostic purposes,
-                // but no path actually consults `committee` anymore.
-                st.committee = (0..self.num_nodes).collect();
-                st.committee_elected = true;
+                // Pure PPT: every honest node is always a dealer in
+                // every round. There is no per-round committee field
+                // anymore -- the dealer set comes directly from
+                // Context (filtered against banned_dealers).
                 st.ppt_round_started = true;
                 st.ppt_round_finished = false;
-                st.ppt_acs_init_sent = false;
                 st.acs_decided_set = None;
                 st.batch_extractor = None;
                 st.recovered_shares_multicast_sent = false;
@@ -93,10 +94,6 @@ impl Context {
                 st.post_complaint_complete = false;
                 st.post_complaint_packets.clear();
                 st.pending_beacon_outputs.clear();
-                // `malicious_dealers` is *global* in `Context.banned_dealers`
-                // now; the per-round copy is still cleared so nothing else
-                // mutates it.
-                st.malicious_dealers.clear();
                 st.blame_log.clear();
                 false
             }
