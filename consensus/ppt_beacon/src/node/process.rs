@@ -203,17 +203,26 @@ impl Context {
 
     /// Validate a dealer's AVSS packet under the PPT two-field
     /// scheme. Returns `Ok(())` on success or `Err(reason)` on
-    /// failure. On failure the caller must permanently ban the
+    /// failure. On failure the caller MUST permanently ban the
     /// dealer: by definition, only a Byzantine dealer can produce
     /// an invalid packet, so banning is safe and required for the
     /// "kick out corrupted leader" path described in the PPT
     /// scheme.
+    ///
+    /// `theta` is supplied by the caller (typically via
+    /// `theta_for_round(round)`). The caller MUST resolve `theta`
+    /// before calling this method; if `theta_for_round` returns
+    /// `None` the caller MUST defer the packet (via
+    /// `Context::buffer_avss_for_theta`) instead of calling this
+    /// method, because "θ not yet available" is a transient async
+    /// race condition and is NOT a protocol-level violation.
     fn avss_local_packet_valid(
         &self,
         beacon_msg: &types::beacon::BeaconMsg,
         transcript_root: &crypto::hash::Hash,
         dealer: Replica,
         round: Round,
+        theta: &BigUint,
     ) -> Result<(), &'static str> {
         let public_root = crypto::hash::do_hash(beacon_msg.serialize_ctrbc().as_slice());
         if public_root != *transcript_root {
@@ -265,7 +274,6 @@ impl Context {
             self.num_faults + 1,
             self.num_nodes,
         );
-        let theta = self.theta_for_round(round);
 
         for coin_num in 0..self.batch_size {
             let coeffs = &degree_test_coeffs[coin_num];
@@ -276,7 +284,7 @@ impl Context {
             let f_large = BigUint::from_bytes_be(f_large_shares[coin_num].as_slice());
             let g_share = BigUint::from_bytes_be(mask_shares[coin_num].as_slice());
 
-            if !verifier.verify_share(self.myid + 1, &f_large, &g_share, &h_coeffs, &theta) {
+            if !verifier.verify_share(self.myid + 1, &f_large, &g_share, &h_coeffs, theta) {
                 log::warn!(
                     "[PPT][AVSS] degree-test failed for dealer {} round {} coin {} at node {}",
                     dealer,
@@ -363,12 +371,29 @@ impl Context {
             return;
         }
 
+        // PPT slide pg 28: θ for round r is derived from round (r-1)'s
+        // reconstructed beacon. In an asynchronous network a fast peer
+        // may broadcast its round-(r+1) AVSSSend before this node has
+        // finished reconstructing round-r's coin 0. In that case
+        // `theta_for_round(round)` returns None — this is NOT a
+        // protocol violation, so we MUST NOT ban the dealer or drop
+        // the packet. Instead, buffer it and replay once
+        // `record_beacon_output_for_theta` populates θ (which the
+        // beacon-emit path does inside `self_coin_check_transmit`).
+        let theta = match self.theta_for_round(round) {
+            Some(t) => t,
+            None => {
+                self.buffer_avss_for_theta(round, beacon_msg, transcript_root, dealer);
+                return;
+            }
+        };
+
         if !self.round_state.contains_key(&round) {
             let rbc_new_state = crate::node::CTRBCState::new(self.secret_domain.clone(), self.num_nodes);
             self.round_state.insert(round, rbc_new_state);
         }
 
-        match self.avss_local_packet_valid(&beacon_msg, &transcript_root, dealer, round) {
+        match self.avss_local_packet_valid(&beacon_msg, &transcript_root, dealer, round, &theta) {
             Ok(()) => {}
             Err(reason) => {
                 log::error!(
@@ -403,6 +428,29 @@ impl Context {
 
         if self.maybe_mark_dealer_completed(round, dealer) {
             self.maybe_broadcast_acs_init_from_avss(round).await;
+        }
+    }
+
+    /// Replay every AVSSSend that was buffered waiting for θ(round)
+    /// to become available. Idempotent — re-processed packets that
+    /// are already valid go through the normal `process_avss_send`
+    /// pipeline and the "already validated" guard short-circuits
+    /// duplicates.
+    #[async_recursion]
+    pub async fn drain_pending_avss_for(&mut self, round: Round) {
+        let pending = self.take_pending_avss_for(round);
+        if pending.is_empty() {
+            return;
+        }
+        log::info!(
+            "[PPT][THETA-REPLAY] node {} replaying {} buffered AVSSSend(s) for round {} now that θ is available",
+            self.myid,
+            pending.len(),
+            round
+        );
+        for (beacon_msg, transcript_root, dealer) in pending.into_iter() {
+            self.process_avss_send(beacon_msg, transcript_root, dealer, round)
+                .await;
         }
     }
 

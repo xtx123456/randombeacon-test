@@ -170,7 +170,17 @@ impl Context {
         // is a fixed public seed; for round r > 0 it is derived from
         // round r-1's reconstructed beacon (which the dealer cannot
         // influence at commit time). See Context::theta_for_round.
-        let theta = self.theta_for_round(new_round);
+        //
+        // For the *dealer* path (this function), θ MUST be available
+        // by construction: the only way ppt_try_start_round(new_round)
+        // gets called is either (a) new_round == 0 (genesis seed) or
+        // (b) self_coin_check_transmit just called
+        // record_beacon_output_for_theta(new_round - 1, ...). Hence
+        // the unwrap below cannot fire on the live path; we keep an
+        // explicit expect message so any future regression is loud.
+        let theta = self
+            .theta_for_round(new_round)
+            .expect("[PPT][THETA-BUG] dealer launching round without θ recorded; should be impossible");
 
         let mut share_vec: Vec<[u8;32]> = Vec::new();
         let mut nonce_share_vec: Vec<[u8;32]> = Vec::new();

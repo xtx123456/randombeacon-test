@@ -7,6 +7,7 @@ use std::{
 use anyhow::{anyhow, Result};
 use config::Node;
 use crypto::aes_hash::HashState;
+use crypto::hash::Hash;
 use fnv::FnvHashMap;
 use fnv::FnvHashMap as HashMap;
 use network::{
@@ -19,7 +20,7 @@ use tokio::{
 };
 
 use types::{
-    beacon::{CoinMsg, Replica, WrapperMsg},
+    beacon::{BeaconMsg, CoinMsg, Replica, WrapperMsg},
     Round, SyncMsg, SyncState,
 };
 
@@ -74,6 +75,20 @@ pub struct Context {
     /// banned, the dealer is rejected from every future round's
     /// AVSS, ACS, and reconstruction paths.
     pub banned_dealers: HashSet<Replica>,
+
+    /// AVSSSend packets received before this node had θ for that
+    /// round. They are deferred (NOT dropped, NOT banned) and
+    /// replayed by `drain_pending_avss_for(round)` once
+    /// `record_beacon_output_for_theta` populates θ.
+    ///
+    /// This race window exists in pure PPT mode because round-r+1's
+    /// AVSSSend can reach a slow node before that node has finished
+    /// reconstructing round-r's coin 0 (which is the source of
+    /// θ(r+1)). Without buffering, the slow node would drop or
+    /// (worse) panic on the early packet and never recover the
+    /// dealer for round r+1.
+    pub pending_avss_for_theta:
+        HashMap<Round, Vec<(BeaconMsg, Hash, Replica)>>,
 
     // ---- Diagnostics / lifecycle ----
     pub num_messages: u32,
@@ -178,6 +193,7 @@ impl Context {
                 acs_state: std::collections::HashMap::new(),
                 theta_per_round: HashMap::default(),
                 banned_dealers: HashSet::new(),
+                pending_avss_for_theta: HashMap::default(),
 
                 num_messages: 0,
                 bench: HashMap::default(),
@@ -254,24 +270,24 @@ impl Context {
     ///
     /// For round 0 we use a fixed public seed so all nodes agree
     /// without a previous beacon being available.
-    pub fn theta_for_round(&self, round: Round) -> BigUint {
+    ///
+    /// Returns `None` for round > 0 when the previous round's
+    /// beacon has not yet been recorded locally. This happens
+    /// naturally in async networks: a fast peer may broadcast its
+    /// round-(r+1) AVSSSend before this node has finished
+    /// reconstructing round-r's coin 0. The caller MUST handle
+    /// `None` by *deferring* the action (typically by buffering
+    /// the AVSSSend in `pending_avss_for_theta`) — never by
+    /// dropping or banning the dealer, since this is a transient
+    /// race window, not a protocol violation.
+    pub fn theta_for_round(&self, round: Round) -> Option<BigUint> {
         if round == 0 {
-            return Self::theta_from_bytes(PPT_GENESIS_THETA_SEED, &self.nonce_domain);
+            return Some(Self::theta_from_bytes(
+                PPT_GENESIS_THETA_SEED,
+                &self.nonce_domain,
+            ));
         }
-        if let Some(theta) = self.theta_per_round.get(&round) {
-            return theta.clone();
-        }
-        // Round-r dealer / verifier should always have round-(r-1)'s
-        // beacon recorded before they touch this method. If not, we
-        // refuse to fall back to a predictable value: returning a
-        // distinguished sentinel θ would silently reintroduce the
-        // hash(round) bug. Instead, we panic loudly so the bug is
-        // caught in testing rather than reducing the security
-        // parameter at runtime.
-        panic!(
-            "[PPT][THETA] round {} requested theta but no previous-round beacon recorded",
-            round
-        );
+        self.theta_per_round.get(&round).cloned()
     }
 
     /// Record this round's beacon output as the source of the
@@ -282,6 +298,39 @@ impl Context {
     pub fn record_beacon_output_for_theta(&mut self, round: Round, output_bytes: &[u8]) {
         let theta = Self::theta_from_bytes(output_bytes, &self.nonce_domain);
         self.theta_per_round.insert(round + 1, theta);
+    }
+
+    /// Buffer an AVSSSend that arrived before its θ was available.
+    /// The packet is replayed by `drain_pending_avss_for(round)`
+    /// once `record_beacon_output_for_theta` populates θ for that
+    /// round.
+    pub fn buffer_avss_for_theta(
+        &mut self,
+        round: Round,
+        beacon_msg: BeaconMsg,
+        transcript_root: Hash,
+        dealer: Replica,
+    ) {
+        log::info!(
+            "[PPT][THETA-DEFER] node {} buffering AVSSSend from dealer {} for round {} until θ becomes available",
+            self.myid,
+            dealer,
+            round
+        );
+        self.pending_avss_for_theta
+            .entry(round)
+            .or_default()
+            .push((beacon_msg, transcript_root, dealer));
+    }
+
+    /// Take (move out) every buffered AVSSSend for `round`.
+    /// Caller is expected to immediately re-process each entry
+    /// via `process_avss_send`.
+    pub fn take_pending_avss_for(
+        &mut self,
+        round: Round,
+    ) -> Vec<(BeaconMsg, Hash, Replica)> {
+        self.pending_avss_for_theta.remove(&round).unwrap_or_default()
     }
 
     /// PPT slide pg 30-32 "first-match" rejection-sampling rule.

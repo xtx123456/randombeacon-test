@@ -384,7 +384,31 @@ impl Context {
             }
         };
 
-        let theta = self.theta_for_round(round);
+        // θ for this round MUST be available by the time we reach
+        // ingest: ACS-decide implies AVSS-validate, which implies
+        // theta_for_round(round) was Some at AVSS time, which is
+        // monotone (θ is only ever inserted, never removed). If it
+        // is somehow None here, refuse to validate any share rather
+        // than panicking — dropping the packet is safe (the dealer
+        // can re-announce later via the recovered-share multicast)
+        // and we surface the anomaly via [PPT][THETA-MISS].
+        let theta = match self.theta_for_round(round) {
+            Some(t) => t,
+            None => {
+                log::error!(
+                    "[PPT][THETA-MISS] node {} ingest_secret_shares_only: θ for round {} not yet recorded; dropping packet from {} coin {}",
+                    self.myid,
+                    round,
+                    share_sender,
+                    coin_num
+                );
+                self.add_benchmark(
+                    String::from("process_batchreconstruct"),
+                    now.elapsed().unwrap().as_nanos(),
+                );
+                return;
+            }
+        };
         let verifier = TwoFieldDealer::new(
             self.secret_domain.clone(),
             self.nonce_domain.clone(),
@@ -911,6 +935,14 @@ impl Context {
 
             // Pure PPT: every node is always a dealer in the next round.
             let next_round: Round = round + self.frequency;
+
+            // Now that θ(next_round) is in the cache, replay any
+            // AVSSSend packets that arrived for `next_round` BEFORE
+            // we had θ available (the async race window between fast
+            // and slow peers). This is the live-path fix for the
+            // "[PPT][THETA] requested theta but no previous-round
+            // beacon recorded" panic that used to crash slow nodes.
+            self.drain_pending_avss_for(next_round).await;
 
             if next_round <= self.max_rounds {
                 if !self.round_state.contains_key(&next_round) {
