@@ -15,9 +15,21 @@ use network::{
     Acknowledgement,
 };
 use num_bigint::BigUint;
-use tokio::{
-    sync::{mpsc::unbounded_channel, mpsc::UnboundedReceiver, oneshot},
-};
+use tokio::sync::{mpsc, oneshot};
+
+/// Bounded inbound channel capacity.
+///
+/// Replaces the original `unbounded_channel`. Bounded queues apply
+/// backpressure: when this node's consensus task can't keep up with
+/// the inbound rate, `Sender::send().await` blocks instead of growing
+/// unbounded memory; that backpressure propagates back to the TCP
+/// kernel buffer of the peer, which naturally throttles the sender.
+///
+/// Picked so that one round's-worth of n=64 broadcasts (~64 * 8 ≈ 512
+/// messages) easily fits even at high batch sizes, but a single slow
+/// task can't accumulate more than ~16 round-equivalents before
+/// senders start to block.
+pub const PPT_INBOUND_CHANNEL_CAPACITY: usize = 8192;
 
 use types::{
     beacon::{BeaconMsg, CoinMsg, Replica, WrapperMsg},
@@ -37,9 +49,9 @@ pub const PPT_GENESIS_THETA_SEED: &[u8] = b"PPT_BEACON_GENESIS_THETA_v1";
 pub struct Context {
     // ---- Networking ----
     pub net_send: TcpReliableSender<Replica, WrapperMsg, Acknowledgement>,
-    pub net_recv: UnboundedReceiver<WrapperMsg>,
+    pub net_recv: mpsc::Receiver<WrapperMsg>,
     pub sync_send: TcpReliableSender<Replica, SyncMsg, Acknowledgement>,
-    pub sync_recv: UnboundedReceiver<SyncMsg>,
+    pub sync_recv: mpsc::Receiver<SyncMsg>,
 
     // ---- Identity / sizing ----
     pub num_nodes: usize,
@@ -119,7 +131,8 @@ impl Context {
         let mut syncer_map: FnvHashMap<Replica, SocketAddr> = FnvHashMap::default();
         syncer_map.insert(0, config.client_addr);
 
-        let (tx_net_to_consensus, rx_net_to_consensus) = unbounded_channel();
+        let (tx_net_to_consensus, rx_net_to_consensus) =
+            mpsc::channel::<WrapperMsg>(PPT_INBOUND_CHANNEL_CAPACITY);
         TcpReceiver::<Acknowledgement, WrapperMsg, _>::spawn(
             my_address,
             Handler::new(tx_net_to_consensus),
@@ -128,7 +141,8 @@ impl Context {
         let syncer_listen_port = config.client_port;
         let syncer_l_address = to_socket_address("0.0.0.0", syncer_listen_port);
 
-        let (tx_net_to_client, rx_net_from_client) = unbounded_channel();
+        let (tx_net_to_client, rx_net_from_client) =
+            mpsc::channel::<SyncMsg>(PPT_INBOUND_CHANNEL_CAPACITY);
         TcpReceiver::<Acknowledgement, SyncMsg, _>::spawn(
             syncer_l_address,
             SyncHandler::new(tx_net_to_client),
@@ -440,6 +454,15 @@ impl Context {
                 msg = self.net_recv.recv() => {
                     let msg = msg.ok_or_else(|| anyhow!("Networking layer has closed"))?;
                     self.process_msg(msg).await;
+                    // Yield after every inbound message so a single
+                    // expensive `process_msg` (e.g. ingest of a
+                    // batch_size=100 BatchBeaconConstruct + cascade
+                    // of n broadcasts) doesn't starve the rest of
+                    // the tokio worker. Without this, head-of-line
+                    // blocking under high round-rate (batch=20 case)
+                    // would let the inbound queue grow until the
+                    // protocol stalled.
+                    tokio::task::yield_now().await;
                 }
                 sync_msg = self.sync_recv.recv() => {
                     let sync_msg = sync_msg.ok_or_else(|| anyhow!("Networking layer has closed"))?;

@@ -1,16 +1,16 @@
 use async_trait::async_trait;
 use futures_util::SinkExt;
 use network::Acknowledgement;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc;
 use types::{beacon::WrapperMsg, SyncMsg};
 
 #[derive(Debug, Clone)]
 pub struct Handler {
-    consensus_tx: UnboundedSender<WrapperMsg>,
+    consensus_tx: mpsc::Sender<WrapperMsg>,
 }
 
 impl Handler {
-    pub fn new(consensus_tx: UnboundedSender<WrapperMsg>) -> Self {
+    pub fn new(consensus_tx: mpsc::Sender<WrapperMsg>) -> Self {
         Self { consensus_tx }
     }
 }
@@ -22,11 +22,17 @@ impl network::Handler<Acknowledgement, WrapperMsg> for Handler {
         msg: WrapperMsg,
         writer: &mut network::Writer<Acknowledgement>,
     ) {
-        // Forward the message to the consensus task. If the consensus
-        // task has died (channel receiver dropped), DO NOT panic — that
-        // would kill the network task too and turn a single-task crash
-        // into a node-wide crash. Just log and drop the inbound message.
-        if let Err(e) = self.consensus_tx.send(msg) {
+        // Bounded `mpsc::Sender::send().await` blocks while the
+        // consensus task is overloaded. That backpressure flows into
+        // the TCP read buffer and slows the peer naturally — much
+        // better than the old `unbounded_channel` which would let
+        // memory grow without bound while the peer kept sending.
+        //
+        // If the consensus task is gone (channel closed), drop the
+        // inbound msg gracefully — never panic, because that used to
+        // cascade-kill the network task and bring the whole node
+        // dark.
+        if let Err(e) = self.consensus_tx.send(msg).await {
             log::error!(
                 "[PPT][NET] consensus channel closed; dropping inbound msg ({})",
                 e
@@ -42,11 +48,11 @@ impl network::Handler<Acknowledgement, WrapperMsg> for Handler {
 
 #[derive(Debug, Clone)]
 pub struct SyncHandler {
-    consensus_tx: UnboundedSender<SyncMsg>,
+    consensus_tx: mpsc::Sender<SyncMsg>,
 }
 
 impl SyncHandler {
-    pub fn new(consensus_tx: UnboundedSender<SyncMsg>) -> Self {
+    pub fn new(consensus_tx: mpsc::Sender<SyncMsg>) -> Self {
         Self { consensus_tx }
     }
 }
@@ -58,8 +64,9 @@ impl network::Handler<Acknowledgement, SyncMsg> for SyncHandler {
         msg: SyncMsg,
         writer: &mut network::Writer<Acknowledgement>,
     ) {
-        // Same graceful-close behaviour as `Handler::dispatch` above.
-        if let Err(e) = self.consensus_tx.send(msg) {
+        // Same graceful-close + backpressure behaviour as
+        // `Handler::dispatch` above.
+        if let Err(e) = self.consensus_tx.send(msg).await {
             log::error!(
                 "[PPT][NET-SYNC] sync channel closed; dropping inbound sync msg ({})",
                 e
