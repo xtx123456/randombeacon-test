@@ -1,14 +1,125 @@
 use std::sync::Arc;
 
 use async_recursion::async_recursion;
-use crypto::hash::verf_mac;
+use crypto::aes_hash::HashState;
+use crypto::hash::{verf_mac, Hash};
 use num_bigint::BigUint;
 use types::{
-    beacon::{CoinMsg, WrapperMsg},
+    beacon::{BeaconMsg, CoinMsg, WrapperMsg},
     Replica, Round, SyncMsg, SyncState,
 };
 
+use crate::node::shamir::two_field::TwoFieldDealer;
+
 use super::Context;
+
+/// Pure verifier for one dealer's AVSS packet under the PPT
+/// two-field scheme. This is the **CPU-heavy** body of the
+/// validation: it runs `batch_size` per-coin `verify_share`
+/// degree-tests plus a full Merkle / commitment check on the AVSS
+/// payload. Lifting it into a free function (no `&self`) lets the
+/// hot path move the call into `tokio::task::spawn_blocking`, so
+/// the consensus task's worker thread is not occupied for the
+/// duration of the degree-test loop.
+///
+/// **Contract identical to the previous `Context::avss_local_packet_valid`**:
+/// returns `Ok(())` on success, `Err(reason)` on any
+/// protocol-level violation (transcript mismatch, bad Merkle
+/// proof, missing two-field material, degree-test failure). The
+/// caller MUST permanently ban the dealer on `Err(_)`.
+///
+/// Inputs that used to be read from `&self` (`hash_context`,
+/// `secret_domain`, `nonce_domain`, `num_faults`, `num_nodes`,
+/// `batch_size`, `myid`) are now explicit parameters, so this
+/// function is `'static`-callable from `spawn_blocking`.
+pub(crate) fn avss_local_packet_valid_pure(
+    beacon_msg: &BeaconMsg,
+    transcript_root: &Hash,
+    dealer: Replica,
+    round: Round,
+    theta: &BigUint,
+    hash_context: &HashState,
+    secret_domain: &BigUint,
+    nonce_domain: &BigUint,
+    num_faults: usize,
+    num_nodes: usize,
+    batch_size: usize,
+    myid: usize,
+) -> Result<(), &'static str> {
+    let public_root = crypto::hash::do_hash(beacon_msg.serialize_ctrbc().as_slice());
+    if public_root != *transcript_root {
+        log::warn!(
+            "[PPT][AVSS] transcript root mismatch for dealer {} round {}",
+            dealer,
+            round
+        );
+        return Err("transcript root mismatch");
+    }
+
+    if !beacon_msg.verify_proofs(hash_context) {
+        log::warn!(
+            "[PPT][AVSS] invalid Merkle/share proof for dealer {} round {}",
+            dealer,
+            round
+        );
+        return Err("merkle proof invalid");
+    }
+
+    let degree_test_coeffs = match beacon_msg.degree_test_coeffs.as_ref() {
+        Some(coeffs) => coeffs,
+        None => return Err("missing degree-test coeffs"),
+    };
+    let mask_shares = match beacon_msg.mask_shares.as_ref() {
+        Some(mask_shares) => mask_shares,
+        None => return Err("missing mask shares"),
+    };
+    let f_large_shares = match beacon_msg.f_large_shares.as_ref() {
+        Some(f_large_shares) => f_large_shares,
+        None => return Err("missing f_large shares"),
+    };
+
+    if degree_test_coeffs.len() != batch_size
+        || mask_shares.len() != batch_size
+        || f_large_shares.len() != batch_size
+    {
+        log::warn!(
+            "[PPT][AVSS] malformed two-field batch lengths from dealer {} round {}",
+            dealer,
+            round
+        );
+        return Err("malformed two-field lengths");
+    }
+
+    let verifier = TwoFieldDealer::new(
+        secret_domain.clone(),
+        nonce_domain.clone(),
+        num_faults + 1,
+        num_nodes,
+    );
+
+    for coin_num in 0..batch_size {
+        let coeffs = &degree_test_coeffs[coin_num];
+        let h_coeffs: Vec<BigUint> = coeffs
+            .iter()
+            .map(|bytes| BigUint::from_bytes_be(bytes.as_slice()))
+            .collect();
+        let f_large = BigUint::from_bytes_be(f_large_shares[coin_num].as_slice());
+        let g_share = BigUint::from_bytes_be(mask_shares[coin_num].as_slice());
+
+        if !verifier.verify_share(myid + 1, &f_large, &g_share, &h_coeffs, theta) {
+            log::warn!(
+                "[PPT][AVSS] degree-test failed for dealer {} round {} coin {} at node {}",
+                dealer,
+                round,
+                coin_num,
+                myid
+            );
+            return Err("degree test failed");
+        }
+    }
+
+    Ok(())
+}
 
 impl Context {
     pub fn check_proposal(self: &Context, wrapper_msg: Arc<WrapperMsg>) -> bool {
@@ -216,6 +327,15 @@ impl Context {
     /// `Context::buffer_avss_for_theta`) instead of calling this
     /// method, because "θ not yet available" is a transient async
     /// race condition and is NOT a protocol-level violation.
+    ///
+    /// This method is a thin wrapper around the pure free function
+    /// `avss_local_packet_valid_pure`; the wrapper is kept so
+    /// existing test code that calls the method form still compiles.
+    /// Production hot paths should call the pure function inside
+    /// `tokio::task::spawn_blocking` so that the heavy degree-test
+    /// loop runs in tokio's blocking pool (multi-core) instead of
+    /// hogging the consensus task's worker thread.
+    #[allow(dead_code)]
     fn avss_local_packet_valid(
         &self,
         beacon_msg: &types::beacon::BeaconMsg,
@@ -224,79 +344,20 @@ impl Context {
         round: Round,
         theta: &BigUint,
     ) -> Result<(), &'static str> {
-        let public_root = crypto::hash::do_hash(beacon_msg.serialize_ctrbc().as_slice());
-        if public_root != *transcript_root {
-            log::warn!(
-                "[PPT][AVSS] transcript root mismatch for dealer {} round {}",
-                dealer,
-                round
-            );
-            return Err("transcript root mismatch");
-        }
-
-        if !beacon_msg.verify_proofs(&self.hash_context) {
-            log::warn!(
-                "[PPT][AVSS] invalid Merkle/share proof for dealer {} round {}",
-                dealer,
-                round
-            );
-            return Err("merkle proof invalid");
-        }
-
-        let degree_test_coeffs = match beacon_msg.degree_test_coeffs.as_ref() {
-            Some(coeffs) => coeffs,
-            None => return Err("missing degree-test coeffs"),
-        };
-        let mask_shares = match beacon_msg.mask_shares.as_ref() {
-            Some(mask_shares) => mask_shares,
-            None => return Err("missing mask shares"),
-        };
-        let f_large_shares = match beacon_msg.f_large_shares.as_ref() {
-            Some(f_large_shares) => f_large_shares,
-            None => return Err("missing f_large shares"),
-        };
-
-        if degree_test_coeffs.len() != self.batch_size
-            || mask_shares.len() != self.batch_size
-            || f_large_shares.len() != self.batch_size
-        {
-            log::warn!(
-                "[PPT][AVSS] malformed two-field batch lengths from dealer {} round {}",
-                dealer,
-                round
-            );
-            return Err("malformed two-field lengths");
-        }
-
-        let verifier = crate::node::shamir::two_field::TwoFieldDealer::new(
-            self.secret_domain.clone(),
-            self.nonce_domain.clone(),
-            self.num_faults + 1,
+        avss_local_packet_valid_pure(
+            beacon_msg,
+            transcript_root,
+            dealer,
+            round,
+            theta,
+            &self.hash_context,
+            &self.secret_domain,
+            &self.nonce_domain,
+            self.num_faults,
             self.num_nodes,
-        );
-
-        for coin_num in 0..self.batch_size {
-            let coeffs = &degree_test_coeffs[coin_num];
-            let h_coeffs: Vec<BigUint> = coeffs
-                .iter()
-                .map(|bytes| BigUint::from_bytes_be(bytes.as_slice()))
-                .collect();
-            let f_large = BigUint::from_bytes_be(f_large_shares[coin_num].as_slice());
-            let g_share = BigUint::from_bytes_be(mask_shares[coin_num].as_slice());
-
-            if !verifier.verify_share(self.myid + 1, &f_large, &g_share, &h_coeffs, theta) {
-                log::warn!(
-                    "[PPT][AVSS] degree-test failed for dealer {} round {} coin {} at node {}",
-                    dealer,
-                    round,
-                    coin_num,
-                    self.myid
-                );
-                return Err("degree test failed");
-            }
-        }
-
-        Ok(())
+            self.batch_size,
+            self.myid,
+        )
     }
 
     fn maybe_mark_dealer_completed(&mut self, round: Round, dealer: Replica) -> bool {
@@ -393,7 +454,60 @@ impl Context {
             self.round_state.insert(round, rbc_new_state);
         }
 
-        match self.avss_local_packet_valid(&beacon_msg, &transcript_root, dealer, round, &theta) {
+        // ---- Level 2 multi-core: move the CPU-heavy AVSS validation
+        // (hash transcript, verify_proofs Merkle batch, batch_size
+        // degree-tests over BigUint arithmetic) into tokio's blocking
+        // pool so the consensus task's worker thread is free to keep
+        // handling other inbound messages while validation runs in
+        // parallel on another core.
+        //
+        // We move `beacon_msg` and `theta` into the blocking closure
+        // and return them back out, so no large clones happen along
+        // the hot path. Everything else copied into the closure is
+        // small and/or cheaply cloned.
+        let hash_context = Arc::clone(&self.hash_context);
+        let secret_domain = self.secret_domain.clone();
+        let nonce_domain = self.nonce_domain.clone();
+        let num_faults = self.num_faults;
+        let num_nodes = self.num_nodes;
+        let batch_size = self.batch_size;
+        let myid = self.myid;
+        let transcript_root_owned = transcript_root;
+
+        let (validation_result, beacon_msg, _theta) =
+            tokio::task::spawn_blocking(move || {
+                let result = avss_local_packet_valid_pure(
+                    &beacon_msg,
+                    &transcript_root_owned,
+                    dealer,
+                    round,
+                    &theta,
+                    &hash_context,
+                    &secret_domain,
+                    &nonce_domain,
+                    num_faults,
+                    num_nodes,
+                    batch_size,
+                    myid,
+                );
+                (result, beacon_msg, theta)
+            })
+            .await
+            .unwrap_or_else(|e| {
+                log::error!(
+                    "[PPT][LEVEL2] AVSS validation blocking task join error round {} dealer {}: {}",
+                    round, dealer, e
+                );
+                // Failsafe: treat join error as transient (no ban). Recreate
+                // a dummy BeaconMsg / theta won't be used because we early-return.
+                (
+                    Err("blocking task join error"),
+                    types::beacon::BeaconMsg::new_with_appx(0, 0, Vec::new()),
+                    BigUint::from(0u32),
+                )
+            });
+
+        match validation_result {
             Ok(()) => {}
             Err(reason) => {
                 log::error!(
