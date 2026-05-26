@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     net::{SocketAddr, SocketAddrV4},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -60,7 +61,13 @@ pub struct Context {
     pub sec_key_map: HashMap<Replica, Vec<u8>>,
 
     // ---- Crypto context ----
-    pub hash_context: HashState,
+    /// `HashState` (AES-PRF + Merkle hasher) wrapped in `Arc` so it
+    /// can be cheaply shared with `tokio::task::spawn_blocking`
+    /// closures on the multi-core hot path (Level 2). `HashState`
+    /// itself wraps three `Aes128Enc` keyed instances which do not
+    /// implement `Clone`; storing it behind `Arc` avoids any need to
+    /// duplicate the cipher state per-message.
+    pub hash_context: Arc<HashState>,
     pub secret_domain: BigUint,
     pub nonce_domain: BigUint,
 
@@ -194,7 +201,7 @@ impl Context {
                 myid: config.id,
                 num_faults: config.num_faults,
 
-                hash_context: hashstate,
+                hash_context: Arc::new(hashstate),
                 secret_domain: prime.clone(),
                 nonce_domain: nonce_prime.clone(),
 
