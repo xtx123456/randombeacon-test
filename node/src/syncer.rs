@@ -25,6 +25,19 @@ pub struct Syncer{
     exit_rx: oneshot::Receiver<()>,
     /// Cancel Handlers
     pub cancel_handlers: Vec<CancelHandler<Acknowledgement>>,
+
+    /// ---- Beacon agreement diagnostics ----
+    /// Tracks for each (round, coin) whether we've already emitted
+    /// an [BEACON-AGREE] / [BEACON-DISAGREE] verdict line for it.
+    /// `(round, coin) -> (agree_logged, disagree_logged)`.
+    /// Disagreement always wins over agreement in the final counts:
+    /// if AGREE is logged first and a late report later disagrees,
+    /// we re-classify the (round, coin) as disagreed (and emit
+    /// a DISAGREE line so the operator sees the late split).
+    pub beacon_verdict_state: HashMap<(Round, usize), (bool, bool)>,
+    /// Running totals across the whole run.
+    pub agreed_coin_count: u64,
+    pub disagreed_coin_count: u64,
 }
 
 impl Syncer{
@@ -63,7 +76,10 @@ impl Syncer{
                 rx_net:rx_net_to_server,
                 net_send:net_send,
                 exit_rx:exit_rx,
-                cancel_handlers:Vec::new()
+                cancel_handlers:Vec::new(),
+                beacon_verdict_state: HashMap::default(),
+                agreed_coin_count: 0,
+                disagreed_coin_count: 0,
             };
             if let Err(e) = syncer.run().await {
                 log::error!("Consensus error: {}", e);
@@ -87,6 +103,18 @@ impl Syncer{
                 exit_val = &mut self.exit_rx => {
                     exit_val.map_err(anyhow::Error::new)?;
                     log::error!("Termination signal received by the server. Exiting.");
+                    // Final beacon-agreement totals (also printed every 100
+                    // verdicts during the run via [BEACON-AGREE-PROGRESS]).
+                    let total = self.agreed_coin_count + self.disagreed_coin_count;
+                    let rate = if total > 0 {
+                        100.0 * (self.disagreed_coin_count as f64) / (total as f64)
+                    } else {
+                        0.0
+                    };
+                    log::error!(
+                        "[BEACON-AGREE-FINAL] total_verdicts={} agreed={} disagreed={} disagree_rate={:.4}%",
+                        total, self.agreed_coin_count, self.disagreed_coin_count, rate
+                    );
                     break
                 },
                 msg = self.rx_net.recv() => {
@@ -231,6 +259,131 @@ impl Syncer{
                                 //vec_times.sort();
                                 log::info!("All n nodes completed reconstruction for round {:?} and index {} with {:?},and set map : {:?}",round,index,vec_times, set_map);
                                 //self.broadcast(SyncMsg { sender: self.num_nodes, state: SyncState::STOP, value:0}).await;
+                            }
+
+                            // ---- Beacon agreement diagnostic ----
+                            // We compare beacon values reported by different nodes for
+                            // the same (round, coin) and emit one AGREE / DISAGREE
+                            // verdict line that the benchmark CSV parser can pick up.
+                            //
+                            // Trigger threshold: 2n/3 reports.
+                            // This matches the existing `beacons_count`/`unique_beacon_count`
+                            // threshold above (line 245) and is the correct quorum for
+                            // n = 3f+1 anyway. Waiting for all n reports (the previous
+                            // behaviour) almost never fires inside the 60 s benchmark
+                            // window because the benchmark is killed before stragglers
+                            // catch up, which is why prior CSV runs showed 0 verdicts.
+                            //
+                            // Disagreement ⇒ two honest nodes computed DIFFERENT
+                            // beacons for the same (round, coin), i.e. an observable
+                            // ACS Agreement violation in PPT. We log per-value node
+                            // groupings so it's easy to tell which nodes split.
+                            //
+                            // Late-report upgrade: if we first logged AGREE at 2n/3 and
+                            // a later straggler delivers a DIFFERENT value, we re-emit
+                            // a DISAGREE line and re-classify the (round, coin) in the
+                            // running totals (agree--, disagree++). This way a late
+                            // network split is never silently swallowed.
+                            let quorum = 2 * self.num_nodes / 3;
+                            if time_sec_map.len() >= quorum {
+                                let (agree_logged, disagree_logged) = self
+                                    .beacon_verdict_state
+                                    .get(&(round, index))
+                                    .copied()
+                                    .unwrap_or((false, false));
+
+                                // Once we've already logged a DISAGREE for this coin
+                                // we don't keep re-logging on every subsequent report.
+                                if !disagree_logged {
+                                    let mut by_value: HashMap<BigInt, Vec<Replica>> =
+                                        HashMap::default();
+                                    for (rep, (_t, secret)) in time_sec_map.iter() {
+                                        by_value.entry(secret.clone()).or_default().push(*rep);
+                                    }
+                                    // Stable per-group node ordering for readable logs.
+                                    for reps in by_value.values_mut() { reps.sort(); }
+
+                                    if by_value.len() == 1 {
+                                        // All reports so far agree. Emit AGREE only the
+                                        // first time we cross the quorum threshold.
+                                        if !agree_logged {
+                                            self.agreed_coin_count += 1;
+                                            self.beacon_verdict_state
+                                                .insert((round, index), (true, false));
+                                            let sample = by_value.keys().next().unwrap();
+                                            let hex = sample.to_str_radix(16);
+                                            let summary = if hex.len() > 24 {
+                                                format!("{}...{} ({} hex chars)",
+                                                    &hex[..8], &hex[hex.len()-8..], hex.len())
+                                            } else {
+                                                hex
+                                            };
+                                            log::info!(
+                                                "[BEACON-AGREE] round {} index {} {}/{} nodes agree value={}",
+                                                round, index, time_sec_map.len(), self.num_nodes, summary
+                                            );
+                                        }
+                                    } else {
+                                        // Disagreement observed. If we had previously
+                                        // logged AGREE for this coin, reclassify the
+                                        // running totals (agree--, disagree++).
+                                        if agree_logged {
+                                            if self.agreed_coin_count > 0 {
+                                                self.agreed_coin_count -= 1;
+                                            }
+                                        }
+                                        self.disagreed_coin_count += 1;
+                                        self.beacon_verdict_state
+                                            .insert((round, index), (agree_logged, true));
+
+                                        // Print every distinct value with the node group
+                                        // that reported it. Truncate value to first/last
+                                        // 8 hex chars to keep the log line readable.
+                                        let mut group_strs: Vec<String> = Vec::new();
+                                        for (value, reps) in by_value.iter() {
+                                            let hex = value.to_str_radix(16);
+                                            let v_summary = if hex.len() > 24 {
+                                                format!("{}...{}",
+                                                    &hex[..8], &hex[hex.len()-8..])
+                                            } else {
+                                                hex
+                                            };
+                                            group_strs.push(format!(
+                                                "nodes={:?}=>value={}", reps, v_summary));
+                                        }
+                                        let upgrade_tag = if agree_logged {
+                                            " (upgraded from AGREE by late report)"
+                                        } else {
+                                            ""
+                                        };
+                                        log::error!(
+                                            "[BEACON-DISAGREE] round {} index {} {} distinct beacon values across {}/{} reporting nodes{}; groups: [{}]",
+                                            round, index, by_value.len(),
+                                            time_sec_map.len(), self.num_nodes,
+                                            upgrade_tag,
+                                            group_strs.join(" | ")
+                                        );
+                                    }
+
+                                    // Periodic progress so a long run shows running
+                                    // totals without grep'ing the whole log.
+                                    let total_verdicts =
+                                        self.agreed_coin_count + self.disagreed_coin_count;
+                                    if total_verdicts > 0 && total_verdicts % 100 == 0 {
+                                        let rate = if total_verdicts > 0 {
+                                            100.0 * (self.disagreed_coin_count as f64)
+                                                / (total_verdicts as f64)
+                                        } else {
+                                            0.0
+                                        };
+                                        log::info!(
+                                            "[BEACON-AGREE-PROGRESS] verdicts so far: agree={} disagree={} (disagree rate {:.4}%)",
+                                            self.agreed_coin_count,
+                                            self.disagreed_coin_count,
+                                            rate
+                                        );
+                                    }
+                                }
                             }
                             let current_time = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
