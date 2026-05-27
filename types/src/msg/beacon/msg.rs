@@ -200,6 +200,34 @@ pub enum CoinMsg{
     /// Once a node sees n-f matching Witness2 messages it finalizes the ACS
     /// decision deterministically (see `acs::decide`).
     ACSWitness2(Round, Replica, Vec<Replica>),
+
+    /// PPT ACS replacement: Cachin-Tessaro / Bracha RBC + Mostefaoui-
+    /// Moumen-Raynal ABA. The triple below carries the wire types
+    /// for the new ACS pipeline:
+    ///
+    ///   - `ACSRbcSend(round, dealer_proposer, bytes)` — the SEND
+    ///     phase of Bracha RBC. `dealer_proposer` is the *proposer*
+    ///     (i.e. which RBC instance this byte stream belongs to);
+    ///     the wrapper-level sender field is the actual broadcaster.
+    ///   - `ACSRbcEcho(round, dealer_proposer, payload_hash)` —
+    ///     ECHO of the SEND with hash-binding.
+    ///   - `ACSRbcReady(round, dealer_proposer, payload_hash)` —
+    ///     READY threshold message.
+    ///   - `ACSAbaBval(round, aba_instance_id, aba_round, value)` —
+    ///     MMR ABA BVAL message. `aba_instance_id` selects which of
+    ///     the n parallel ABA instances the message belongs to.
+    ///   - `ACSAbaAux(round, aba_instance_id, aba_round, value)` —
+    ///     MMR ABA AUX message.
+    ///
+    /// All inputs are signature-free (PQ-safe): the only crypto
+    /// material is `payload_hash`, which is a pure SHA-256-class
+    /// hash of the RBC payload bytes (used to bind ECHO/READY back
+    /// to a specific SEND content; nothing more).
+    ACSRbcSend(Round, Replica, Vec<u8>),
+    ACSRbcEcho(Round, Replica, Hash),
+    ACSRbcReady(Round, Replica, Hash),
+    ACSAbaBval(Round, Replica, u64, bool),
+    ACSAbaAux(Round, Replica, u64, bool),
 }
 
 #[derive(Debug,Serialize,Deserialize,Clone)]

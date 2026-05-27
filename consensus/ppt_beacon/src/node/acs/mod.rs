@@ -10,4 +10,5 @@
 pub mod state;
 pub mod protocol;
 pub mod aba;
+pub mod aba_driver;
 pub mod coin;
