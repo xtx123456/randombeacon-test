@@ -109,6 +109,18 @@ pub struct Context {
     pub pending_avss_for_theta:
         HashMap<Round, Vec<(BeaconMsg, Hash, Replica)>>,
 
+    /// Round → previous-round beacon bytes used to seed the new
+    /// ACS common-coin derivation. Pattern is identical to
+    /// `theta_per_round`: `record_beacon_output_for_coin(round, ..)`
+    /// inserts under key `round + 1` so the next ACS round can call
+    /// `coin_seed_for_acs_round(round + 1)` and obtain a value
+    /// without any further lookup.
+    ///
+    /// For round 0 the ACS common coin uses the public genesis seed
+    /// `PPT_GENESIS_COIN_SEED`; this map only carries entries for
+    /// round >= 1, populated as the protocol completes earlier rounds.
+    pub coin_per_round: HashMap<Round, Vec<u8>>,
+
     // ---- Diagnostics / lifecycle ----
     pub num_messages: u32,
     pub bench: HashMap<String, u128>,
@@ -215,6 +227,7 @@ impl Context {
                 theta_per_round: HashMap::default(),
                 banned_dealers: HashSet::new(),
                 pending_avss_for_theta: HashMap::default(),
+                coin_per_round: HashMap::default(),
 
                 num_messages: 0,
                 bench: HashMap::default(),

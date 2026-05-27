@@ -1339,6 +1339,13 @@ impl Context {
             // coin-0 beacon, which the next round's dealer cannot influence.
             self.record_beacon_output_for_theta(round, number.as_slice());
 
+            // Self-bootstrap MMR ABA common coin: store the same
+            // beacon output as the seed for the *next* ACS round's
+            // coin derivation. Honest nodes agree on `number` bit-
+            // for-bit (ACS + batch-recover safety) so every node's
+            // coin_bit_for(round+1, ..) returns the identical bit.
+            self.record_beacon_output_for_coin(round, number.as_slice());
+
             // Pure PPT: every node is always a dealer in the next round.
             let next_round: Round = round + self.frequency;
 
