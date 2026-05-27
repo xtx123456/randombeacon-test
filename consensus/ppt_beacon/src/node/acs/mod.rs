@@ -13,3 +13,5 @@ pub mod aba;
 pub mod aba_driver;
 pub mod coin;
 pub mod rbc;
+#[cfg(test)]
+pub mod e2e_test;
