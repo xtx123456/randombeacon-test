@@ -146,7 +146,7 @@ write_header_if_needed() {
     local csv="$1"
     if [ ! -f "$csv" ]; then
         cat > "$csv" <<'EOF'
-protocol,batch,frequency,run,duration_sec,node_count,unique_batch_count,batch_throughput_wall,batch_active_window_sec,batch_throughput_active,first_batch_round,last_batch_round,internal_progress_span,internal_progress_units_per_sec,batch_gap_count,batch_gap_mean_ms,batch_gap_median_ms,batch_gap_p95_ms,unique_beacon_count,beacon_throughput_wall,beacon_active_window_sec,beacon_throughput_active,recon_gap_count,recon_gap_mean_ms,recon_gap_median_ms,recon_gap_p95_ms,acs_trigger,acs_decide,acs_recon,batch_recover,two_field,post_complaint,post_blame,first_batch_ts,last_batch_ts,first_beacon_ts,last_beacon_ts,complete_round_count_uniform,round_throughput_wall_uniform,round_throughput_active_uniform,round_span_mean_ms_uniform,round_span_p95_ms_uniform,round_e2e_latency_mean_ms_uniform,round_e2e_latency_p95_ms_uniform
+protocol,batch,frequency,run,duration_sec,node_count,unique_batch_count,batch_throughput_wall,batch_active_window_sec,batch_throughput_active,first_batch_round,last_batch_round,internal_progress_span,internal_progress_units_per_sec,batch_gap_count,batch_gap_mean_ms,batch_gap_median_ms,batch_gap_p95_ms,unique_beacon_count,beacon_throughput_wall,beacon_active_window_sec,beacon_throughput_active,recon_gap_count,recon_gap_mean_ms,recon_gap_median_ms,recon_gap_p95_ms,acs_trigger,acs_decide,acs_recon,batch_recover,two_field,post_complaint,post_blame,first_batch_ts,last_batch_ts,first_beacon_ts,last_beacon_ts,complete_round_count_uniform,round_throughput_wall_uniform,round_throughput_active_uniform,round_span_mean_ms_uniform,round_span_p95_ms_uniform,round_e2e_latency_mean_ms_uniform,round_e2e_latency_p95_ms_uniform,beacon_agreed_count,beacon_disagreed_count,beacon_disagree_rate_pct
 EOF
     fi
 }
@@ -267,6 +267,17 @@ ppt_round_start_pat = re.compile(
 bea_round_start_pat = re.compile(
     r'\[BEA\]\[STAGE\]\[BATCH-START\] node \d+ round (\d+)'
 )
+
+# Beacon-agreement diagnostic emitted by node/src/syncer.rs.
+# Preferred: a single [BEACON-AGREE-FINAL] line at process exit
+# carries the running totals. As a fallback (e.g. SIGKILL before
+# exit handler runs), we also count individual [BEACON-AGREE] /
+# [BEACON-DISAGREE] verdict lines.
+beacon_agree_final_pat = re.compile(
+    r'\[BEACON-AGREE-FINAL\] total_verdicts=(\d+) agreed=(\d+) disagreed=(\d+)'
+)
+beacon_agree_individual_pat = re.compile(r'\[BEACON-AGREE\] round')
+beacon_disagree_individual_pat = re.compile(r'\[BEACON-DISAGREE\] round')
 
 def parse_ts(line: str):
     m = ts_pat.search(line)
@@ -402,6 +413,51 @@ if protocol == "ppt":
         pass
 
 # ============================================================
+# Beacon-agreement diagnostic (cross-protocol).
+#
+# The syncer emits one [BEACON-AGREE] or [BEACON-DISAGREE] line per
+# (round, coin) pair once it has collected reports from ALL n nodes,
+# and a single summary [BEACON-AGREE-FINAL] line at exit. A non-zero
+# beacon_disagreed_count means two honest nodes computed DIFFERENT
+# beacons for the same (round, coin) -- i.e. an empirically observed
+# ACS Agreement violation. For a formally correct ACS implementation
+# this column should always read 0.
+# ============================================================
+beacon_agreed_count = 0
+beacon_disagreed_count = 0
+final_seen = False
+
+try:
+    with open(syncer_log, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            m = beacon_agree_final_pat.search(line)
+            if m:
+                # Use the last [BEACON-AGREE-FINAL] line in the file
+                # (there should be exactly one; if SIGKILL hit before
+                # the exit handler ran, this line will simply be
+                # absent and we fall back to counting).
+                beacon_agreed_count = int(m.group(2))
+                beacon_disagreed_count = int(m.group(3))
+                final_seen = True
+
+    if not final_seen:
+        # Fallback: count the per-verdict lines directly.
+        with open(syncer_log, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if beacon_agree_individual_pat.search(line):
+                    beacon_agreed_count += 1
+                elif beacon_disagree_individual_pat.search(line):
+                    beacon_disagreed_count += 1
+except FileNotFoundError:
+    pass
+
+beacon_total_verdicts = beacon_agreed_count + beacon_disagreed_count
+if beacon_total_verdicts > 0:
+    beacon_disagree_rate_pct = 100.0 * beacon_disagreed_count / beacon_total_verdicts
+else:
+    beacon_disagree_rate_pct = 0.0
+
+# ============================================================
 # Uniform metrics (cross-protocol comparable).
 #
 # A "complete round" is defined uniformly as: a round R for which
@@ -509,6 +565,10 @@ row = [
     round_span_p95_str,
     round_e2e_lat_mean_str,
     round_e2e_lat_p95_str,
+    # ---- Beacon agreement diagnostic ----
+    beacon_agreed_count,
+    beacon_disagreed_count,
+    f"{beacon_disagree_rate_pct:.6f}",
 ]
 
 with open(summary_csv, "a", newline="", encoding="utf-8") as f:
@@ -561,6 +621,11 @@ print(f"Round span mean (ms):           {round_span_mean_str}")
 print(f"Round span p95 (ms):            {round_span_p95_str}")
 print(f"Round E2E latency mean (ms):    {round_e2e_lat_mean_str}")
 print(f"Round E2E latency p95 (ms):     {round_e2e_lat_p95_str}")
+print("=== Beacon agreement diagnostic ===")
+print(f"Beacon (round,coin) verdicts:   {beacon_total_verdicts}")
+print(f"Beacon AGREED:                  {beacon_agreed_count}")
+print(f"Beacon DISAGREED:               {beacon_disagreed_count}   <-- non-zero = ACS Agreement violated")
+print(f"Beacon disagreement rate (%):   {beacon_disagree_rate_pct:.6f}")
 print("=== Case complete ===")
 PY
 
