@@ -80,7 +80,7 @@ pub struct Context {
     pub round_state: HashMap<Round, CTRBCState>,
 
     // ---- ACS state ----
-    pub acs_state: std::collections::HashMap<Round, crate::node::acs::state::ACSInstanceState>,
+    pub acs_state: std::collections::HashMap<Round, crate::node::acs::state::AcsRound>,
 
     /// Round → degree-test challenge θ (large field). Populated when
     /// each round's beacon output is finalised; consumed by the next

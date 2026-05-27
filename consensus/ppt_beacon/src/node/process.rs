@@ -261,37 +261,58 @@ impl Context {
                 );
             }
             CoinMsg::ACSPropose(round, sender, dealers) => {
-                log::info!(
-                    "[PPT][ACS] node {} got ACSPropose from {} for round {} with {} dealers {:?}",
-                    self.myid,
+                log::warn!(
+                    "[PPT][ACS-LEGACY] dropping legacy ACSPropose from {} round {} ({} dealers); pure PPT now uses RBC + MMR ABA",
                     sender,
                     round,
-                    dealers.len(),
-                    dealers
+                    dealers.len()
                 );
-                self.process_acs_propose(round, sender, dealers).await;
             }
             CoinMsg::ACSWitness1(round, sender, validated) => {
-                log::info!(
-                    "[PPT][ACS] node {} got ACSWitness1 from {} for round {} with {} proposers {:?}",
-                    self.myid,
+                log::warn!(
+                    "[PPT][ACS-LEGACY] dropping legacy ACSWitness1 from {} round {} ({} proposers); pure PPT now uses RBC + MMR ABA",
                     sender,
                     round,
-                    validated.len(),
-                    validated
+                    validated.len()
                 );
-                self.process_acs_witness1(round, sender, validated).await;
             }
             CoinMsg::ACSWitness2(round, sender, witnessed) => {
-                log::info!(
-                    "[PPT][ACS] node {} got ACSWitness2 from {} for round {} with {} W1 senders {:?}",
-                    self.myid,
+                log::warn!(
+                    "[PPT][ACS-LEGACY] dropping legacy ACSWitness2 from {} round {} ({} senders); pure PPT now uses RBC + MMR ABA",
                     sender,
                     round,
-                    witnessed.len(),
-                    witnessed
+                    witnessed.len()
                 );
-                self.process_acs_witness2(round, sender, witnessed).await;
+            }
+            CoinMsg::ACSRbcSend(round, proposer, payload) => {
+                log::info!(
+                    "[PPT][ACS-RBC] node {} got ACSRbcSend round {} proposer {} (|payload|={} bytes, wire-sender={})",
+                    self.myid,
+                    round,
+                    proposer,
+                    payload.len(),
+                    wrapper_msg.sender
+                );
+                if wrapper_msg.sender != proposer {
+                    log::warn!(
+                        "[PPT][ACS-RBC] dropping ACSRbcSend round {} proposer {} sent by wire {} (sender mismatch)",
+                        round, proposer, wrapper_msg.sender
+                    );
+                } else {
+                    self.process_acs_rbc_send(round, proposer, payload).await;
+                }
+            }
+            CoinMsg::ACSRbcEcho(round, proposer, payload_hash) => {
+                self.process_acs_rbc_echo(round, proposer, wrapper_msg.sender, payload_hash).await;
+            }
+            CoinMsg::ACSRbcReady(round, proposer, payload_hash) => {
+                self.process_acs_rbc_ready(round, proposer, wrapper_msg.sender, payload_hash).await;
+            }
+            CoinMsg::ACSAbaBval(round, aba_instance_id, aba_round, value) => {
+                self.process_acs_aba_bval(round, aba_instance_id, aba_round, value, wrapper_msg.sender).await;
+            }
+            CoinMsg::ACSAbaAux(round, aba_instance_id, aba_round, value) => {
+                self.process_acs_aba_aux(round, aba_instance_id, aba_round, value, wrapper_msg.sender).await;
             }
             _ => {}
         }
