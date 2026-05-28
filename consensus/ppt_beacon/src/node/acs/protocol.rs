@@ -531,30 +531,6 @@ impl Context {
                 for a in acts {
                     self.dispatch_aba_action(round, self.myid, a).await;
                 }
-                // Liveness-critical: once we have just fed an ABA
-                // input, ABA(j) round-0 needs its coin. The enclosing
-                // RBC outer entry only runs `acs_external_scan_finalize_only`,
-                // which deliberately skips `pump_coins` to avoid the
-                // batch=100 regression caused by per-RBC-message scan
-                // overhead. Without this targeted pump, in some
-                // adversarial schedules where many RBC instances
-                // deliver back-to-back (and no peer ABA message has
-                // yet arrived to trigger an outer ABA scan), our
-                // local ABA(j) for several `j` could sit indefinitely
-                // with input fed but coin-0 unfed. We saw this stall
-                // empirically in the n=16 batch=500 80 s benchmark
-                // where active_window dropped from ~75 s to 31.5 s.
-                //
-                // Calling pump_coins exactly once per fresh input
-                // feed is bounded: each round we feed at most n
-                // inputs, so this adds at most n extra pump scans
-                // per round (vs O(n^2) per round if we scanned on
-                // every RBC ECHO/READY). The pump_coins helper is
-                // idempotent + has its own fixed-point loop, so
-                // calling it here cannot violate Validity / Agreement
-                // / Termination -- it strengthens Termination by
-                // closing the cascade-internal coin-pump gap.
-                self.acs_pump_coins(round).await;
             }
             None => {
                 let st = self.acs_round_mut(round);
