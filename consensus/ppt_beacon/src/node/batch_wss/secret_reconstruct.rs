@@ -958,9 +958,45 @@ impl Context {
         );
     }
     
+    /// Public entry: recover every ready coin for `round` and emit
+    /// the resulting beacons. **Optimisation B (2026-05): coin-0
+    /// fast path.** Coin-0's reconstructed beacon is the source of
+    /// θ_{r+1} and the next-round ACS coin seed, so once it is
+    /// emitted the local node can immediately broadcast the next
+    /// round's AVSS as dealer and overlap the audit phase of round
+    /// r with the AVSS phase of round r+1. The previous one-shot
+    /// batch_recover delayed coin-0 emission until the entire batch
+    /// finished interpolating, putting the round-r+1 dealer launch
+    /// at ~70 % of round-r's wall clock and effectively serialising
+    /// the protocol round-by-round.
+    ///
+    /// The new flow:
+    ///   1. If coin-0 is ready and not yet emitted, recover ONLY
+    ///      coin-0 in a small spawn_blocking call (a single
+    ///      Lagrange interpolation, batch_size× cheaper than the
+    ///      full batch). Emit coin-0 immediately, which fires
+    ///      `record_beacon_output_for_theta` /
+    ///      `record_beacon_output_for_coin` /
+    ///      `ppt_try_start_round(round+1)` inside
+    ///      `self_coin_check_transmit`.
+    ///   2. Then recover all the remaining ready coins in one big
+    ///      batch_recover (same code path as before).
+    ///
+    /// Both calls share the `recover_and_emit_coin_set` helper which
+    /// is identical to the previous body of this function.
+    ///
+    /// Safety / liveness: identical to the old one-shot path.
+    /// Coin-0's reconstruction uses the same shares_matrix subset
+    /// as a one-shot batch_recover would have used; the resulting
+    /// beacon value is byte-identical at every honest node, so
+    /// θ_{r+1} and the ACS coin seed_{r+1} are also identical
+    /// across honest nodes (preserving ACS Agreement). The audit
+    /// `MulticastRecoveredShares` broadcast on the coin-0 path
+    /// only discloses coin-0; the second pass discloses the rest.
+    /// ACS three-property and PQ-safety are unchanged.
     #[async_recursion]
     async fn maybe_recover_ready_coins(&mut self, round: Round) {
-        let ready = {
+        let ready_initial = {
             let rbc_state = match self.round_state.get(&round) {
                 Some(rbc_state) => rbc_state,
                 None => return,
@@ -971,16 +1007,71 @@ impl Context {
             ready_coins(rbc_state, self.batch_size)
         };
 
-        if ready.is_empty() {
+        if ready_initial.is_empty() {
             return;
         }
 
-        // (c) Level 2: pull the BatchExtractor + shares_matrix out
-        //     under a read-only borrow, then drop the borrow before
-        //     handing them off to `tokio::task::spawn_blocking`. This
-        //     keeps the consensus task's worker thread free while
-        //     the Lagrange interpolation (O(|ready| * n²)) runs on
-        //     the blocking pool.
+        // Optimisation B coin-0 fast path: if coin-0 is ready and
+        // not yet emitted, recover and emit it FIRST (small,
+        // single-coin spawn_blocking call). This unblocks the
+        // round-r+1 AVSS dealer launch ~2 seconds earlier than
+        // the previous one-shot batch_recover did, which is the
+        // single biggest win for cross-round pipelining.
+        let coin0_pending = ready_initial.contains(&0)
+            && !self
+                .round_state
+                .get(&round)
+                .map(|s| s.emitted_beacon_coins.contains(&0))
+                .unwrap_or(true);
+
+        if coin0_pending {
+            log::info!(
+                "[PPT][COIN0-FAST] node {} round {} prioritising coin-0 recovery to unblock next-round AVSS pipeline",
+                self.myid,
+                round
+            );
+            self.recover_and_emit_coin_set(round, vec![0]).await;
+
+            // Re-snapshot ready set: coin-0 is now in recovered_coins,
+            // ready_coins() will skip it on its next call.
+            let remaining = {
+                let rbc_state = match self.round_state.get(&round) {
+                    Some(rbc_state) => rbc_state,
+                    None => return,
+                };
+                if rbc_state.batch_reconstruction_complete {
+                    return;
+                }
+                ready_coins(rbc_state, self.batch_size)
+            };
+
+            if remaining.is_empty() {
+                return;
+            }
+
+            self.recover_and_emit_coin_set(round, remaining).await;
+        } else {
+            // Standard one-shot batch path (e.g. coin-0 already emitted
+            // or coin-0 is not in this batch's ready set yet).
+            self.recover_and_emit_coin_set(round, ready_initial).await;
+        }
+    }
+
+    /// Pure helper: recover the secrets for `coin_set`, write them
+    /// back to `reconstructed_secrets`, run `coin_check` to derive
+    /// each beacon value, broadcast a `MulticastRecoveredShares`
+    /// snapshot covering every coin disclosed so far, and emit each
+    /// beacon via `flush_pending_beacon_outputs`.
+    ///
+    /// Identical body to the previous monolithic
+    /// `maybe_recover_ready_coins`; factored out so the coin-0 fast
+    /// path and the remaining-coins pass can share the same logic.
+    #[async_recursion]
+    async fn recover_and_emit_coin_set(&mut self, round: Round, coin_set: Vec<usize>) {
+        if coin_set.is_empty() {
+            return;
+        }
+
         let (extractor, shares_matrix, decided) = {
             let rbc_state = match self.round_state.get(&round) {
                 Some(rbc_state) => rbc_state,
@@ -998,21 +1089,18 @@ impl Context {
                 .clone()
                 .expect("ACS-decided BatchExtractor missing");
             let shares_matrix =
-                build_batch_matrix_for_coins(rbc_state, ready.as_slice(), self.num_nodes);
+                build_batch_matrix_for_coins(rbc_state, coin_set.as_slice(), self.num_nodes);
             (extractor, shares_matrix, decided)
         };
 
         log::info!(
-            "[PPT][BATCH-RECOVER] node {} round {} recovering ready coins {:?}",
+            "[PPT][BATCH-RECOVER] node {} round {} recovering coins {:?}",
             self.myid,
             round,
-            ready
+            coin_set
         );
 
-        // Heavy Lagrange interpolation runs on tokio's blocking pool
-        // on another OS thread, so the consensus task here can keep
-        // processing other inbound messages until the recover is
-        // done.
+        // Heavy Lagrange interpolation runs on tokio's blocking pool.
         let recovered = tokio::task::spawn_blocking(move || {
             extractor.batch_recover(&shares_matrix)
         })
@@ -1045,7 +1133,7 @@ impl Context {
             rbc_state.sync_secret_maps().await;
 
             let mut outputs = Vec::new();
-            for coin in ready.iter().copied() {
+            for coin in coin_set.iter().copied() {
                 rbc_state.recovered_coins.insert(coin);
 
                 if !rbc_state.emitted_beacon_coins.contains(&coin) {
