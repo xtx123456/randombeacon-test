@@ -105,32 +105,52 @@ impl Context {
 
         self.acs_try_start_self_rbc(round).await;
         self.acs_try_feed_deferred_inputs(round).await;
-        // External scan once at the cascade boundary; inner cascades
-        // (dispatch_aba_action / dispatch_rbc_action) deliberately do
-        // NOT re-scan because pump_coins / force_zero / maybe_finalize
-        // are all idempotent + monotone, so doing them once here at
-        // the outer boundary preserves Validity / Agreement /
-        // Termination at significantly lower CPU cost (see
-        // experiment-A discussion in the PR description).
-        self.acs_external_scan_once(round).await;
+        // AVSS-hook path covers both ABA-input-changing events
+        // (via acs_try_feed_deferred_inputs) and round-bootstrap, so
+        // it needs the FULL scan. The two specialised RBC vs ABA
+        // outer scans below are used for inbound network-message
+        // cascade tails.
+        self.acs_external_scan_full(round).await;
     }
 
-    /// External-boundary scan: pump every (j, aba_round) coin that
-    /// hasn't been fed, fire the n-f-decided-1 force-zero rule if
-    /// applicable, and finalise the round if every ABA decided.
+    /// Full external-boundary scan: pump every (j, aba_round) coin
+    /// that hasn't been fed, fire the n-f-decided-1 force-zero rule
+    /// if applicable, and finalise the round if every ABA decided.
     ///
-    /// This is the *only* place these three scans run on the cascade
-    /// hot path; cascade-internal callers (the `*_inner` handlers
-    /// invoked from `dispatch_*_action`) skip the scan. Idempotency
-    /// + monotonicity of `acs_pump_coins`, `acs_maybe_force_zero_inputs`
-    /// and `acs_maybe_finalize` guarantee that running them once at
-    /// the cascade boundary is semantically equivalent to running
-    /// them after every inner handler — but ~O(n) cheaper per
-    /// inbound message.
+    /// Used at the cascade boundary by the **ABA inbound handlers**
+    /// (`process_acs_aba_bval` / `process_acs_aba_aux`) and by the
+    /// AVSS hook (`acs_note_local_change`). The RBC inbound
+    /// handlers use the cheaper `acs_external_scan_finalize_only`
+    /// instead, because RBC ECHO/READY counter updates can never
+    /// directly enable a `pump_coins` or `force_zero` transition --
+    /// only ABA state changes (and AVSS-completion changes that
+    /// arrive through `acs_note_local_change`) can. RBC delivery
+    /// *can* feed a fresh ABA input via `on_rbc_delivered`, but
+    /// once that input is fed, the resulting BVAL is broadcast to
+    /// peers and their ABA outer handlers will trigger
+    /// `acs_external_scan_full` within the next network round-trip
+    /// to pump the new ABA(j) round-0 coin. This avoids the per-
+    /// inbound-RBC-message scan overhead that regressed batch=100
+    /// throughput by 23 % in the first version of experiment A.
+    ///
+    /// The three helpers are idempotent + monotone so running them
+    /// at the cascade boundary preserves Validity / Agreement /
+    /// Termination — see PR description for the formal argument.
     #[async_recursion]
-    async fn acs_external_scan_once(&mut self, round: Round) {
+    async fn acs_external_scan_full(&mut self, round: Round) {
         self.acs_pump_coins(round).await;
         self.acs_maybe_force_zero_inputs(round).await;
+        self.acs_maybe_finalize(round).await;
+    }
+
+    /// Cheaper external-boundary scan: only checks whether the
+    /// round can finalise. Used by the RBC inbound handlers
+    /// (`process_acs_rbc_send` / `echo` / `ready`) because their
+    /// state changes (ECHO/READY counters and SEND payload caching)
+    /// cannot directly enable a `pump_coins` / `force_zero`
+    /// transition; only ABA state changes can.
+    #[async_recursion]
+    async fn acs_external_scan_finalize_only(&mut self, round: Round) {
         self.acs_maybe_finalize(round).await;
     }
 
@@ -580,8 +600,9 @@ impl Context {
     //   * `process_acs_*`        -- OUTER entry: called by the
     //     network dispatcher in `process.rs` for each received
     //     wire message. Runs the inner cascade and then triggers
-    //     **exactly one** external scan
-    //     (`acs_external_scan_once`) at the cascade boundary.
+    //     **exactly one** external scan at the cascade boundary.
+    //     RBC handlers use the cheap `acs_external_scan_finalize_only`,
+    //     ABA handlers use the full `acs_external_scan_full`.
     //
     //   * `process_acs_*_inner`  -- INNER entry: called from
     //     `dispatch_rbc_action` / `dispatch_aba_action` along the
@@ -594,14 +615,26 @@ impl Context {
     //     deferring them to the boundary preserves Validity /
     //     Agreement / Termination at significantly lower CPU cost.
     //
+    // Why specialised scans for RBC vs ABA? The RBC state machine
+    // only updates ECHO/READY counters and SEND payload bytes -- it
+    // never directly enables a `pump_coins` or `force_zero`
+    // transition (those depend on ABA state). RBC delivery *does*
+    // feed an ABA input via `on_rbc_delivered`, but the resulting
+    // BVAL is broadcast to peers, who then run their own ABA outer
+    // scan within ~1 RTT and pump the new ABA(j) round-0 coin.
+    // Skipping pump_coins on the RBC path avoided a 23 % batch=100
+    // throughput regression in the first version of experiment A
+    // (where every RBC ECHO/READY also triggered a full pump scan).
+    //
     // Termination intuition: every inbound ACS message arrives
     // through one of the OUTER entries (the network dispatcher in
     // `process.rs` only ever calls the outer variants), and every
-    // outer entry concludes with `acs_external_scan_once`. Hence
-    // every state mutation that could enable a new scan-driven
-    // transition (coin pump, force-zero, finalize) is followed by
-    // exactly one scan before control returns to the network
-    // event loop. This is sufficient for monotone progress.
+    // outer entry concludes with at least `acs_maybe_finalize`.
+    // ABA inbound messages additionally trigger pump_coins +
+    // force_zero, which are exactly the events that can require
+    // them. Every state mutation that could enable a new scan-
+    // driven transition is therefore followed by an appropriate
+    // scan before control returns to the network event loop.
 
     /// `ACSRbcSend(round, proposer, payload)`. The dispatcher in
     /// `process.rs` already checked that the wrapper-level sender
@@ -615,7 +648,7 @@ impl Context {
         payload: Vec<u8>,
     ) {
         self.process_acs_rbc_send_inner(round, proposer, payload).await;
-        self.acs_external_scan_once(round).await;
+        self.acs_external_scan_finalize_only(round).await;
     }
 
     #[async_recursion]
@@ -656,7 +689,7 @@ impl Context {
         payload_hash: crypto::hash::Hash,
     ) {
         self.process_acs_rbc_echo_inner(round, proposer, sender, payload_hash).await;
-        self.acs_external_scan_once(round).await;
+        self.acs_external_scan_finalize_only(round).await;
     }
 
     #[async_recursion]
@@ -693,7 +726,7 @@ impl Context {
         payload_hash: crypto::hash::Hash,
     ) {
         self.process_acs_rbc_ready_inner(round, proposer, sender, payload_hash).await;
-        self.acs_external_scan_once(round).await;
+        self.acs_external_scan_finalize_only(round).await;
     }
 
     #[async_recursion]
@@ -731,7 +764,7 @@ impl Context {
         sender: Replica,
     ) {
         self.process_acs_aba_bval_inner(round, aba_instance_id, aba_round, value, sender).await;
-        self.acs_external_scan_once(round).await;
+        self.acs_external_scan_full(round).await;
     }
 
     #[async_recursion]
@@ -768,7 +801,7 @@ impl Context {
         sender: Replica,
     ) {
         self.process_acs_aba_aux_inner(round, aba_instance_id, aba_round, value, sender).await;
-        self.acs_external_scan_once(round).await;
+        self.acs_external_scan_full(round).await;
     }
 
     #[async_recursion]
