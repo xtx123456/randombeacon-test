@@ -421,16 +421,75 @@ impl Context {
     }
 
     /// Broadcast a message to all nodes.
+    ///
+    /// **Hot-path optimisation (P0-A)**: the wire bytes of `protmsg`
+    /// are byte-identical for every recipient -- only the per-
+    /// recipient HMAC differs because each peer has its own pre-
+    /// shared symmetric key. The previous implementation called
+    /// `WrapperMsg::new(...)` once per recipient, which internally
+    /// re-ran `bincode::serialize(&protmsg)` n-1 times even though
+    /// the output was the same every time. With the new ACS
+    /// pipeline emitting ~80 broadcasts per round per node (RBC
+    /// SEND/ECHO/READY × n proposers + ABA BVAL/AUX × n instances),
+    /// the redundant serialisation became a measurable share of
+    /// the consensus task's CPU budget.
+    ///
+    /// The new implementation:
+    ///   1. serialises `protmsg` exactly once into a `Vec<u8>`,
+    ///   2. for every recipient computes only the HMAC over those
+    ///      shared bytes using that recipient's secret key, and
+    ///   3. constructs the `WrapperMsg` with the (cheap) `protmsg`
+    ///      clone for the wire payload + the per-recipient mac.
+    ///
+    /// Wire format is unchanged (no `WrapperMsg` field rename), so
+    /// this is a pure implementation-side optimisation. ACS three-
+    /// property safety is unaffected.
+    ///
+    /// We also avoid the previous `self.sec_key_map.clone()` per
+    /// broadcast by collecting the recipient list up-front into a
+    /// small `Vec<(Replica, Vec<u8>)>`, releasing the immutable
+    /// borrow before any `&mut self` operation.
     pub async fn broadcast(&mut self, protmsg: CoinMsg, round: Round) {
-        let sec_key_map = self.sec_key_map.clone();
-        for (replica, sec_key) in sec_key_map.into_iter() {
-            if replica != self.myid {
-                let wrapper_msg =
-                    WrapperMsg::new(protmsg.clone(), self.myid, sec_key.as_slice(), round);
-                let cancel_handler: CancelHandler<Acknowledgement> =
-                    self.net_send.send(replica, wrapper_msg).await;
-                self.add_cancel_handler(cancel_handler);
+        // (1) serialise once -- this is what `WrapperMsg::new`
+        //     internally did n-1 times before.
+        let bytes = bincode::serialize(&protmsg)
+            .expect("Failed to serialize protmsg for broadcast");
+
+        let myid = self.myid;
+
+        // (2) collect (replica, mac) for every recipient using the
+        //     shared `bytes`. We snapshot the keys first so we can
+        //     drop the immutable borrow on `self.sec_key_map` before
+        //     touching `self.net_send` and `self.cancel_handlers`.
+        //     This loop is pure CPU (HMAC-SHA256) and runs in tens
+        //     of microseconds per recipient.
+        let mut wrappers: Vec<(Replica, WrapperMsg)> =
+            Vec::with_capacity(self.sec_key_map.len());
+        for (replica, sec_key) in self.sec_key_map.iter() {
+            if *replica == myid {
+                continue;
             }
+            let mac = crypto::hash::do_mac(bytes.as_slice(), sec_key.as_slice());
+            // The wire format expects an owned `protmsg`; the clone
+            // here is the only remaining per-recipient cost.
+            let wrapper = WrapperMsg {
+                protmsg: protmsg.clone(),
+                sender: myid,
+                mac,
+                round,
+            };
+            wrappers.push((*replica, wrapper));
+        }
+
+        // (3) push the wrappers to per-recipient channels. Each call
+        //     is sub-microsecond (TcpReliableSender::send only does
+        //     a synchronous channel push -- the actual TCP I/O runs
+        //     in a separately-spawned per-connection task), so there
+        //     is no benefit to wrapping these in `join_all`.
+        for (replica, wrapper) in wrappers {
+            let cancel_handler: CancelHandler<Acknowledgement> =
+                self.net_send.send(replica, wrapper).await;
+            self.add_cancel_handler(cancel_handler);
         }
     }
 
