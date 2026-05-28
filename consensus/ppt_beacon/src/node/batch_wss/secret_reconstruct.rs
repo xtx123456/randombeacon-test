@@ -1242,6 +1242,43 @@ impl Context {
         self.maybe_recover_ready_coins(round).await;
     }
 
+    /// Inbound `MulticastRecoveredShares(round, sender, snapshot)`.
+    ///
+    /// **P0-A.1 fire-and-forget audit**: this handler used to await
+    /// the spawn_blocking audit (~80–300 ms per round) and apply
+    /// blame writes inline on the consensus task's main loop. That
+    /// blocked every other inbound message (in particular round-r+1
+    /// AVSSSend packets) for the audit duration, which empirically
+    /// caused PPT b=500 / b=1000 to stall after only ~30 / ~20 s of
+    /// an 80 s benchmark.
+    ///
+    /// The new flow:
+    ///   1. Cheap inline writes (~µs): record this sender's snapshot
+    ///      in `post_complaint_packets`, return early if we have
+    ///      not yet reached the n-f threshold or the audit already
+    ///      ran.
+    ///   2. Once threshold hits, spawn a *detached* `tokio::spawn`
+    ///      task that runs the full `audit_post_complaint_pure`
+    ///      computation on the blocking pool. The detached task
+    ///      sends the resulting `blame_events` back to the main
+    ///      loop via `Context::audit_tx`.
+    ///   3. The main loop's `tokio::select!` arm picks up the
+    ///      `AuditCompletion` and calls `finalize_audit_completion`,
+    ///      which performs the blame / ban / release writes. All
+    ///      `Context` mutations therefore stay single-threaded and
+    ///      sequential — no Mutex needed on the hot path.
+    ///
+    /// Safety / liveness preserved:
+    ///   - The audit's correctness depends only on its inputs
+    ///     (decided set, comm vectors, post packets, audit senders,
+    ///     batch_size, hash_context), all of which are owned values
+    ///     moved into the detached task. No shared mutable state.
+    ///   - The blame writes (`ban_dealer_global`,
+    ///     `maybe_release_round`) only affect future rounds; round-r
+    ///     beacons have already been emitted before audit completes,
+    ///     so deferring blame writes by the wall-clock duration of
+    ///     the audit task does not change protocol output for any
+    ///     committed round.
     pub async fn process_multicast_recovered_shares(
         &mut self,
         recovered: MulticastRecoveredSharesMsg,
@@ -1267,7 +1304,7 @@ impl Context {
             sender
         );
 
-        let (decided, comm_vectors, post_packets, audit_senders) = {
+        let detach_inputs = {
             let rbc_state = self.round_state.get_mut(&round).unwrap();
 
             if rbc_state.cleared {
@@ -1311,42 +1348,77 @@ impl Context {
 
             rbc_state.post_complaint_complete = true;
 
-            (
+            Some((
                 rbc_state.acs_decided_set.clone().unwrap_or_default(),
                 rbc_state.comm_vectors.clone(),
                 rbc_state.post_complaint_packets.clone(),
                 senders,
-            )
+            ))
         };
 
-        // (d) Level 2: bulk audit loop on tokio blocking pool. The
-        // pre-flight `&mut self.round_state` borrow was already
-        // dropped at the end of the outer `let (..) = { .. };` block,
-        // so we can freely move owned audit inputs into the closure.
+        let (decided, comm_vectors, post_packets, audit_senders) = match detach_inputs {
+            Some(v) => v,
+            None => return,
+        };
+
+        // P0-A.1: detach the audit work into an independent
+        // `tokio::spawn` task. The main loop returns immediately,
+        // unblocking subsequent inbound messages (especially round-r+1
+        // AVSSSend packets) instead of awaiting the ~80-300 ms
+        // spawn_blocking audit synchronously.
         let hash_context = std::sync::Arc::clone(&self.hash_context);
         let batch_size = self.batch_size;
-        let blame_events = tokio::task::spawn_blocking(move || {
-            audit_post_complaint_pure(
-                decided,
-                comm_vectors,
-                post_packets,
-                audit_senders,
-                batch_size,
-                &hash_context,
-            )
-        })
-        .await
-        .unwrap_or_else(|e| {
-            log::error!(
-                "[PPT][LEVEL2] post-complaint audit blocking task join error round {}: {}",
-                round, e
+        let myid = self.myid;
+        let audit_tx = self.audit_tx.clone();
+
+        tokio::spawn(async move {
+            let blame_events = tokio::task::spawn_blocking(move || {
+                audit_post_complaint_pure(
+                    decided,
+                    comm_vectors,
+                    post_packets,
+                    audit_senders,
+                    batch_size,
+                    &hash_context,
+                )
+            })
+            .await
+            .unwrap_or_else(|e| {
+                log::error!(
+                    "[PPT][LEVEL2] post-complaint audit blocking task join error round {}: {}",
+                    round, e
+                );
+                Vec::new()
+            });
+
+            log::info!(
+                "[PPT][POST-COMPLAINT] node {} round {} async audit produced {} blame events; publishing to main loop",
+                myid,
+                round,
+                blame_events.len()
             );
-            Vec::new()
+
+            let _ = audit_tx.send(crate::node::context::AuditCompletion {
+                round,
+                blame_events,
+            });
         });
+    }
+
+    /// Apply the blame / ban / release writes from a completed
+    /// fire-and-forget audit. Called from the main loop's
+    /// `tokio::select!` arm on `audit_rx.recv()`.
+    pub async fn finalize_audit_completion(
+        &mut self,
+        completion: crate::node::context::AuditCompletion,
+    ) {
+        let round = completion.round;
+        let blame_events = completion.blame_events;
+        let threshold = self.num_nodes - self.num_faults;
 
         if blame_events.is_empty() {
             log::info!(
-                "[PPT][POST-COMPLAINT] node {} round {} completed at async threshold {} with no blame events",
+                "[PPT][POST-COMPLAINT] node {} round {} async audit completed (n-f threshold {}) with no blame events",
                 self.myid,
                 round,
                 threshold
@@ -1360,7 +1432,14 @@ impl Context {
 
         let mut to_ban: HashSet<Replica> = HashSet::new();
         {
-            let rbc_state = self.round_state.get_mut(&round).unwrap();
+            let rbc_state = match self.round_state.get_mut(&round) {
+                Some(rbc_state) => rbc_state,
+                None => {
+                    // round_state already released between the audit
+                    // task spawning and finishing -- nothing to do.
+                    return;
+                }
+            };
             for (dealer, reason) in blame_events.into_iter() {
                 log::error!(
                     "[PPT][POST-BLAME] node {} round {} blaming dealer {}: {:?}",
@@ -1373,15 +1452,9 @@ impl Context {
                 to_ban.insert(dealer);
             }
         }
-        // Permanently kick the dealer out of every future round.
-        // This is the missing half of the PPT "kick out corrupted
-        // leader" research path (slides pg 17-25): blame is now
-        // wired into Context::banned_dealers, which the AVSS, ACS
-        // and reconstruction paths all consult.
         for dealer in to_ban.into_iter() {
             self.ban_dealer_global(dealer);
         }
-        // Same idempotent release after the blame path runs.
         self.maybe_release_round(round);
     }
 

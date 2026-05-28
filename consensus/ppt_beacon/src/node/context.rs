@@ -121,11 +121,47 @@ pub struct Context {
     /// round >= 1, populated as the protocol completes earlier rounds.
     pub coin_per_round: HashMap<Round, Vec<u8>>,
 
+    // ---- Audit fire-and-forget plumbing (P0-A.1) ----
+    //
+    // post-ACS audit (the bulk of `process_multicast_recovered_shares`)
+    // does not feed back into the round-r protocol pipeline -- it
+    // only records blame and bans dealers from FUTURE rounds. Running
+    // it inline on the consensus task's main loop blocks every other
+    // inbound message (in particular round-r+1's AVSSSend packets)
+    // for the duration of the audit + spawn_blocking await -- which
+    // empirically caused PPT b=500 / b=1000 to stall after only
+    // 31 / 19 seconds of an 80 s benchmark.
+    //
+    // The fix detaches the audit + spawn_blocking work into an
+    // independent `tokio::spawn`-ed task that publishes its blame
+    // events back to the main loop via the channel below. The main
+    // loop drains the channel in a `tokio::select!` arm and applies
+    // the blame writes (`blame_dealer`, `ban_dealer_global`,
+    // `maybe_release_round`) on the consensus task's worker thread,
+    // so all `Context` mutations remain serialised exactly as before.
+    //
+    // Result: the consensus main loop no longer awaits the audit
+    // task, and round-r+1's AVSSSend / ACS messages can be processed
+    // immediately while round-r's audit runs in parallel on the
+    // tokio blocking pool.
+    pub audit_tx: mpsc::UnboundedSender<AuditCompletion>,
+    pub audit_rx: mpsc::UnboundedReceiver<AuditCompletion>,
+
     // ---- Diagnostics / lifecycle ----
     pub num_messages: u32,
     pub bench: HashMap<String, u128>,
     pub cancel_handlers: HashMap<Round, Vec<CancelHandler<Acknowledgement>>>,
     exit_rx: oneshot::Receiver<()>,
+}
+
+/// Result of one detached `process_multicast_recovered_shares` audit
+/// run. The detached task computes `blame_events` from the spawn_blocking
+/// audit and sends this struct back to the main loop, which then
+/// performs the blame / ban writes on `Context` (single-threaded).
+#[derive(Debug)]
+pub struct AuditCompletion {
+    pub round: Round,
+    pub blame_events: Vec<(Replica, crate::node::ctrbc::state::BlameReason)>,
 }
 
 impl Context {
@@ -202,6 +238,9 @@ impl Context {
                 );
             }
 
+            // Audit fire-and-forget channel (see field comment above).
+            let (audit_tx, audit_rx) = mpsc::unbounded_channel::<AuditCompletion>();
+
             let mut c = Context {
                 net_send: consensus_net,
                 net_recv: rx_net_to_consensus,
@@ -227,6 +266,8 @@ impl Context {
                 theta_per_round: HashMap::default(),
                 banned_dealers: HashSet::new(),
                 pending_avss_for_theta: HashMap::default(),
+                audit_tx,
+                audit_rx,
                 coin_per_round: HashMap::default(),
 
                 num_messages: 0,
@@ -542,6 +583,20 @@ impl Context {
                     // would let the inbound queue grow until the
                     // protocol stalled.
                     tokio::task::yield_now().await;
+                }
+                Some(audit_completion) = self.audit_rx.recv() => {
+                    // Audit fire-and-forget result (P0-A.1):
+                    //
+                    // A previously-spawned detached task finished its
+                    // post-ACS audit (the spawn_blocking
+                    // `audit_post_complaint_pure` call inside
+                    // `process_multicast_recovered_shares`) and produced
+                    // `blame_events`. Apply them here on the consensus
+                    // task's worker thread so all `Context` mutations
+                    // (banned_dealers, round_state) remain
+                    // single-threaded-serialised, with no need for
+                    // Mutex-style locking on the hot path.
+                    self.finalize_audit_completion(audit_completion).await;
                 }
                 sync_msg = self.sync_recv.recv() => {
                     let sync_msg = sync_msg.ok_or_else(|| anyhow!("Networking layer has closed"))?;
