@@ -19,3 +19,4 @@ pub mod ctrbc;
 pub use ctrbc::*;
 
 pub mod acs;
+pub mod shoup_smart;
