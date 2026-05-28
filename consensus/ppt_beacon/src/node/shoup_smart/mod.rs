@@ -33,3 +33,4 @@
 //! these state machines into `Context` (commits 6-7).
 
 pub mod reed_solomon;
+pub mod compact_broadcast;
