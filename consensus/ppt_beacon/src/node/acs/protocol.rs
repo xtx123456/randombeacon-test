@@ -105,8 +105,32 @@ impl Context {
 
         self.acs_try_start_self_rbc(round).await;
         self.acs_try_feed_deferred_inputs(round).await;
-        self.acs_maybe_force_zero_inputs(round).await;
+        // External scan once at the cascade boundary; inner cascades
+        // (dispatch_aba_action / dispatch_rbc_action) deliberately do
+        // NOT re-scan because pump_coins / force_zero / maybe_finalize
+        // are all idempotent + monotone, so doing them once here at
+        // the outer boundary preserves Validity / Agreement /
+        // Termination at significantly lower CPU cost (see
+        // experiment-A discussion in the PR description).
+        self.acs_external_scan_once(round).await;
+    }
+
+    /// External-boundary scan: pump every (j, aba_round) coin that
+    /// hasn't been fed, fire the n-f-decided-1 force-zero rule if
+    /// applicable, and finalise the round if every ABA decided.
+    ///
+    /// This is the *only* place these three scans run on the cascade
+    /// hot path; cascade-internal callers (the `*_inner` handlers
+    /// invoked from `dispatch_*_action`) skip the scan. Idempotency
+    /// + monotonicity of `acs_pump_coins`, `acs_maybe_force_zero_inputs`
+    /// and `acs_maybe_finalize` guarantee that running them once at
+    /// the cascade boundary is semantically equivalent to running
+    /// them after every inner handler — but ~O(n) cheaper per
+    /// inbound message.
+    #[async_recursion]
+    async fn acs_external_scan_once(&mut self, round: Round) {
         self.acs_pump_coins(round).await;
+        self.acs_maybe_force_zero_inputs(round).await;
         self.acs_maybe_finalize(round).await;
     }
 
@@ -272,10 +296,20 @@ impl Context {
     }
 
     /// Feed the common coin into every (j, current_aba_round) pair
-    /// that hasn't been fed yet. Idempotent. We aggressively pump
-    /// coins so a freshly-advanced round inside any instance has
-    /// its coin available without waiting for another inbound BVAL/
-    /// AUX trigger.
+    /// that hasn't been fed yet. Idempotent. Iterates internally
+    /// until a fixed point is reached, so that feeding coin r at
+    /// instance j (which can advance instance j into round r+1) is
+    /// followed in the *same* outer scan by feeding coin r+1, etc.
+    ///
+    /// Without this fixed-point loop, the experiment-A "scan once
+    /// at the cascade boundary" design would cost one extra network
+    /// round-trip of latency per ABA round of advancement, because
+    /// each newly-advanced round's coin would only be pumped after
+    /// the next inbound BVAL/AUX from a peer triggered another
+    /// outer scan. The loop is bounded by `MAX_PUMP_PASSES` to
+    /// defend against any pathological infinite advancement (in
+    /// practice MMR ABA terminates in O(1) expected ABA rounds, so
+    /// 16 is well above any realistic upper bound).
     #[async_recursion]
     async fn acs_pump_coins(&mut self, round: Round) {
         // We may not have the seed yet (round > 0 with previous
@@ -285,40 +319,47 @@ impl Context {
             return;
         }
 
-        let needed: Vec<(usize, u64)> = {
-            let st = match self.acs_state.get(&round) {
-                Some(s) => s,
-                None => return,
-            };
-            let mut needed = Vec::new();
-            for j in 0..st.n {
-                if !st.aba_input_fed[j] {
-                    // Cannot advance until input is fed — coin is
-                    // useless before that.
-                    continue;
-                }
-                let curr = st.aba.current_aba_round(j).unwrap_or(0);
-                for r in 0..=curr {
-                    if !st.coin_fed_for.contains(&(j, r)) {
-                        needed.push((j, r));
+        const MAX_PUMP_PASSES: usize = 16;
+        for _ in 0..MAX_PUMP_PASSES {
+            let needed: Vec<(usize, u64)> = {
+                let st = match self.acs_state.get(&round) {
+                    Some(s) => s,
+                    None => return,
+                };
+                let mut needed = Vec::new();
+                for j in 0..st.n {
+                    if !st.aba_input_fed[j] {
+                        // Cannot advance until input is fed — coin
+                        // is useless before that.
+                        continue;
+                    }
+                    let curr = st.aba.current_aba_round(j).unwrap_or(0);
+                    for r in 0..=curr {
+                        if !st.coin_fed_for.contains(&(j, r)) {
+                            needed.push((j, r));
+                        }
                     }
                 }
-            }
-            needed
-        };
+                needed
+            };
 
-        for (j, r) in needed {
-            let bit = match self.coin_bit_for(round, j, r) {
-                Some(b) => b,
-                None => continue,
-            };
-            let acts = {
-                let st = self.acs_round_mut(round);
-                st.coin_fed_for.insert((j, r));
-                st.aba.handle_coin(j, r, bit)
-            };
-            for a in acts {
-                self.dispatch_aba_action(round, self.myid, a).await;
+            if needed.is_empty() {
+                return;
+            }
+
+            for (j, r) in needed {
+                let bit = match self.coin_bit_for(round, j, r) {
+                    Some(b) => b,
+                    None => continue,
+                };
+                let acts = {
+                    let st = self.acs_round_mut(round);
+                    st.coin_fed_for.insert((j, r));
+                    st.aba.handle_coin(j, r, bit)
+                };
+                for a in acts {
+                    self.dispatch_aba_action(round, self.myid, a).await;
+                }
             }
         }
     }
@@ -369,6 +410,12 @@ impl Context {
     ///   - `SendEcho(h)`       → broadcast `ACSRbcEcho` + self-deliver
     ///   - `SendReady(h)`      → broadcast `ACSRbcReady` + self-deliver
     ///   - `Delivered(payload)`→ record locally and feed ABA(j) input
+    ///
+    /// Self-deliver paths intentionally call the **`*_inner`**
+    /// variants of the inbound handlers, which skip the external
+    /// scan (`acs_external_scan_once`). The scan happens once at
+    /// the outer cascade boundary, not on every recursive
+    /// self-deliver step.
     #[async_recursion]
     async fn dispatch_rbc_action(
         &mut self,
@@ -380,19 +427,20 @@ impl Context {
             RbcAction::SendSend { payload } => {
                 let msg = CoinMsg::ACSRbcSend(round, proposer, payload.clone());
                 self.broadcast(msg, round).await;
-                // Self-deliver: feed our own SEND into our local RBC
-                // state so the ECHO/READY thresholds count us.
-                self.process_acs_rbc_send(round, proposer, payload).await;
+                // Self-deliver inner: feed our own SEND into our local
+                // RBC state so the ECHO/READY thresholds count us.
+                // No scan here -- it runs once at the outer boundary.
+                self.process_acs_rbc_send_inner(round, proposer, payload).await;
             }
             RbcAction::SendEcho { payload_hash } => {
                 let msg = CoinMsg::ACSRbcEcho(round, proposer, payload_hash);
                 self.broadcast(msg, round).await;
-                self.process_acs_rbc_echo(round, proposer, self.myid, payload_hash).await;
+                self.process_acs_rbc_echo_inner(round, proposer, self.myid, payload_hash).await;
             }
             RbcAction::SendReady { payload_hash } => {
                 let msg = CoinMsg::ACSRbcReady(round, proposer, payload_hash);
                 self.broadcast(msg, round).await;
-                self.process_acs_rbc_ready(round, proposer, self.myid, payload_hash).await;
+                self.process_acs_rbc_ready_inner(round, proposer, self.myid, payload_hash).await;
             }
             RbcAction::Delivered { payload } => {
                 self.on_rbc_delivered(round, proposer, payload).await;
@@ -479,9 +527,12 @@ impl Context {
     }
 
     /// Dispatch one `AbaDriverAction`. Maps:
-    ///   - `Bval`     → broadcast + self-deliver
-    ///   - `Aux`      → broadcast + self-deliver
-    ///   - `Decided`  → log; finalisation happens in `acs_maybe_finalize`.
+    ///   - `Bval`     → broadcast + self-deliver (inner)
+    ///   - `Aux`      → broadcast + self-deliver (inner)
+    ///   - `Decided`  → log; finalisation happens at the outer scan.
+    ///
+    /// As with `dispatch_rbc_action`, self-deliver uses the `*_inner`
+    /// handler variants which skip the external scan.
     #[async_recursion]
     async fn dispatch_aba_action(
         &mut self,
@@ -498,7 +549,7 @@ impl Context {
                     value,
                 );
                 self.broadcast(msg, round).await;
-                self.process_acs_aba_bval(round, aba_instance_id as Replica, aba_round, value, sender).await;
+                self.process_acs_aba_bval_inner(round, aba_instance_id as Replica, aba_round, value, sender).await;
             }
             AbaDriverAction::Aux { aba_instance_id, aba_round, value } => {
                 let msg = CoinMsg::ACSAbaAux(
@@ -508,7 +559,7 @@ impl Context {
                     value,
                 );
                 self.broadcast(msg, round).await;
-                self.process_acs_aba_aux(round, aba_instance_id as Replica, aba_round, value, sender).await;
+                self.process_acs_aba_aux_inner(round, aba_instance_id as Replica, aba_round, value, sender).await;
             }
             AbaDriverAction::Decided { aba_instance_id, value } => {
                 log::info!(
@@ -523,6 +574,34 @@ impl Context {
     }
 
     // ---- Inbound message handlers ----
+    //
+    // Each handler comes in two flavours:
+    //
+    //   * `process_acs_*`        -- OUTER entry: called by the
+    //     network dispatcher in `process.rs` for each received
+    //     wire message. Runs the inner cascade and then triggers
+    //     **exactly one** external scan
+    //     (`acs_external_scan_once`) at the cascade boundary.
+    //
+    //   * `process_acs_*_inner`  -- INNER entry: called from
+    //     `dispatch_rbc_action` / `dispatch_aba_action` along the
+    //     self-deliver path. Runs the state-machine update + any
+    //     resulting cascade actions. **Does not scan**, because
+    //     the enclosing outer entry will scan at the cascade
+    //     boundary anyway, and the three scan helpers
+    //     (`acs_pump_coins` / `acs_maybe_force_zero_inputs` /
+    //     `acs_maybe_finalize`) are idempotent + monotone, so
+    //     deferring them to the boundary preserves Validity /
+    //     Agreement / Termination at significantly lower CPU cost.
+    //
+    // Termination intuition: every inbound ACS message arrives
+    // through one of the OUTER entries (the network dispatcher in
+    // `process.rs` only ever calls the outer variants), and every
+    // outer entry concludes with `acs_external_scan_once`. Hence
+    // every state mutation that could enable a new scan-driven
+    // transition (coin pump, force-zero, finalize) is followed by
+    // exactly one scan before control returns to the network
+    // event loop. This is sufficient for monotone progress.
 
     /// `ACSRbcSend(round, proposer, payload)`. The dispatcher in
     /// `process.rs` already checked that the wrapper-level sender
@@ -530,6 +609,17 @@ impl Context {
     /// from the proposer themselves).
     #[async_recursion]
     pub async fn process_acs_rbc_send(
+        &mut self,
+        round: Round,
+        proposer: Replica,
+        payload: Vec<u8>,
+    ) {
+        self.process_acs_rbc_send_inner(round, proposer, payload).await;
+        self.acs_external_scan_once(round).await;
+    }
+
+    #[async_recursion]
+    async fn process_acs_rbc_send_inner(
         &mut self,
         round: Round,
         proposer: Replica,
@@ -555,12 +645,22 @@ impl Context {
         for a in acts {
             self.dispatch_rbc_action(round, proposer, a).await;
         }
-
-        self.acs_maybe_finalize(round).await;
     }
 
     #[async_recursion]
     pub async fn process_acs_rbc_echo(
+        &mut self,
+        round: Round,
+        proposer: Replica,
+        sender: Replica,
+        payload_hash: crypto::hash::Hash,
+    ) {
+        self.process_acs_rbc_echo_inner(round, proposer, sender, payload_hash).await;
+        self.acs_external_scan_once(round).await;
+    }
+
+    #[async_recursion]
+    async fn process_acs_rbc_echo_inner(
         &mut self,
         round: Round,
         proposer: Replica,
@@ -582,12 +682,22 @@ impl Context {
         for a in acts {
             self.dispatch_rbc_action(round, proposer, a).await;
         }
-
-        self.acs_maybe_finalize(round).await;
     }
 
     #[async_recursion]
     pub async fn process_acs_rbc_ready(
+        &mut self,
+        round: Round,
+        proposer: Replica,
+        sender: Replica,
+        payload_hash: crypto::hash::Hash,
+    ) {
+        self.process_acs_rbc_ready_inner(round, proposer, sender, payload_hash).await;
+        self.acs_external_scan_once(round).await;
+    }
+
+    #[async_recursion]
+    async fn process_acs_rbc_ready_inner(
         &mut self,
         round: Round,
         proposer: Replica,
@@ -609,12 +719,23 @@ impl Context {
         for a in acts {
             self.dispatch_rbc_action(round, proposer, a).await;
         }
-
-        self.acs_maybe_finalize(round).await;
     }
 
     #[async_recursion]
     pub async fn process_acs_aba_bval(
+        &mut self,
+        round: Round,
+        aba_instance_id: Replica,
+        aba_round: u64,
+        value: bool,
+        sender: Replica,
+    ) {
+        self.process_acs_aba_bval_inner(round, aba_instance_id, aba_round, value, sender).await;
+        self.acs_external_scan_once(round).await;
+    }
+
+    #[async_recursion]
+    async fn process_acs_aba_bval_inner(
         &mut self,
         round: Round,
         aba_instance_id: Replica,
@@ -635,14 +756,23 @@ impl Context {
         for a in acts {
             self.dispatch_aba_action(round, self.myid, a).await;
         }
-
-        self.acs_pump_coins(round).await;
-        self.acs_maybe_force_zero_inputs(round).await;
-        self.acs_maybe_finalize(round).await;
     }
 
     #[async_recursion]
     pub async fn process_acs_aba_aux(
+        &mut self,
+        round: Round,
+        aba_instance_id: Replica,
+        aba_round: u64,
+        value: bool,
+        sender: Replica,
+    ) {
+        self.process_acs_aba_aux_inner(round, aba_instance_id, aba_round, value, sender).await;
+        self.acs_external_scan_once(round).await;
+    }
+
+    #[async_recursion]
+    async fn process_acs_aba_aux_inner(
         &mut self,
         round: Round,
         aba_instance_id: Replica,
@@ -663,9 +793,5 @@ impl Context {
         for a in acts {
             self.dispatch_aba_action(round, self.myid, a).await;
         }
-
-        self.acs_pump_coins(round).await;
-        self.acs_maybe_force_zero_inputs(round).await;
-        self.acs_maybe_finalize(round).await;
     }
 }
