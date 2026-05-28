@@ -978,12 +978,19 @@ impl Context {
     ///      `record_beacon_output_for_theta` /
     ///      `record_beacon_output_for_coin` /
     ///      `ppt_try_start_round(round+1)` inside
-    ///      `self_coin_check_transmit`.
+    ///      `self_coin_check_transmit`. **Crucially, this fast-path
+    ///      call passes `emit_audit_multicast = false`** — the
+    ///      audit `MulticastRecoveredShares` broadcast is deferred
+    ///      until the second pass below, so that audit always sees
+    ///      the FULL batch of disclosures, not just coin-0.
     ///   2. Then recover all the remaining ready coins in one big
-    ///      batch_recover (same code path as before).
+    ///      batch_recover (same code path as before), this time
+    ///      with `emit_audit_multicast = true`. The audit
+    ///      multicast carries the complete set of disclosed coins
+    ///      (coin-0 ∪ remaining), so the post-ACS audit sees the
+    ///      same evidence as the pre-fast-path implementation did.
     ///
-    /// Both calls share the `recover_and_emit_coin_set` helper which
-    /// is identical to the previous body of this function.
+    /// Both calls share the `recover_and_emit_coin_set` helper.
     ///
     /// Safety / liveness: identical to the old one-shot path.
     /// Coin-0's reconstruction uses the same shares_matrix subset
@@ -991,8 +998,9 @@ impl Context {
     /// beacon value is byte-identical at every honest node, so
     /// θ_{r+1} and the ACS coin seed_{r+1} are also identical
     /// across honest nodes (preserving ACS Agreement). The audit
-    /// `MulticastRecoveredShares` broadcast on the coin-0 path
-    /// only discloses coin-0; the second pass discloses the rest.
+    /// `MulticastRecoveredShares` is sent **once per round** with
+    /// the full disclosure set, so post-ACS audit completeness
+    /// (every coin's commitment validation) is preserved verbatim.
     /// ACS three-property and PQ-safety are unchanged.
     #[async_recursion]
     async fn maybe_recover_ready_coins(&mut self, round: Round) {
@@ -1030,7 +1038,10 @@ impl Context {
                 self.myid,
                 round
             );
-            self.recover_and_emit_coin_set(round, vec![0]).await;
+            // emit_audit_multicast = false: defer the audit
+            // multicast to the second pass so it carries the full
+            // batch of disclosures, not just coin-0. See doc above.
+            self.recover_and_emit_coin_set(round, vec![0], false).await;
 
             // Re-snapshot ready set: coin-0 is now in recovered_coins,
             // ready_coins() will skip it on its next call.
@@ -1046,28 +1057,99 @@ impl Context {
             };
 
             if remaining.is_empty() {
+                // Edge case: only coin-0 was in the ready set. We
+                // never sent the audit multicast in the fast-path
+                // call (because we deferred it), so emit a
+                // coin-0-only multicast now, matching what the
+                // pre-fast-path code would have produced for a
+                // batch_size = 1 round.
+                self.send_audit_multicast_snapshot(round).await;
                 return;
             }
 
-            self.recover_and_emit_coin_set(round, remaining).await;
+            self.recover_and_emit_coin_set(round, remaining, true).await;
         } else {
             // Standard one-shot batch path (e.g. coin-0 already emitted
             // or coin-0 is not in this batch's ready set yet).
-            self.recover_and_emit_coin_set(round, ready_initial).await;
+            self.recover_and_emit_coin_set(round, ready_initial, true).await;
+        }
+    }
+
+    /// Stand-alone audit-multicast send used by the coin-0 fast
+    /// path's degenerate "remaining is empty" edge case (e.g. the
+    /// pathological batch_size = 1 case where only coin-0 ever
+    /// gets recovered). Deliberately mirrors the multicast block
+    /// of `recover_and_emit_coin_set` so audit semantics remain
+    /// identical to the pre-fast-path implementation.
+    #[async_recursion]
+    async fn send_audit_multicast_snapshot(&mut self, round: Round) {
+        let (multicast_msg, decided_dbg) = {
+            let rbc_state = match self.round_state.get(&round) {
+                Some(s) => s,
+                None => return,
+            };
+            let decided = match rbc_state.acs_decided_set.clone() {
+                Some(d) => d,
+                None => return,
+            };
+            let mut disclosed: Vec<usize> =
+                rbc_state.multicast_disclosed_coins.iter().copied().collect();
+            disclosed.sort_unstable();
+            if disclosed.is_empty() {
+                return;
+            }
+            let msg = build_local_multicast_snapshot(
+                rbc_state,
+                round,
+                self.myid,
+                decided.as_slice(),
+                disclosed.as_slice(),
+            );
+            (Some(msg), decided)
+        };
+
+        if let Some(msg) = multicast_msg {
+            log::info!(
+                "[PPT][POST-COMPLAINT-MULTICAST] node {} round {} (fast-path edge case, only coin-0 in batch) decided_set_len={}",
+                self.myid,
+                round,
+                decided_dbg.len()
+            );
+            let coin_msg = CoinMsg::MulticastRecoveredShares(msg.clone(), self.myid, round);
+            self.broadcast(coin_msg, round).await;
+            self.process_multicast_recovered_shares(msg, self.myid, round).await;
         }
     }
 
     /// Pure helper: recover the secrets for `coin_set`, write them
     /// back to `reconstructed_secrets`, run `coin_check` to derive
-    /// each beacon value, broadcast a `MulticastRecoveredShares`
-    /// snapshot covering every coin disclosed so far, and emit each
-    /// beacon via `flush_pending_beacon_outputs`.
+    /// each beacon value, optionally broadcast a
+    /// `MulticastRecoveredShares` snapshot, and emit each beacon
+    /// via `flush_pending_beacon_outputs`.
     ///
-    /// Identical body to the previous monolithic
-    /// `maybe_recover_ready_coins`; factored out so the coin-0 fast
-    /// path and the remaining-coins pass can share the same logic.
+    /// `emit_audit_multicast` controls whether the audit-side
+    /// `MulticastRecoveredShares` broadcast is sent on this call.
+    /// The coin-0 fast path passes `false` so that its single-coin
+    /// disclosure is NOT sent prematurely (which would cause the
+    /// post-ACS audit threshold to be reached on a partial
+    /// disclosure set, allowing dealer commitments for
+    /// coin-1..batch-1 to escape verification). The follow-up
+    /// `remaining` pass passes `true` and carries the full
+    /// disclosure (`multicast_disclosed_coins` accumulates across
+    /// both passes), so audit semantics match the pre-fast-path
+    /// one-shot code exactly.
+    ///
+    /// All non-multicast steps (recover, write back to
+    /// `reconstructed_secrets`, `coin_check`, beacon emit, update
+    /// `multicast_disclosed_coins`) are identical to the
+    /// pre-fast-path body of this function.
     #[async_recursion]
-    async fn recover_and_emit_coin_set(&mut self, round: Round, coin_set: Vec<usize>) {
+    async fn recover_and_emit_coin_set(
+        &mut self,
+        round: Round,
+        coin_set: Vec<usize>,
+        emit_audit_multicast: bool,
+    ) {
         if coin_set.is_empty() {
             return;
         }
@@ -1150,7 +1232,15 @@ impl Context {
                 rbc_state.multicast_disclosed_coins.iter().copied().collect();
             disclosed.sort_unstable();
 
-            let multicast_msg = if disclosed.is_empty() {
+            // Audit multicast is only built when the caller asked
+            // for it. The coin-0 fast path passes
+            // `emit_audit_multicast = false` so that its partial
+            // disclosure (only `[0]`) is NOT broadcast — the
+            // follow-up "remaining" pass with `true` carries the
+            // full disclosure and ensures the post-ACS audit sees
+            // every coin's commitment data, exactly as the
+            // pre-fast-path one-shot code did.
+            let multicast_msg = if !emit_audit_multicast || disclosed.is_empty() {
                 None
             } else {
                 Some(build_local_multicast_snapshot(
