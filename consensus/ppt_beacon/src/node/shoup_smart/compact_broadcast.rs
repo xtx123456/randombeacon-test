@@ -54,6 +54,7 @@ use crypto::aes_hash::{HashState, MerkleTree, Proof};
 use crypto::hash::{do_hash, Hash};
 use types::Replica;
 
+use super::proof_leaf_index;
 use super::reed_solomon::{Fragment, RsCodingError, RsDecoder, RsEncoder};
 
 /// Side-effect emitted by `CompactBroadcastState` — translated by
@@ -359,6 +360,19 @@ impl CompactBroadcastState {
             );
             return Vec::new();
         }
+        // Position binding: the path must prove `fragment` is at index
+        // `myid` under `root`. A Byzantine dealer that hands us a
+        // fragment+path for a different position would otherwise pass
+        // the three checks above but feed the RS decoder mis-positioned
+        // shards, breaking validity even with B3 agreement holding.
+        let claimed_idx = proof_leaf_index(&path);
+        if claimed_idx != self.myid as usize {
+            log::debug!(
+                "[ShoupSmart][CompactBroadcast] node {} dropped SEND: path leaf-index {} != myid {}",
+                self.myid, claimed_idx, self.myid
+            );
+            return Vec::new();
+        }
 
         self.own_echo_root = Some(root);
         self.own_fragment = Some((path.clone(), fragment.clone()));
@@ -397,6 +411,19 @@ impl CompactBroadcastState {
         if frag_idx >= self.n {
             return Vec::new();
         }
+        // Position binding (1/2): in CompactBroadcast every honest
+        // P_j only echoes its own fragment, which lives at index j.
+        // Reject any echo claiming a frag_idx other than the wire
+        // sender's identity. This prevents a Byzantine echoer from
+        // injecting fragments at wrong positions even with valid
+        // Merkle paths and shutting validity down via mis-decoding.
+        if frag_idx != wire_sender as usize {
+            log::debug!(
+                "[ShoupSmart][CompactBroadcast] node {} dropped ECHO: frag_idx {} != wire_sender {}",
+                self.myid, frag_idx, wire_sender
+            );
+            return Vec::new();
+        }
         // Validate Merkle path.
         let expected_leaf = do_hash(fragment.as_bytes());
         if path.item() != expected_leaf {
@@ -406,6 +433,19 @@ impl CompactBroadcastState {
             return Vec::new();
         }
         if !path.validate(&self.hash_state) {
+            return Vec::new();
+        }
+        // Position binding (2/2): the Merkle path must additionally
+        // prove the leaf is at the claimed `frag_idx` (== wire
+        // sender's index). Together with B2/B3 + collision-resistance
+        // this guarantees the recovered (idx, fragment) tuples are
+        // canonical RS shards rather than mis-positioned ones.
+        let claimed_idx = proof_leaf_index(&path);
+        if claimed_idx != frag_idx {
+            log::debug!(
+                "[ShoupSmart][CompactBroadcast] node {} dropped ECHO: path leaf-index {} != frag_idx {}",
+                self.myid, claimed_idx, frag_idx
+            );
             return Vec::new();
         }
 
@@ -819,5 +859,119 @@ mod tests {
             res,
             Err(CompactBroadcastError::NotProposer { .. })
         ));
+    }
+
+    // ---- Audit fix: position-binding regression ----
+
+    #[test]
+    fn cb_dropped_send_with_path_for_wrong_position() {
+        // Byzantine dealer sends to node 0 a (root, π_5, f_5)
+        // intended for node 5's slot. Without the leaf-index check
+        // every cryptographic verification (hash, root, validate)
+        // succeeds, but feeding f_5 as our index-0 shard would
+        // poison RS decoding. The position binding in
+        // handle_dispersal must catch this.
+        let n = 8;
+        let t = 2;
+
+        // Honest dealer perspective: build the real (root, paths,
+        // fragments) so we have legitimate Merkle artefacts to
+        // re-target.
+        let mut dealer = make_state(1, n, t, 1);
+        let acts = dealer
+            .set_input_as_proposer(b"compact-broadcast-position-attack".to_vec())
+            .expect("dealer dispersal ok");
+        // Pull out P_5's tuple (path π_5 + fragment f_5).
+        let (root, path_for_5, frag_for_5) = acts
+            .iter()
+            .find_map(|a| match a {
+                CompactBroadcastAction::SendDispersal {
+                    recipient_idx,
+                    root,
+                    path,
+                    fragment,
+                } if *recipient_idx == 5 => Some((*root, path.clone(), fragment.clone())),
+                _ => None,
+            })
+            .expect("expected SendDispersal recipient_idx=5");
+
+        // Node 0 receives a misaddressed SEND (path/fragment for
+        // index 5, but node 0 is index 0).
+        let mut node0 = make_state(0, n, t, 1);
+        let result = node0.handle_dispersal(1, root, path_for_5, frag_for_5);
+        assert!(
+            result.is_empty(),
+            "must reject SEND whose path leaf-index ≠ recipient's myid"
+        );
+        assert!(node0.own_echo_root.is_none());
+    }
+
+    #[test]
+    fn cb_dropped_echo_with_lying_frag_idx() {
+        // Byzantine echo sender P_5 received a legitimate (π_5, f_5)
+        // from an honest dealer. P_5 then BROADCASTS an ECHO claiming
+        // frag_idx=0 (i.e. lying about which slot the fragment
+        // belongs to). Without the position binding this would
+        // get recorded as P_5's contribution at slot 0, eventually
+        // causing all honest nodes to decode garbage even from an
+        // honest dealer. The wire_sender / frag_idx tie + the path
+        // leaf-index check must drop it.
+        let n = 8;
+        let t = 2;
+
+        let mut dealer = make_state(1, n, t, 1);
+        let acts = dealer.set_input_as_proposer(b"echo-frag_idx-lie".to_vec()).unwrap();
+        // Take P_5's tuple — the only legitimately-pathed fragment
+        // a Byzantine P_5 holds.
+        let (root, path_for_5, frag_for_5) = acts
+            .iter()
+            .find_map(|a| match a {
+                CompactBroadcastAction::SendDispersal {
+                    recipient_idx,
+                    root,
+                    path,
+                    fragment,
+                } if *recipient_idx == 5 => Some((*root, path.clone(), fragment.clone())),
+                _ => None,
+            })
+            .expect("dealer SendDispersal[5]");
+
+        // Node 0 (recipient of forged ECHO) receives the Byzantine
+        // ECHO from wire_sender=5 carrying frag_idx=0.
+        let mut node0 = make_state(0, n, t, 1);
+        let result = node0.handle_echo(
+            5,                /* wire_sender = byzantine P_5 */
+            root,
+            path_for_5.clone(),
+            frag_for_5.clone(),
+            0, /* lying frag_idx */
+        );
+        assert!(
+            result.is_empty(),
+            "ECHO with frag_idx ≠ wire_sender must be dropped"
+        );
+
+        // Even if the byzantine sets frag_idx == wire_sender (=5)
+        // the path is for the right index (5), so a *true* echo
+        // would still pass — but if they tried to substitute a
+        // path for a different index keeping frag_idx=5, the
+        // path-leaf-index check would catch it. Sanity: the
+        // honest variant succeeds.
+        let result = node0.handle_echo(5, root, path_for_5, frag_for_5, 5);
+        // We expect at least the echo to be recorded (no SendVote
+        // yet because we only have 1 echo, but the action may be
+        // empty either way; what matters is that it didn't drop).
+        // The internal echo_per_root[root] should now have an entry
+        // for sender 5.
+        let _ = result;
+        let count = node0
+            .echo_per_root
+            .get(&root)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert_eq!(
+            count, 1,
+            "honest echo at the correct position must be recorded"
+        );
     }
 }

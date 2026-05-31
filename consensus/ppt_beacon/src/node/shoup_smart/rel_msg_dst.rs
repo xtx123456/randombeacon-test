@@ -68,6 +68,7 @@ use crypto::aes_hash::{HashState, MerkleTree, Proof};
 use crypto::hash::{do_hash, Hash};
 use types::Replica;
 
+use super::proof_leaf_index;
 use super::reed_solomon::{Fragment, RsCodingError, RsDecoder, RsEncoder};
 
 // ---------------------------------------------------------------------
@@ -535,16 +536,23 @@ impl RelMsgDstState {
             if !entry.frag_path.validate(&self.hash_state) {
                 return Vec::new();
             }
-            // Position check: the proof's path bits encode the leaf
-            // index. We can't directly read the index from the
-            // Proof, but the validate() ensures it ENDS at the
-            // claimed root. Combined with our knowledge that the
-            // sender built the tree with `gen_proof(j)` for
-            // recipient j == myid, we trust the structural binding
-            // here. (For a stronger Byzantine-sender check, the
-            // index can be reconstructed by counting trailing bits
-            // -- not done here; the rebuild check at delivery time
-            // catches any mismatch.)
+            // Position binding: the path must prove `fragment` is at
+            // recipient's index (`myid_idx`) under `msg_root`. A
+            // Byzantine sender could otherwise hand us a fragment
+            // belonging to a different recipient's slot — passing
+            // hash + Merkle validation but causing us to echo a
+            // mis-positioned fragment. Without this check, the
+            // dispersal-phase Π_RelMsgDst has no rebuild defence
+            // (only the forward sub-protocol does), so we MUST
+            // verify position here.
+            let claimed_idx = proof_leaf_index(&entry.frag_path);
+            if claimed_idx != myid_idx {
+                log::debug!(
+                    "[ShoupSmart][RelMsgDst] node {} dropped dispersal: msg_idx {} frag_path leaf-index {} != myid {}",
+                    self.myid, entry.msg_idx, claimed_idx, myid_idx
+                );
+                return Vec::new();
+            }
             let slot = entry.msg_idx;
             ordered[slot] = Some(entry);
         }
@@ -618,6 +626,21 @@ impl RelMsgDstState {
         wire_sender: Replica,
         echo: EchoPayload,
     ) -> Vec<RelMsgDstAction> {
+        if echo.frag_idx >= self.n {
+            return Vec::new();
+        }
+        // Position binding (1/3): in Π_RelMsgDst every honest P_j
+        // echoes the j-th fragment of m_recipient — i.e. its OWN
+        // index in the recipient's message-fragment vector. Tie
+        // `frag_idx` to the wire sender's identity so a Byzantine
+        // echoer cannot mis-position someone else's fragment.
+        if echo.frag_idx != wire_sender as usize {
+            log::debug!(
+                "[ShoupSmart][RelMsgDst] node {} dropped ECHO: frag_idx {} != wire_sender {}",
+                self.myid, echo.frag_idx, wire_sender
+            );
+            return Vec::new();
+        }
         // Validate frag_path: hash(fragment) at index frag_idx under msg_root.
         let expected_leaf = do_hash(echo.fragment.as_bytes());
         if echo.frag_path.item() != expected_leaf {
@@ -629,7 +652,14 @@ impl RelMsgDstState {
         if !echo.frag_path.validate(&self.hash_state) {
             return Vec::new();
         }
-        if echo.frag_idx >= self.n {
+        // Position binding (2/3): the frag_path must prove the
+        // fragment lives at index `frag_idx` under `msg_root`.
+        let claimed_frag_idx = proof_leaf_index(&echo.frag_path);
+        if claimed_frag_idx != echo.frag_idx {
+            log::debug!(
+                "[ShoupSmart][RelMsgDst] node {} dropped ECHO: frag_path leaf-index {} != frag_idx {}",
+                self.myid, claimed_frag_idx, echo.frag_idx
+            );
             return Vec::new();
         }
 
@@ -644,6 +674,21 @@ impl RelMsgDstState {
             return Vec::new();
         }
         if !echo.meta_path.validate(&self.hash_state) {
+            return Vec::new();
+        }
+        // Position binding (3/3): the meta_path must prove `msg_root`
+        // is at the recipient's own slot (`myid`) in the meta-tree.
+        // Otherwise a Byzantine echoer could attach a different
+        // recipient's `msg_root` (= `r_k`, k != myid) to our slot,
+        // causing us to record echoes whose fragments aren't even
+        // for OUR message m_myid. RS decoding would then produce
+        // garbage as our delivered message.
+        let claimed_meta_idx = proof_leaf_index(&echo.meta_path);
+        if claimed_meta_idx != self.myid as usize {
+            log::debug!(
+                "[ShoupSmart][RelMsgDst] node {} dropped ECHO: meta_path leaf-index {} != myid {}",
+                self.myid, claimed_meta_idx, self.myid
+            );
             return Vec::new();
         }
 
@@ -874,6 +919,22 @@ impl RelMsgDstState {
                 reason: ForwardReject::InvalidMetaPath,
             }];
         }
+        // Position binding for forwarder: my_meta_path must prove
+        // my_msg_root is at index `forwarder_idx` under meta_root.
+        // The forwarder's claim that the message belongs to slot
+        // `forwarder_idx` must be cryptographically tied to that
+        // slot. (The rebuild check below catches *original-sender*
+        // misbehaviour; this check catches *forwarder*
+        // misbehaviour that wouldn't be visible from the rebuild
+        // alone — e.g. forwarder forwards a message but tags it
+        // with the wrong index.)
+        let claimed_forwarder_idx = proof_leaf_index(&forward.my_meta_path);
+        if claimed_forwarder_idx != forward.forwarder_idx {
+            return vec![RelMsgDstAction::ForwardRejected {
+                source: wire_sender,
+                reason: ForwardReject::InvalidMetaPath,
+            }];
+        }
 
         // (2) Validate every per-fragment Merkle path under
         //     `my_msg_root`.
@@ -899,6 +960,18 @@ impl RelMsgDstState {
                 || path.root() != forward.my_msg_root
                 || !path.validate(&self.hash_state)
             {
+                return vec![RelMsgDstAction::ForwardRejected {
+                    source: wire_sender,
+                    reason: ForwardReject::InvalidFragmentPath { frag_idx: *frag_idx },
+                }];
+            }
+            // Position binding: each (path, fragment, frag_idx)
+            // tuple must satisfy `proof_leaf_index(path) == frag_idx`.
+            // Even though the rebuild check below would eventually
+            // catch a mis-positioned shard via a root mismatch, we
+            // reject early to (a) avoid wasting RS-decode CPU and
+            // (b) attribute blame more precisely.
+            if proof_leaf_index(path) != *frag_idx {
                 return vec![RelMsgDstAction::ForwardRejected {
                     source: wire_sender,
                     reason: ForwardReject::InvalidFragmentPath { frag_idx: *frag_idx },
@@ -1392,6 +1465,211 @@ mod tests {
         let node = make_state(1, 4, 1, 0);
         let res = node.prepare_forward_for(1);
         assert!(matches!(res, Err(RelMsgDstError::SelfForwardRequest)));
+    }
+
+    // ---- Audit fix: position-binding regression ----
+
+    /// A Byzantine SENDER hands node 1 a per-recipient dispersal
+    /// block whose `frag_path` was generated for index 5 (not 1).
+    /// Every cryptographic check below the position binding (hash,
+    /// root, validate) succeeds — the position check must drop it.
+    #[test]
+    fn rmd_dispersal_dropped_when_frag_path_index_mismatches_recipient() {
+        let n = 7;
+        let t = 2;
+        // Use an HONEST dealer perspective to extract real
+        // (msg_root, π_ij, f_ij) artefacts; we then "redirect" them.
+        let mut dealer = make_state(0, n, t, 0);
+        let acts = dealer.set_input_as_sender(unique_msgs(n, 32)).unwrap();
+        // The dispersal block destined for recipient 5 contains
+        // n entries each with frag_path at index=5.
+        let entries_for_5 = match &acts[5] {
+            RelMsgDstAction::SendDispersal { entries, .. } => entries.clone(),
+            _ => panic!("expected SendDispersal[5]"),
+        };
+        // Hand them to node 1 (which expects index=1 paths) under
+        // the honest sender's identity.
+        let mut node1 = make_state(1, n, t, 0);
+        let result = node1.handle_dispersal(0, entries_for_5);
+        assert!(
+            result.is_empty(),
+            "dispersal with frag_path leaf-index ≠ recipient's myid must be dropped"
+        );
+        assert!(!node1.own_dispersal_accepted);
+    }
+
+    /// A Byzantine ECHO sender claims `frag_idx` = j' ≠ its own
+    /// wire identity j. Even with valid paths and fragments, the
+    /// frag_idx ↔ wire_sender binding must reject the echo.
+    #[test]
+    fn rmd_echo_dropped_when_frag_idx_does_not_match_wire_sender() {
+        let n = 7;
+        let t = 2;
+        // Drive the distribution phase to the point where node 1
+        // has accepted its dispersal and learned the meta_root /
+        // meta_paths, so its `handle_echo` actually produces
+        // non-empty output paths for an honest echo.
+        let mut nodes: Vec<RelMsgDstState> =
+            (0..n).map(|i| make_state(i as Replica, n, t, 0)).collect();
+        let acts = nodes[0]
+            .set_input_as_sender(unique_msgs(n, 32))
+            .unwrap();
+        // Deliver the dispersal block to each receiver so they
+        // know meta_root.
+        let dispersals: Vec<(usize, Vec<DispersalEntry>)> = acts
+            .into_iter()
+            .filter_map(|a| match a {
+                RelMsgDstAction::SendDispersal { recipient_idx, entries } => {
+                    Some((recipient_idx, entries))
+                }
+                _ => None,
+            })
+            .collect();
+        for (recipient, entries) in dispersals.iter() {
+            let _ = nodes[*recipient].handle_dispersal(0, entries.clone());
+        }
+        // Reach into a SendEcho action that node 5 emitted for
+        // recipient 1 — that gives us a real EchoPayload with
+        // legitimate paths for (frag_idx=5, recipient=1).
+        let acts5 = nodes[5].handle_dispersal(0, dispersals[5].1.clone());
+        // dispersal already accepted from outer loop; second call is no-op.
+        // Re-derive echo by replaying handle_dispersal on a fresh state.
+        let _ = acts5;
+        let mut fresh5 = make_state(5, n, t, 0);
+        let acts5 = fresh5.handle_dispersal(0, dispersals[5].1.clone());
+        let echo_for_1 = acts5
+            .into_iter()
+            .find_map(|a| match a {
+                RelMsgDstAction::SendEcho { recipient_idx: 1, echo } => Some(echo),
+                _ => None,
+            })
+            .expect("expected SendEcho recipient_idx=1");
+        // Tamper: lie about frag_idx (claim 0 instead of 5).
+        let mut bad_echo = echo_for_1;
+        bad_echo.frag_idx = 0;
+        // Node 1 receives this from wire_sender=5.
+        let result = nodes[1].handle_echo(5, bad_echo);
+        assert!(
+            result.is_empty(),
+            "ECHO whose frag_idx (claim) ≠ wire_sender must be dropped"
+        );
+    }
+
+    /// A Byzantine ECHO sender attaches a meta-path proving
+    /// `msg_root` is at the WRONG slot (not the recipient's). With
+    /// honest-looking frag_path, the check that catches this is the
+    /// meta_path leaf-index binding.
+    #[test]
+    fn rmd_echo_dropped_when_meta_path_index_mismatches_recipient() {
+        let n = 7;
+        let t = 2;
+        // Set up the same honest dispersal as above and extract
+        // node 5's intended echo to recipient 1 (meta_path at
+        // index 1) — then SWAP in node 5's meta_path that proves
+        // r_5 at index 5 instead, while keeping frag_idx & frag_path
+        // honest for slot 5.
+        let mut sender = make_state(0, n, t, 0);
+        let acts = sender.set_input_as_sender(unique_msgs(n, 32)).unwrap();
+        let dispersal_5 = match &acts[5] {
+            RelMsgDstAction::SendDispersal { entries, .. } => entries.clone(),
+            _ => panic!(),
+        };
+        let mut node5 = make_state(5, n, t, 0);
+        let acts5 = node5.handle_dispersal(0, dispersal_5);
+        // Node 5 emits SendEcho actions for every peer; pull out
+        // the one for recipient 1 and the one for recipient 5.
+        let mut echo_for_1 = None;
+        let mut echo_for_5 = None;
+        for a in acts5 {
+            if let RelMsgDstAction::SendEcho { recipient_idx, echo } = a {
+                if recipient_idx == 1 {
+                    echo_for_1 = Some(echo);
+                } else if recipient_idx == 5 {
+                    echo_for_5 = Some(echo);
+                }
+            }
+        }
+        let mut e1 = echo_for_1.expect("echo for recipient 1");
+        let e5 = echo_for_5.expect("echo for recipient 5");
+        // Tamper: replace e1's meta_path & msg_root with e5's
+        // (which prove r_5 at meta-tree index 5). Keep the echo's
+        // OWN frag_path consistent (node 5's frag at index 5 under
+        // r_5). Now: recipient 1 receives an echo with meta-path
+        // chained at INDEX 5, not 1 — must be dropped.
+        e1.meta_path = e5.meta_path;
+        e1.msg_root = e5.msg_root;
+        e1.frag_path = e5.frag_path;
+        e1.fragment = e5.fragment;
+
+        let mut node1 = make_state(1, n, t, 0);
+        let result = node1.handle_echo(5, e1);
+        assert!(
+            result.is_empty(),
+            "ECHO whose meta_path leaf-index ≠ recipient's myid must be dropped"
+        );
+    }
+
+    /// A Byzantine FORWARDER tampers with `forwarder_idx`, claiming
+    /// to be at a different position than the meta_path actually
+    /// proves. The position binding in handle_forward must reject.
+    #[test]
+    fn rmd_forwarding_rejects_lying_forwarder_idx() {
+        let n = 4;
+        let t = 1;
+        let msgs = unique_msgs(n, 32);
+        let mut nodes: Vec<RelMsgDstState> =
+            (0..n).map(|i| make_state(i as Replica, n, t, 0)).collect();
+        let mut pending: Vec<(Replica, RelMsgDstAction)> = Vec::new();
+        let acts = nodes[0].set_input_as_sender(msgs.clone()).unwrap();
+        for a in acts {
+            pending.push((0, a));
+        }
+        for _ in 0..200 {
+            if nodes.iter().all(|n| n.delivered()) { break; }
+            let mut next = Vec::new();
+            for (sender_id, action) in pending.drain(..) {
+                match action {
+                    RelMsgDstAction::SendDispersal { recipient_idx, entries } => {
+                        for a in nodes[recipient_idx].handle_dispersal(sender_id, entries) {
+                            next.push((recipient_idx as Replica, a));
+                        }
+                    }
+                    RelMsgDstAction::SendEcho { recipient_idx, echo } => {
+                        for a in nodes[recipient_idx].handle_echo(sender_id, echo) {
+                            next.push((recipient_idx as Replica, a));
+                        }
+                    }
+                    RelMsgDstAction::SendVote { meta_root } => {
+                        for (i, node) in nodes.iter_mut().enumerate() {
+                            for a in node.handle_vote(sender_id, meta_root) {
+                                next.push((i as Replica, a));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            pending = next;
+        }
+        let mut fwd = match nodes[1].prepare_forward_for(99).unwrap() {
+            RelMsgDstAction::SendForward { forward, .. } => forward,
+            _ => panic!(),
+        };
+        // Tamper: claim forwarder_idx=2 while my_meta_path proves
+        // index 1 (forwarder is actually node 1).
+        fwd.forwarder_idx = 2;
+        let mut q = make_state(99, n, t, 0);
+        let result = q.handle_forward(1, fwd);
+        match &result[0] {
+            RelMsgDstAction::ForwardRejected { reason, .. } => {
+                assert!(
+                    matches!(reason, ForwardReject::InvalidMetaPath),
+                    "expected InvalidMetaPath, got {:?}",
+                    reason
+                );
+            }
+            other => panic!("expected ForwardRejected, got {:?}", other),
+        }
     }
 }
 
