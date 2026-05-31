@@ -34,3 +34,4 @@
 
 pub mod reed_solomon;
 pub mod compact_broadcast;
+pub mod rel_msg_dst;
