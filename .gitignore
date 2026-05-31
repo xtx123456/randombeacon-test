@@ -109,7 +109,11 @@ baseline_records/
 *.bak
 *.orig
 *_BACKUP_*
-*_*_*
+# Backup-suffixed source files emitted by some IDEs / merge tools
+# (pattern: <filename>_<line>_<col>). The previous "*_*_*" rule was
+# too broad and accidentally hid legitimate source files whose names
+# happen to contain two underscores (e.g. rel_msg_dst.rs).
+*.rs_[0-9]*_[0-9]*
 *.bak
 *.orig
 consensus/ppt_beacon/src/node/gather/gather.rs_102_47
