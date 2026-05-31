@@ -35,6 +35,7 @@
 pub mod reed_solomon;
 pub mod compact_broadcast;
 pub mod rel_msg_dst;
+pub mod sec_key_dst;
 
 use crypto::aes_hash::Proof;
 
