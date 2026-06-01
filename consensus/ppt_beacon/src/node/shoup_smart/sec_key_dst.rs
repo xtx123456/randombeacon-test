@@ -349,6 +349,13 @@ pub struct SecKeyDstState {
     /// Cached delivered share (`k_myid`), set once distribution
     /// completes successfully and the bytes parse cleanly.
     delivered_share: Option<BigUint>,
+    /// Sender-only: full share vector `(k_1, ..., k_n)` cached
+    /// in `set_input_as_sender`. None on receiver-only nodes and
+    /// before the sender call. Exposed via `sender_known_shares()`
+    /// so a higher-level Π_SecMsgDst (Sec 4.3) can synchronously
+    /// derive per-recipient symmetric keys without waiting for
+    /// the SecKeyDst transport to round-trip.
+    sender_known_shares: Option<Vec<BigUint>>,
 }
 
 impl fmt::Debug for SecKeyDstState {
@@ -386,6 +393,7 @@ impl SecKeyDstState {
             prime,
             rmd,
             delivered_share: None,
+            sender_known_shares: None,
         })
     }
 
@@ -395,6 +403,19 @@ impl SecKeyDstState {
 
     pub fn delivered_share(&self) -> Option<&BigUint> {
         self.delivered_share.as_ref()
+    }
+
+    /// Sender-only accessor: the full share vector `(k_1, ..., k_n)`
+    /// the dealer computed in `set_input_as_sender`. Returns `None`
+    /// on a receiver-only node or before the sender call.
+    ///
+    /// Higher-level protocols (Π_SecMsgDst, Sec 4.3) need this to
+    /// derive per-recipient symmetric keys synchronously, since the
+    /// dealer locally knows every `k_j` immediately after sampling
+    /// the polynomial — there is no security reason to wait for
+    /// the network round-trip just to use them.
+    pub fn sender_known_shares(&self) -> Option<&[BigUint]> {
+        self.sender_known_shares.as_deref()
     }
 
     /// Sender-side: sample a random degree-`t` polynomial with
@@ -448,6 +469,10 @@ impl SecKeyDstState {
             .iter()
             .map(|s| serialize_share(&self.prime, s).expect("share < prime by construction"))
             .collect();
+
+        // Cache the full share vector for sender-side composition
+        // (e.g. Π_SecMsgDst's per-recipient PRG key derivation).
+        self.sender_known_shares = Some(shares);
 
         let actions = self
             .rmd
