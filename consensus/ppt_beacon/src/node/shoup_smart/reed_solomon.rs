@@ -56,6 +56,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use reed_solomon_erasure::{galois_8::ReedSolomon, Error as RsError};
+use serde::{Deserialize, Serialize};
 
 /// Maximum payload size = 2^32 - 5 bytes (4 GiB minus the length
 /// prefix). Anything larger panics in `encode`.
@@ -71,7 +72,7 @@ const LENGTH_PREFIX_BYTES: usize = 4;
 /// Shoup-Smart pipeline can construct strongly-typed Merkle leaves
 /// (`hash(fragment.bytes())`) without confusing fragments with raw
 /// data slices.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Fragment {
     bytes: Vec<u8>,
 }

@@ -314,6 +314,48 @@ impl Context {
             CoinMsg::ACSAbaAux(round, aba_instance_id, aba_round, value) => {
                 self.process_acs_aba_aux(round, aba_instance_id, aba_round, value, wrapper_msg.sender).await;
             }
+            // ---- Shoup-Smart 2024 SecMsgDst-routed AVSS (commit 6 receiver-side) ----
+            //
+            // Commit 6 lands the receiver plumbing only. The legacy
+            // `AVSSSend` path above still drives AVSS-completion in
+            // production; the variants below cache decrypted
+            // plaintexts so commit 7 can flip the dealer cutover
+            // atomically without changing the wire dispatcher again.
+            CoinMsg::AVSSSecMsgPublicCommit(commit_msg) => {
+                self.process_avss_secmsg_public_commit(commit_msg).await;
+            }
+            CoinMsg::AVSSSecMsgKeyDispersal(round, dealer, payload) => {
+                self.process_avss_secmsg_key_dispersal(
+                    round, dealer, payload, wrapper_msg.sender,
+                )
+                .await;
+            }
+            CoinMsg::AVSSSecMsgKeyEcho(round, dealer, payload) => {
+                self.process_avss_secmsg_key_echo(round, dealer, payload, wrapper_msg.sender)
+                    .await;
+            }
+            CoinMsg::AVSSSecMsgKeyVote(round, dealer, meta_root) => {
+                self.process_avss_secmsg_key_vote(round, dealer, meta_root, wrapper_msg.sender)
+                    .await;
+            }
+            CoinMsg::AVSSSecMsgCipherDispersal(round, dealer, payload) => {
+                self.process_avss_secmsg_cipher_dispersal(
+                    round, dealer, payload, wrapper_msg.sender,
+                )
+                .await;
+            }
+            CoinMsg::AVSSSecMsgCipherEcho(round, dealer, payload) => {
+                self.process_avss_secmsg_cipher_echo(
+                    round, dealer, payload, wrapper_msg.sender,
+                )
+                .await;
+            }
+            CoinMsg::AVSSSecMsgCipherVote(round, dealer, meta_root) => {
+                self.process_avss_secmsg_cipher_vote(
+                    round, dealer, meta_root, wrapper_msg.sender,
+                )
+                .await;
+            }
             _ => {}
         }
     }

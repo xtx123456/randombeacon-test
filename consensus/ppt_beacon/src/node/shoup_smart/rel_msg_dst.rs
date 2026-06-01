@@ -66,6 +66,7 @@ use std::sync::Arc;
 
 use crypto::aes_hash::{HashState, MerkleTree, Proof};
 use crypto::hash::{do_hash, Hash};
+use serde::{Deserialize, Serialize};
 use types::Replica;
 
 use super::proof_leaf_index;
@@ -81,7 +82,7 @@ use super::reed_solomon::{Fragment, RsCodingError, RsDecoder, RsEncoder};
 ///
 /// The recipient `P_j` is implicit (each recipient gets a vector of
 /// `n` `DispersalEntry`s, one per message index `i ∈ [0, n)`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DispersalEntry {
     /// Which message this fragment belongs to (0-based).
     pub msg_idx: usize,
@@ -97,7 +98,7 @@ pub struct DispersalEntry {
 /// Wire payload of one ECHO message from `P_j` (echo sender) to
 /// `P_i` (echo recipient). Carries the j-th fragment of message
 /// `m_i` along with the two Merkle paths required for validation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EchoPayload {
     /// Self-computed meta-root `r = MerkleTree(r_1, ..., r_n)` from
     /// the echo sender's view (must match locally-computed `r` if
@@ -123,7 +124,7 @@ pub struct EchoPayload {
 /// Wire payload of a FORWARD message from `P_j` to a third party
 /// `Q`, transferring `m_j` to Q. Used by the unhappy-path
 /// forwarding sub-protocol.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForwardPayload {
     /// Meta-root `r` (Q must have already computed the same `r`
     /// locally during its own distribution-phase output stage; an

@@ -228,6 +228,149 @@ pub enum CoinMsg{
     ACSRbcReady(Round, Replica, Hash),
     ACSAbaBval(Round, Replica, u64, bool),
     ACSAbaAux(Round, Replica, u64, bool),
+
+    /// Shoup-Smart 2024 Π_SecMsgDst (Sec 4.3) wire types for AVSS
+    /// share distribution. The five variants below replace the
+    /// per-recipient `AVSSSend(BeaconMsg, ...)` cleartext unicast
+    /// once commit 7 cuts the dealer over. The encoding is:
+    ///
+    ///   - `AVSSSecMsgPublicCommit(msg)` — broadcast once per
+    ///     dealer per round; carries the public Merkle roots,
+    ///     degree-test coefficients, and transcript-binding hash
+    ///     that used to be duplicated across n cleartext
+    ///     `AVSSSend` packets.
+    ///   - `AVSSSecMsgKey*` and `AVSSSecMsgCipher*` — opaque
+    ///     bincode-encoded byte payloads carrying
+    ///     `Vec<DispersalEntry>` (key) / `Vec<DispersalEntry>`
+    ///     (cipher) for dispersal, `EchoPayload` for echo, and
+    ///     a bare meta-root `Hash` for vote. `(round, dealer)`
+    ///     identifies the SecMsgDst instance; the wrapper-level
+    ///     wire sender is the actual broadcaster of the message.
+    ///
+    /// All payloads are PQ-safe: only `do_hash` + Merkle proofs +
+    /// Reed-Solomon over GF(2^8) (no DL/pairing/RSA primitives).
+    AVSSSecMsgPublicCommit(AvssPublicCommitMsg),
+    AVSSSecMsgKeyDispersal(Round, Replica, Vec<u8>),
+    AVSSSecMsgKeyEcho(Round, Replica, Vec<u8>),
+    AVSSSecMsgKeyVote(Round, Replica, Hash),
+    AVSSSecMsgCipherDispersal(Round, Replica, Vec<u8>),
+    AVSSSecMsgCipherEcho(Round, Replica, Vec<u8>),
+    AVSSSecMsgCipherVote(Round, Replica, Hash),
+}
+
+/// Public AVSS commitment broadcast once per (round, dealer).
+///
+/// Replaces the duplicated public fields previously stuffed into
+/// every cleartext `BeaconMsg` (one per recipient): every honest
+/// node that receives this commit ends up with the same
+/// `(root_vec, degree_test_coeffs, transcript_root)` triple.
+///
+/// The `transcript_root` is `do_hash(canonical(round, dealer,
+/// root_vec, degree_test_coeffs))` and serves the same binding
+/// role as the previous `transcript_root = do_hash(BeaconMsg
+/// .serialize_ctrbc())` — once a node has cached this commit,
+/// any per-recipient share that recovers via Π_SecMsgDst is
+/// validated against the cached `root_vec` and `degree_test_coeffs`.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct AvssPublicCommitMsg {
+    pub origin: Replica,
+    pub round: Round,
+    pub root_vec: Vec<Hash>,
+    pub degree_test_coeffs: Vec<Vec<Val>>,
+    pub transcript_root: Hash,
+}
+
+impl AvssPublicCommitMsg {
+    pub fn new(
+        origin: Replica,
+        round: Round,
+        root_vec: Vec<Hash>,
+        degree_test_coeffs: Vec<Vec<Val>>,
+    ) -> Self {
+        // Compute transcript_root deterministically over the
+        // canonical bincode encoding of the public fields.
+        // Receivers must recompute this and compare on receipt.
+        let canonical = bincode::serialize(&(
+            origin,
+            round,
+            &root_vec,
+            &degree_test_coeffs,
+        ))
+        .expect("bincode serialize public-commit canonical");
+        let transcript_root = do_hash(&canonical);
+        Self {
+            origin,
+            round,
+            root_vec,
+            degree_test_coeffs,
+            transcript_root,
+        }
+    }
+
+    /// Recompute and verify the binding `transcript_root`. Returns
+    /// false if a Byzantine sender tampered with the commit.
+    pub fn verify_transcript_root(&self) -> bool {
+        let canonical = bincode::serialize(&(
+            self.origin,
+            self.round,
+            &self.root_vec,
+            &self.degree_test_coeffs,
+        ))
+        .expect("bincode serialize public-commit canonical");
+        do_hash(&canonical) == self.transcript_root
+    }
+}
+
+/// Per-recipient confidential AVSS payload — bincode-serialized
+/// and shipped through Π_SecMsgDst's encrypted channel. After a
+/// receiver completes Π_SecMsgDst, the delivered plaintext bytes
+/// deserialize back into this struct, which is then validated
+/// against the cached `AvssPublicCommitMsg` and stored as the
+/// node's local AVSS dealer packet.
+///
+/// This is exactly the per-recipient subset of `BeaconMsg` /
+/// `BatchWSSMsg` used by the legacy `AVSSSend` path:
+///
+/// | Field            | Field on legacy `BatchWSSMsg`/`BeaconMsg` |
+/// |------------------|-------------------------------------------|
+/// | `secrets`        | `BatchWSSMsg.secrets` (f(j+1) mod p)      |
+/// | `nonces`         | `BatchWSSMsg.nonces` (nonce mod q)        |
+/// | `mask_shares`    | `BeaconMsg.mask_shares` (g(j+1) mod q)    |
+/// | `f_large_shares` | `BeaconMsg.f_large_shares` (f(j+1) mod q) |
+/// | `mps`            | `BatchWSSMsg.mps` (per-coin Merkle proofs)|
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct AvssRecipientPayload {
+    pub secrets: Vec<Val>,
+    pub nonces: Vec<Val>,
+    pub mask_shares: Vec<Val>,
+    pub f_large_shares: Vec<Val>,
+    pub mps: Vec<Proof>,
+}
+
+impl AvssRecipientPayload {
+    pub fn new(
+        secrets: Vec<Val>,
+        nonces: Vec<Val>,
+        mask_shares: Vec<Val>,
+        f_large_shares: Vec<Val>,
+        mps: Vec<Proof>,
+    ) -> Self {
+        Self {
+            secrets,
+            nonces,
+            mask_shares,
+            f_large_shares,
+            mps,
+        }
+    }
+
+    pub fn serialize_bytes(&self) -> Vec<u8> {
+        bincode::serialize(self).expect("bincode serialize AvssRecipientPayload")
+    }
+
+    pub fn deserialize_bytes(bytes: &[u8]) -> Option<Self> {
+        bincode::deserialize(bytes).ok()
+    }
 }
 
 #[derive(Debug,Serialize,Deserialize,Clone)]
@@ -380,6 +523,117 @@ impl WireReady for WrapperMsg{
     fn init(self) -> Self {
         match self {
             _x=>_x
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Unit tests for the Shoup-Smart 2024 SecMsgDst-AVSS wire types.
+// ---------------------------------------------------------------------
+
+#[cfg(test)]
+mod shoup_smart_avss_wire_tests {
+    use super::*;
+
+    fn sample_root(byte: u8) -> Hash {
+        let mut h = [0u8; 32];
+        for (i, b) in h.iter_mut().enumerate() {
+            *b = byte.wrapping_add(i as u8);
+        }
+        h
+    }
+
+    fn sample_val(byte: u8) -> Val {
+        let mut v = [0u8; 32];
+        for (i, b) in v.iter_mut().enumerate() {
+            *b = byte ^ (i as u8);
+        }
+        v
+    }
+
+    #[test]
+    fn avss_public_commit_msg_bincode_roundtrip() {
+        let m = AvssPublicCommitMsg::new(
+            7,
+            42,
+            vec![sample_root(0xAA), sample_root(0xBB), sample_root(0xCC)],
+            vec![
+                vec![sample_val(0x01), sample_val(0x02)],
+                vec![sample_val(0x03), sample_val(0x04)],
+                vec![sample_val(0x05), sample_val(0x06)],
+            ],
+        );
+        let bytes = bincode::serialize(&m).expect("ser");
+        let parsed: AvssPublicCommitMsg = bincode::deserialize(&bytes).expect("de");
+        assert_eq!(parsed, m);
+        assert!(parsed.verify_transcript_root());
+    }
+
+    #[test]
+    fn avss_public_commit_transcript_root_detects_tamper() {
+        let mut m = AvssPublicCommitMsg::new(
+            3,
+            12,
+            vec![sample_root(0x10)],
+            vec![vec![sample_val(0x20)]],
+        );
+        // Pristine commit verifies.
+        assert!(m.verify_transcript_root());
+        // Tampering with public fields without recomputing the
+        // binding hash → verify must fail.
+        m.root_vec.push(sample_root(0x99));
+        assert!(!m.verify_transcript_root());
+    }
+
+    #[test]
+    fn avss_recipient_payload_serialize_roundtrip() {
+        // Build a small payload with empty Merkle proofs (Proof
+        // serialisation is exercised in ppt_beacon tests; here we
+        // just need the AvssRecipientPayload struct itself).
+        let p = AvssRecipientPayload::new(
+            vec![sample_val(0x11), sample_val(0x12)],
+            vec![sample_val(0x21), sample_val(0x22)],
+            vec![sample_val(0x31), sample_val(0x32)],
+            vec![sample_val(0x41), sample_val(0x42)],
+            Vec::new(), // no Merkle proofs in this minimal example
+        );
+        let bytes = p.serialize_bytes();
+        let parsed = AvssRecipientPayload::deserialize_bytes(&bytes)
+            .expect("AvssRecipientPayload deserialize");
+        assert_eq!(parsed, p);
+    }
+
+    #[test]
+    fn avss_recipient_payload_rejects_garbage() {
+        let parsed = AvssRecipientPayload::deserialize_bytes(&[0xFFu8; 4]);
+        assert!(parsed.is_none(), "garbage bytes must not deserialize");
+    }
+
+    #[test]
+    fn coin_msg_secmsg_variants_bincode_roundtrip() {
+        let commit = AvssPublicCommitMsg::new(
+            1,
+            5,
+            vec![sample_root(0x01)],
+            vec![vec![sample_val(0x02)]],
+        );
+        let cases = vec![
+            CoinMsg::AVSSSecMsgPublicCommit(commit),
+            CoinMsg::AVSSSecMsgKeyDispersal(7, 2, vec![1u8, 2u8, 3u8]),
+            CoinMsg::AVSSSecMsgKeyEcho(7, 2, vec![4u8, 5u8]),
+            CoinMsg::AVSSSecMsgKeyVote(7, 2, sample_root(0xDE)),
+            CoinMsg::AVSSSecMsgCipherDispersal(7, 2, vec![6u8, 7u8]),
+            CoinMsg::AVSSSecMsgCipherEcho(7, 2, vec![8u8]),
+            CoinMsg::AVSSSecMsgCipherVote(7, 2, sample_root(0xAD)),
+        ];
+        for c in cases {
+            let bytes = bincode::serialize(&c).expect("ser");
+            let parsed: CoinMsg = bincode::deserialize(&bytes).expect("de");
+            // CoinMsg doesn't implement PartialEq directly; check
+            // structurally via bincode equality (the canonical way
+            // a network peer would compare).
+            let bytes2 = bincode::serialize(&parsed).expect("re-ser");
+            assert_eq!(bytes, bytes2);
         }
     }
 }

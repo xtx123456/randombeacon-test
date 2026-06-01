@@ -121,6 +121,37 @@ pub struct Context {
     /// round >= 1, populated as the protocol completes earlier rounds.
     pub coin_per_round: HashMap<Round, Vec<u8>>,
 
+    // ---- Shoup-Smart 2024 SecMsgDst-wrapped AVSS receiver state (commit 6) ----
+    //
+    // Receiver-side caches for the new Π_SecMsgDst-routed AVSS dealer
+    // path. The dealer is unchanged in commit 6 (still uses the
+    // legacy `AVSSSend` cleartext unicast); these fields plumb the
+    // INCOMING side so commit 7 can flip the cutover atomically.
+    //
+    // For each (round, dealer) we track:
+    //   - `avss_secmsg_state` — one `SecMsgDstState` instance lazily
+    //     created on the first arriving SecMsgDst-tagged message;
+    //     handles the key channel + cipher channel internally.
+    //   - `avss_secmsg_public` — the broadcast `AvssPublicCommitMsg`
+    //     (Merkle roots + h(x) coefficients + transcript binding);
+    //     populated on `AVSSSecMsgPublicCommit` receipt.
+    //   - `avss_secmsg_delivered_bytes` — the decrypted plaintext
+    //     bytes after `SecMsgDstState` emits `DeliveredMessage`.
+    //     `commit 7` will deserialize these into
+    //     `AvssRecipientPayload`, validate Merkle proofs against
+    //     `avss_secmsg_public`, run two-field degree test, store in
+    //     `CTRBCState`, and trigger `AVSSReady`/`AVSSComplete`.
+    //
+    // In commit 6 the handlers stop at "store decrypted bytes" — no
+    // AVSS-completion is signalled via this path, so the dealer's
+    // legacy `AVSSSend` continues to drive the actual quorum.
+    pub avss_secmsg_state: HashMap<
+        (Round, Replica),
+        crate::node::shoup_smart::sec_msg_dst::SecMsgDstState,
+    >,
+    pub avss_secmsg_public: HashMap<(Round, Replica), types::beacon::AvssPublicCommitMsg>,
+    pub avss_secmsg_delivered_bytes: HashMap<(Round, Replica), Vec<u8>>,
+
     // ---- Audit fire-and-forget plumbing (P0-A.1) ----
     //
     // post-ACS audit (the bulk of `process_multicast_recovered_shares`)
@@ -269,6 +300,10 @@ impl Context {
                 audit_tx,
                 audit_rx,
                 coin_per_round: HashMap::default(),
+
+                avss_secmsg_state: HashMap::default(),
+                avss_secmsg_public: HashMap::default(),
+                avss_secmsg_delivered_bytes: HashMap::default(),
 
                 num_messages: 0,
                 bench: HashMap::default(),

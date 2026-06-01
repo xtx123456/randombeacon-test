@@ -20,3 +20,7 @@ pub use ctrbc::*;
 
 pub mod acs;
 pub mod shoup_smart;
+
+mod avss_secmsg;
+#[allow(unused_imports)]
+pub use avss_secmsg::*;
