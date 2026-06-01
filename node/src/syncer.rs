@@ -25,6 +25,15 @@ pub struct Syncer{
     exit_rx: oneshot::Receiver<()>,
     /// Cancel Handlers
     pub cancel_handlers: Vec<CancelHandler<Acknowledgement>>,
+
+    /// ---- Beacon agreement diagnostics ----
+    /// For each (round, coin), remember whether we already logged
+    /// an [BEACON-AGREE] / [BEACON-DISAGREE] verdict so we don't
+    /// spam log lines as additional late reports arrive.
+    pub beacon_verdict_logged: HashSet<(Round, usize)>,
+    /// Running totals across the whole run.
+    pub agreed_coin_count: u64,
+    pub disagreed_coin_count: u64,
 }
 
 impl Syncer{
@@ -63,7 +72,10 @@ impl Syncer{
                 rx_net:rx_net_to_server,
                 net_send:net_send,
                 exit_rx:exit_rx,
-                cancel_handlers:Vec::new()
+                cancel_handlers:Vec::new(),
+                beacon_verdict_logged: HashSet::default(),
+                agreed_coin_count: 0,
+                disagreed_coin_count: 0,
             };
             if let Err(e) = syncer.run().await {
                 log::error!("Consensus error: {}", e);
@@ -87,6 +99,18 @@ impl Syncer{
                 exit_val = &mut self.exit_rx => {
                     exit_val.map_err(anyhow::Error::new)?;
                     log::error!("Termination signal received by the server. Exiting.");
+                    // Final beacon-agreement totals (also printed every 100
+                    // verdicts during the run via [BEACON-AGREE-PROGRESS]).
+                    let total = self.agreed_coin_count + self.disagreed_coin_count;
+                    let rate = if total > 0 {
+                        100.0 * (self.disagreed_coin_count as f64) / (total as f64)
+                    } else {
+                        0.0
+                    };
+                    log::error!(
+                        "[BEACON-AGREE-FINAL] total_verdicts={} agreed={} disagreed={} disagree_rate={:.4}%",
+                        total, self.agreed_coin_count, self.disagreed_coin_count, rate
+                    );
                     break
                 },
                 msg = self.rx_net.recv() => {
@@ -231,6 +255,79 @@ impl Syncer{
                                 //vec_times.sort();
                                 log::info!("All n nodes completed reconstruction for round {:?} and index {} with {:?},and set map : {:?}",round,index,vec_times, set_map);
                                 //self.broadcast(SyncMsg { sender: self.num_nodes, state: SyncState::STOP, value:0}).await;
+                            }
+
+                            // ---- Beacon agreement diagnostic ----
+                            // Once we have collected reports from ALL n nodes for this
+                            // (round, coin), explicitly compare their beacon values and
+                            // surface a single AGREE / DISAGREE verdict line that the
+                            // benchmark CSV parser can pick up.
+                            //
+                            // Disagreement here ⇒ two honest nodes computed DIFFERENT
+                            // beacons for the same (round, coin), which is a direct
+                            // observation of an ACS Agreement violation in the PPT
+                            // implementation. We log per-value node groupings so it's
+                            // easy to tell which nodes split.
+                            if time_sec_map.len() == self.num_nodes
+                                && !self.beacon_verdict_logged.contains(&(round, index))
+                            {
+                                let mut by_value: HashMap<BigInt, Vec<Replica>> = HashMap::default();
+                                for (rep, (_t, secret)) in time_sec_map.iter() {
+                                    by_value.entry(secret.clone()).or_default().push(*rep);
+                                }
+                                // Stable per-group node ordering for readable logs.
+                                for reps in by_value.values_mut() { reps.sort(); }
+
+                                self.beacon_verdict_logged.insert((round, index));
+
+                                if by_value.len() == 1 {
+                                    self.agreed_coin_count += 1;
+                                    let sample = by_value.keys().next().unwrap();
+                                    let hex = sample.to_str_radix(16);
+                                    let summary = if hex.len() > 24 {
+                                        format!("{}...{} ({} hex chars)",
+                                            &hex[..8], &hex[hex.len()-8..], hex.len())
+                                    } else {
+                                        hex
+                                    };
+                                    log::info!(
+                                        "[BEACON-AGREE] round {} index {} all {} nodes agree value={}",
+                                        round, index, self.num_nodes, summary
+                                    );
+                                } else {
+                                    self.disagreed_coin_count += 1;
+                                    // Print every distinct value with the node group that
+                                    // reported it. Truncate value to first/last 8 hex
+                                    // chars to keep the log line readable.
+                                    let mut group_strs: Vec<String> = Vec::new();
+                                    for (value, reps) in by_value.iter() {
+                                        let hex = value.to_str_radix(16);
+                                        let v_summary = if hex.len() > 24 {
+                                            format!("{}...{}",
+                                                &hex[..8], &hex[hex.len()-8..])
+                                        } else {
+                                            hex
+                                        };
+                                        group_strs.push(format!("nodes={:?}=>value={}", reps, v_summary));
+                                    }
+                                    log::error!(
+                                        "[BEACON-DISAGREE] round {} index {} {} distinct beacon values across {} nodes; groups: [{}]",
+                                        round, index, by_value.len(), self.num_nodes,
+                                        group_strs.join(" | ")
+                                    );
+                                }
+
+                                // Periodic progress so a long run shows running totals
+                                // without grep'ing the whole log.
+                                let total_verdicts = self.agreed_coin_count + self.disagreed_coin_count;
+                                if total_verdicts > 0 && total_verdicts % 100 == 0 {
+                                    log::info!(
+                                        "[BEACON-AGREE-PROGRESS] verdicts so far: agree={} disagree={} (disagree rate {:.4}%)",
+                                        self.agreed_coin_count,
+                                        self.disagreed_coin_count,
+                                        100.0 * (self.disagreed_coin_count as f64) / (total_verdicts as f64)
+                                    );
+                                }
                             }
                             let current_time = SystemTime::now()
                             .duration_since(UNIX_EPOCH)

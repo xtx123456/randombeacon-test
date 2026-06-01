@@ -25,8 +25,17 @@ BIN="${BIN:-$ROOT/target/release/node}"
 TRI="${TRI:-32862}"
 IP_FILE="${IP_FILE:-$ROOT/ip_file}"
 
-# 你目前只要 batch=20
-BATCHES=(20 50 100)
+# PPT's amortised throughput per coin is (round_overhead / batch_size).
+# Empirically the per-round overhead at n=16 is ~3.5 s irrespective of
+# batch size (single-round serial protocol: AVSS -> ACS -> reconstruct).
+# So PPT's coin-throughput in coin/s is ~ batch_size / 3.5.
+#
+# To clearly see the regime where PPT outperforms BEA, we sweep batch
+# sizes in PPT's main operating range. The smaller batches (20 / 50 /
+# 100) are kept first to verify protocol correctness; the larger ones
+# (500 / 1000 / 2000) are where the batch-sharing optimisation
+# actually gives PPT its advantage.
+BATCHES=(20 50 100 500 1000 2000)
 PROTOCOLS=("bea" "ppt")
 
 if [ ! -x "$BIN" ]; then

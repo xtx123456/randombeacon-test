@@ -1,144 +1,140 @@
+//! Per-round state container for the new PPT ACS pipeline:
+//! Bracha RBC + n parallel Mostefaoui-Moumen-Raynal ABAs + self-
+//! bootstrap common coin.
+//!
+//! This module holds **only** the state struct and trivial helpers.
+//! All protocol logic (RBC inputs, ABA inputs, coin pumping, decision
+//! finalisation) lives in `acs::protocol`, which owns a `Context` and
+//! actually broadcasts / dispatches messages.
+
 use std::collections::{HashMap, HashSet};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ACSPhase {
-    CollectingInit,
-    OutputBroadcast,
-    Finalized,
+use crypto::hash::Hash;
+use types::Replica;
+
+use super::aba_driver::AcsRoundState as AbaRoundDriver;
+use super::rbc::RbcInstanceState;
+
+/// One ACS round's state: n RBC instances (one per proposer) plus
+/// the n-parallel ABA driver, plus the deferred-input book that
+/// implements PPT's "wait for AVSS totality before feeding ABA(j)
+/// input=1" rule.
+pub struct AcsRound {
+    pub round: types::Round,
+    pub myid: Replica,
+    pub n: usize,
+    pub f: usize,
+
+    /// One Bracha RBC instance per proposer index `j ∈ [0, n)`.
+    pub rbc: Vec<RbcInstanceState>,
+    /// Once we have ≥ n-f locally AVSS-completed dealers, the ACS
+    /// driver flips this to true and broadcasts our own RBC SEND.
+    pub rbc_self_send_done: bool,
+
+    /// `proposer_id -> delivered RBC payload bytes`. Populated when
+    /// the corresponding RBC instance reaches the `Delivered` state.
+    /// The bytes are the proposer's claimed AVSS-completed-dealer
+    /// set; we keep them so the post-ACS audit and any future
+    /// debugging can recover what the proposer said. The current
+    /// ACS does NOT use the contents to compute its dealer-set
+    /// output (the output is `{j : ABA(j) decided 1}`), but the
+    /// payload bytes remain on hand for future protocol extensions.
+    pub rbc_delivered_payload: HashMap<usize, Vec<u8>>,
+
+    /// Pending ABA-input-1 candidates: proposer j had its RBC
+    /// delivered, but at the moment of delivery the local view did
+    /// not yet contain dealer j as AVSS-completed. We re-evaluate
+    /// these on every AVSS-completion change.
+    ///
+    /// Pattern parallels `pending_avss_for_theta` in `Context`.
+    pub deferred_inputs: HashSet<usize>,
+
+    /// The n parallel MMR ABA driver. Holds per-instance state and
+    /// the all-decided latch.
+    pub aba: AbaRoundDriver,
+
+    /// Has each ABA instance had its input fed in yet?
+    /// `aba_input_fed[j] == true` ⇔ we have called `aba.set_input(j, _)`
+    /// (with either a 1 or a 0).
+    pub aba_input_fed: Vec<bool>,
+
+    /// Coin-feeding bookkeeping: `(aba_instance_id, aba_round) ∈
+    /// coin_fed_for` ⇔ we have already called `aba.handle_coin(j, r,
+    /// _)` for that pair. Keeps the coin pump idempotent on multi-
+    /// trigger paths.
+    pub coin_fed_for: HashSet<(usize, u64)>,
+
+    /// Set once we have triggered the "force input 0 on undecided
+    /// instances" rule (after observing ≥ n-f decisions of 1).
+    pub forced_zero_round_started: bool,
+
+    /// Set once we have called `Context::finalize_acs_round` for
+    /// this round. Idempotent latch.
+    pub finalized: bool,
+
+    /// Banned dealers seen so far. Not propagated by ACS itself —
+    /// the global `Context::banned_dealers` is the source of truth;
+    /// we keep this only as a per-round snapshot for diagnostics.
+    pub banned_snapshot: HashSet<Replica>,
 }
 
-impl Default for ACSPhase {
-    fn default() -> Self {
-        ACSPhase::CollectingInit
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct ACSInstanceState {
-    pub round: usize,
-    pub myid: usize,
-
-    /// Local completed dealers collected directly from the AVSS path.
-    pub completed_dealers: HashSet<usize>,
-    pub proposed_set: HashSet<usize>,
-
-    /// Local candidate built from ACSInit quorum.
-    pub decided_set: Option<HashSet<usize>>,
-
-    pub init_sent: bool,
-    pub output_sent: bool,
-
-    /// Final ACS decision: only set once we observe n-f identical ACSOutput payloads.
-    pub final_decided: bool,
-    pub final_decided_set: Option<HashSet<usize>>,
-
-    /// sender -> ACSInit proposal
-    pub outputs_seen: HashMap<usize, HashSet<usize>>,
-
-    /// sender -> ACSOutput payload
-    pub final_outputs_seen: HashMap<usize, HashSet<usize>>,
-
-    pub phase: ACSPhase,
-}
-
-impl ACSInstanceState {
-    pub fn new(round: usize, myid: usize) -> Self {
+impl AcsRound {
+    pub fn new(round: types::Round, myid: Replica, n: usize, f: usize) -> Self {
+        let rbc: Vec<RbcInstanceState> = (0..n)
+            .map(|j| RbcInstanceState::new(myid, j as Replica, n, f))
+            .collect();
         Self {
             round,
             myid,
-            completed_dealers: HashSet::new(),
-            proposed_set: HashSet::new(),
-            decided_set: None,
-            init_sent: false,
-            output_sent: false,
-            final_decided: false,
-            final_decided_set: None,
-            outputs_seen: HashMap::new(),
-            final_outputs_seen: HashMap::new(),
-            phase: ACSPhase::CollectingInit,
+            n,
+            f,
+            rbc,
+            rbc_self_send_done: false,
+            rbc_delivered_payload: HashMap::new(),
+            deferred_inputs: HashSet::new(),
+            aba: AbaRoundDriver::new(myid, n, f),
+            aba_input_fed: vec![false; n],
+            coin_fed_for: HashSet::new(),
+            forced_zero_round_started: false,
+            finalized: false,
+            banned_snapshot: HashSet::new(),
         }
     }
 
-    pub fn mark_completed(&mut self, dealer: usize) {
-        self.completed_dealers.insert(dealer);
-    }
-
-    pub fn set_proposal_from_completed(&mut self) {
-        self.proposed_set = self.completed_dealers.clone();
-    }
-
-    pub fn record_init(&mut self, from: usize, dealers: HashSet<usize>) {
-        self.outputs_seen.insert(from, dealers);
-    }
-
-    /// Backward-compatible alias.
-    pub fn record_output(&mut self, from: usize, dealers: HashSet<usize>) {
-        self.record_init(from, dealers);
-    }
-
-    /// Build exactly one local candidate once we have n-f ACSInit messages.
-    /// For performance, keep the repo's original quorum-union rule here.
-    pub fn maybe_build_output(&mut self, threshold: usize) -> Option<HashSet<usize>> {
-        if let Some(existing) = self.decided_set.clone() {
-            return Some(existing);
+    /// External-validity / banning hook: drop any pending input
+    /// candidate for `dealer` and never feed it again. Idempotent.
+    pub fn ban_dealer(&mut self, dealer: Replica) {
+        self.banned_snapshot.insert(dealer);
+        let dealer_idx = dealer as usize;
+        if dealer_idx < self.n {
+            self.deferred_inputs.remove(&dealer_idx);
         }
-
-        if self.outputs_seen.len() < threshold {
-            return None;
-        }
-
-        let mut union_set = HashSet::new();
-        for dealers in self.outputs_seen.values() {
-            union_set.extend(dealers.iter().copied());
-        }
-
-        self.decided_set = Some(union_set.clone());
-        self.phase = ACSPhase::OutputBroadcast;
-        Some(union_set)
     }
 
-    pub fn mark_output_sent(&mut self) {
-        self.output_sent = true;
-    }
-
-    pub fn record_final_output(&mut self, from: usize, dealers: HashSet<usize>) {
-        self.final_outputs_seen.insert(from, dealers);
-    }
-
-    /// Finalize only when we have n-f identical ACSOutput payloads.
-    pub fn try_finalize_from_outputs(&mut self, threshold: usize) -> Option<HashSet<usize>> {
-        if self.final_decided {
-            return None;
-        }
-
-        let mut vote_count: HashMap<Vec<usize>, usize> = HashMap::new();
-        for dealers in self.final_outputs_seen.values() {
-            let key = Self::canonical_vec(dealers);
-            *vote_count.entry(key).or_insert(0) += 1;
-        }
-
-        let winning_vec = vote_count
+    /// Compute final ACS dealer set: `{ j : ABA(j) decided 1 }`,
+    /// filtered against the global banned-dealer list (passed in by
+    /// the caller, since `AcsRound` doesn't directly own
+    /// `Context::banned_dealers`). Returns `None` until every
+    /// instance has decided.
+    pub fn compute_decided_dealers(
+        &self,
+        banned: &HashSet<Replica>,
+    ) -> Option<Vec<Replica>> {
+        let bset = self.aba.maybe_compute_acs_output()?;
+        let mut out: Vec<Replica> = bset
             .into_iter()
-            .find_map(|(dealers, count)| if count >= threshold { Some(dealers) } else { None })?;
-
-        let decided: HashSet<usize> = winning_vec.into_iter().collect();
-
-        self.final_decided = true;
-        self.final_decided_set = Some(decided.clone());
-        self.phase = ACSPhase::Finalized;
-
-        Some(decided)
+            .map(|j| j as Replica)
+            .filter(|d| !banned.contains(d))
+            .collect();
+        out.sort_unstable();
+        Some(out)
     }
 
-    pub fn final_decision_vec(&self) -> Option<Vec<usize>> {
-        self.final_decided_set
-            .as_ref()
-            .map(Self::canonical_vec)
-    }
-
-    fn canonical_vec(dealers: &HashSet<usize>) -> Vec<usize> {
-        let mut v: Vec<usize> = dealers.iter().copied().collect();
-        v.sort_unstable();
-        v
+    /// Convenience: return the cached payload-hash of the proposer's
+    /// delivered RBC (used by tests / future audit).
+    pub fn rbc_delivered_hash(&self, j: usize) -> Option<Hash> {
+        self.rbc_delivered_payload
+            .get(&j)
+            .map(|p| crypto::hash::do_hash(p.as_slice()))
     }
 }
