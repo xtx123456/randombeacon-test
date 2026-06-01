@@ -59,7 +59,11 @@ impl Context {
     /// Lazily construct the per-(round, dealer) SecMsgDst-AVSS
     /// state machine on first message arrival. Returns a mutable
     /// borrow of the entry.
-    fn get_or_init_avss_secmsg(
+    ///
+    /// `pub(crate)` so the dealer-side launch in `batch_wssinit`
+    /// can install the local SecMsgDstState before calling
+    /// `set_input_as_sender`.
+    pub(crate) fn get_or_init_avss_secmsg(
         &mut self,
         round: Round,
         dealer: Replica,
@@ -85,10 +89,10 @@ impl Context {
     }
 
     /// Receiver entry point for a broadcast `AVSSSecMsgPublicCommit`
-    /// from `dealer`. Verifies the transcript-binding hash and
-    /// caches the commit so commit 7's payload-verifier can chain
-    /// per-recipient Merkle proofs against `root_vec` and run the
-    /// degree test against `degree_test_coeffs`.
+    /// from `dealer`. Verifies the transcript-binding hash, caches
+    /// the commit, and triggers `try_finalize_avss_secmsg` (which
+    /// is a no-op until the matching SecMsgDst delivery also lands).
+    #[async_recursion]
     pub async fn process_avss_secmsg_public_commit(
         &mut self,
         msg: AvssPublicCommitMsg,
@@ -101,28 +105,35 @@ impl Context {
             );
             return;
         }
+        let round = msg.round;
+        let dealer = msg.origin;
         // Idempotent: first-seen-wins. Byzantine dealer that
         // re-broadcasts a different commit is silently dropped.
-        match self.avss_secmsg_public.entry((msg.round, msg.origin)) {
+        let newly_cached = match self.avss_secmsg_public.entry((round, dealer)) {
             Entry::Occupied(_) => {
                 log::debug!(
                     "[PPT][SECMSG-AVSS][PUB-COMMIT] node {} dropping duplicate \
                      public-commit from dealer {} for round {} (already cached)",
-                    self.myid, msg.origin, msg.round
+                    self.myid, dealer, round
                 );
+                false
             }
             Entry::Vacant(e) => {
                 log::info!(
                     "[PPT][SECMSG-AVSS][PUB-COMMIT] node {} cached public-commit \
                      from dealer {} for round {} (#roots={}, #h-coeffs={})",
                     self.myid,
-                    msg.origin,
-                    msg.round,
+                    dealer,
+                    round,
                     msg.root_vec.len(),
                     msg.degree_test_coeffs.len(),
                 );
                 e.insert(msg);
+                true
             }
+        };
+        if newly_cached {
+            self.try_finalize_avss_secmsg(round, dealer).await;
         }
     }
 
@@ -262,8 +273,11 @@ impl Context {
     /// dealer) `SecMsgDstState` into wire `CoinMsg` variants and
     /// send / broadcast them through `Context`'s networking.
     /// `Delivered` and `*Rejected` outcomes are handled locally.
+    /// `pub(crate)` so the dealer-side launch can pump the
+    /// `SecMsgDstAction`s emitted by `set_input_as_sender` through
+    /// the same wire-routing pipeline as receiver-side responses.
     #[async_recursion]
-    async fn dispatch_avss_secmsg_actions(
+    pub(crate) async fn dispatch_avss_secmsg_actions(
         &mut self,
         round: Round,
         dealer: Replica,
@@ -458,12 +472,10 @@ impl Context {
 
     /// Called when the per-(round, dealer) SecMsgDst state has
     /// fully delivered our own per-recipient AVSS payload. Caches
-    /// the decrypted plaintext bytes.
-    ///
-    /// Commit 6 stops here; commit 7 will deserialize these bytes
-    /// into `AvssRecipientPayload`, validate Merkle proofs against
-    /// `avss_secmsg_public[(round, dealer)]`, run the two-field
-    /// degree test, and trigger AVSS-completion.
+    /// the decrypted plaintext bytes and triggers
+    /// `try_finalize_avss_secmsg` (which proceeds only when the
+    /// public-commit broadcast has also been cached).
+    #[async_recursion]
     async fn on_avss_secmsg_delivered(
         &mut self,
         round: Round,
@@ -474,15 +486,150 @@ impl Context {
         log::info!(
             "[PPT][SECMSG-AVSS][DELIVERED] node {} delivered SecMsgDst-AVSS \
              payload from dealer {} for round {} -- {} plaintext bytes \
-             (public-commit cached={}). Commit 6 caches only; AVSS-completion \
-             still flows through legacy AVSSSend path.",
+             (public-commit cached={})",
             self.myid,
             dealer,
             round,
             plaintext.len(),
             public_cached
         );
+        // Idempotent: first-seen-wins. SecMsgDst delivery is
+        // already idempotent at the state-machine level (latches
+        // on first XOR), but defensive guard here costs nothing.
+        if self
+            .avss_secmsg_delivered_bytes
+            .contains_key(&(round, dealer))
+        {
+            return;
+        }
         self.avss_secmsg_delivered_bytes
             .insert((round, dealer), plaintext);
+        self.try_finalize_avss_secmsg(round, dealer).await;
+    }
+
+    /// Once both the public-commit broadcast and the SecMsgDst
+    /// delivery for `(round, dealer)` have landed locally,
+    /// reconstruct the equivalent legacy-shape `BeaconMsg +
+    /// transcript_root` pair and feed it into the existing
+    /// `process_avss_send` pipeline.
+    ///
+    /// `process_avss_send` performs every step the live AVSS
+    /// pipeline requires (theta gating + buffering, spawn_blocking
+    /// validation via `avss_local_packet_valid_pure`,
+    /// `ban_dealer_global` on failure, `store_avss_packet`,
+    /// AVSSReady broadcast, AVSSComplete threshold + broadcast,
+    /// AVSS-completion + ACS hook). Reusing it preserves every
+    /// P0/P1/Level fix automatically — the only thing that
+    /// changes between the legacy and SecMsgDst paths is HOW the
+    /// dealer's per-recipient payload arrived.
+    ///
+    /// Idempotent: returns early if either prerequisite is
+    /// missing or if the dealer has already been validated for
+    /// this round.
+    #[async_recursion]
+    pub(crate) async fn try_finalize_avss_secmsg(
+        &mut self,
+        round: Round,
+        dealer: Replica,
+    ) {
+        // Need both inputs.
+        if !self.avss_secmsg_public.contains_key(&(round, dealer)) {
+            return;
+        }
+        if !self.avss_secmsg_delivered_bytes.contains_key(&(round, dealer)) {
+            return;
+        }
+        // Skip if banned.
+        if self.banned_dealers.contains(&dealer) {
+            log::warn!(
+                "[PPT][SECMSG-AVSS][FINALIZE] dropping finalize for banned \
+                 dealer {} round {}",
+                dealer, round
+            );
+            return;
+        }
+        // Skip if already finalized through this or any earlier path.
+        if let Some(rs) = self.round_state.get(&round) {
+            if rs.avss_local_valid.contains(&dealer) {
+                return;
+            }
+        }
+        // Take ownership of the cached pieces. We `clone` rather than
+        // `remove` so a duplicate trigger (idempotent re-entry) still
+        // sees the same data — the `avss_local_valid` guard above
+        // prevents double-processing into the AVSS quorum.
+        let public = self
+            .avss_secmsg_public
+            .get(&(round, dealer))
+            .expect("just verified contains_key")
+            .clone();
+        let plaintext = self
+            .avss_secmsg_delivered_bytes
+            .get(&(round, dealer))
+            .expect("just verified contains_key")
+            .clone();
+        let myid = self.myid;
+
+        let payload = match types::beacon::AvssRecipientPayload::deserialize_bytes(&plaintext) {
+            Some(p) => p,
+            None => {
+                log::error!(
+                    "[PPT][SECMSG-AVSS][FINALIZE] node {} got malformed \
+                     AvssRecipientPayload bytes from dealer {} round {} -- \
+                     banning dealer",
+                    myid, dealer, round
+                );
+                self.ban_dealer_global(dealer);
+                return;
+            }
+        };
+
+        // Reconstruct a BeaconMsg with the same field layout as
+        // the legacy AVSSSend would have carried. Public fields
+        // come from the cached AvssPublicCommitMsg (identical at
+        // every honest receiver by construction); per-recipient
+        // fields come from the decrypted AvssRecipientPayload.
+        // `appx_con` is empty in the pure-PPT path (legacy dealer
+        // also passes Vec::new() — see batch_wssinit.rs:154).
+        let wss = types::beacon::BatchWSSMsg::new(
+            dealer,
+            payload.secrets,
+            payload.nonces,
+            payload.mps,
+        );
+        let beacon_msg = types::beacon::BeaconMsg::new_two_field(
+            dealer,
+            round,
+            wss,
+            public.root_vec.clone(),
+            Vec::new(),
+            public.degree_test_coeffs.clone(),
+            payload.mask_shares,
+            payload.f_large_shares,
+        );
+        // Use the *same* transcript-root derivation as the legacy
+        // path: do_hash(BeaconMsg::serialize_ctrbc()). Because
+        // every honest receiver reconstructs BeaconMsg from the
+        // same public commit and the same canonical empty
+        // appx_con, this hash is bit-identical at every honest
+        // node — which is exactly what the AVSSReady / AVSSComplete
+        // quorum requires.
+        let transcript_root =
+            crypto::hash::do_hash(beacon_msg.serialize_ctrbc().as_slice());
+
+        log::info!(
+            "[PPT][SECMSG-AVSS][FINALIZE] node {} feeding reconstructed \
+             BeaconMsg into process_avss_send for dealer {} round {} \
+             (transcript_root prefix={:02x}{:02x}{:02x}{:02x})",
+            myid,
+            dealer,
+            round,
+            transcript_root[0],
+            transcript_root[1],
+            transcript_root[2],
+            transcript_root[3]
+        );
+        self.process_avss_send(beacon_msg, transcript_root, dealer, round)
+            .await;
     }
 }

@@ -156,8 +156,24 @@ impl Context {
 
     pub(crate) async fn choose_fn(self: &mut Context, wrapper_msg: WrapperMsg) {
         match wrapper_msg.clone().protmsg {
-            CoinMsg::AVSSSend(beaconmsg, transcript_root, dealer, round) => {
-                self.process_avss_send(beaconmsg, transcript_root, dealer, round).await;
+            // Legacy cleartext AVSSSend from a peer running an older
+            // binary. Commit 7 cut the dealer over to the
+            // Shoup-Smart 2024 SecMsgDst path (AVSSSecMsgPublicCommit
+            // + AVSSSecMsgKey* + AVSSSecMsgCipher*); honest dealers
+            // running this binary never emit AVSSSend on the wire.
+            // We keep the `process_avss_send` body alive because the
+            // theta-replay path (`drain_pending_avss_for`) and the
+            // SecMsgDst finalisation path (`try_finalize_avss_secmsg`)
+            // both call it internally with locally-reconstructed
+            // BeaconMsgs. This branch only fires for a literal wire
+            // AVSSSend, which we drop with a diagnostic.
+            CoinMsg::AVSSSend(_beaconmsg, _transcript_root, dealer, round) => {
+                log::warn!(
+                    "[PPT][AVSS-LEGACY] dropping wire AVSSSend from dealer {} \
+                     for round {} -- commit 7 cut the dealer over to \
+                     SecMsgDst-routed AVSS",
+                    dealer, round
+                );
             }
             CoinMsg::AVSSReady(dealer, transcript_root, sender, round) => {
                 self.process_avss_ready(dealer, transcript_root, sender, round).await;

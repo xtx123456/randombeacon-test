@@ -1,7 +1,7 @@
 use std::time::SystemTime;
 
 use async_recursion::async_recursion;
-use crypto::{aes_hash::MerkleTree, hash::{do_hash, Hash}};
+use crypto::{aes_hash::MerkleTree, hash::Hash};
 use num_bigint::{BigUint, RandBigInt};
 use types::{
     beacon::{BatchWSSMsg, BeaconMsg, CoinMsg, Round, Val, WrapperMsg},
@@ -148,8 +148,6 @@ impl Context {
             new_round
         );
 
-        let mut beacon_msgs = Vec::new();
-
         // Pure PPT: no legacy appxcon payload.
         let vec_round_msgs: Vec<(Round,Vec<(Replica,Val)>)> = Vec::new();
 
@@ -275,32 +273,110 @@ impl Context {
         assert_eq!(roots_vec.len(), batch_size);
         assert_eq!(degree_test_batch.len(), batch_size);
 
-        for (idx, (rep, batchwss)) in vec_msgs_to_be_sent.into_iter().enumerate() {
-            let beacon_msg = BeaconMsg::new_two_field(
-                self.myid,
-                new_round,
-                batchwss,
-                roots_vec.clone(),
-                vec_round_msgs.clone(),
-                degree_test_batch.clone(),
+        // ============================================================
+        // Shoup-Smart 2024 Π_SecMsgDst-routed dispatch (commit 7 cutover).
+        //
+        // Replaces the legacy per-recipient AVSSSend(BeaconMsg, ...)
+        // unicast loop:
+        //
+        //   1. Public commitment (root_vec, degree_test_coeffs, +
+        //      transcript binding hash) is broadcast ONCE via
+        //      AVSSSecMsgPublicCommit, instead of being duplicated
+        //      across n cleartext BeaconMsg copies.
+        //
+        //   2. Per-recipient confidential payload (secrets, nonces,
+        //      mask_shares, f_large_shares, mps) is dispersed via
+        //      Π_SecMsgDst. SecKeyDst gives every P_j a private
+        //      Shamir share k_j of a fresh master key K; RelMsgDst
+        //      publicly distributes the n hash-chain-encrypted
+        //      ciphertexts c_j = m_j XOR PRG(k_j). Each P_j
+        //      decrypts its own c_j with its own k_j.
+        //
+        //   3. AVSSReady / AVSSComplete quorum + AVSS-completion +
+        //      ACS hook are unchanged: the receiver's
+        //      `try_finalize_avss_secmsg` reconstructs an
+        //      equivalent-shaped BeaconMsg and feeds it into the
+        //      same `process_avss_send` pipeline that the legacy
+        //      cleartext path used. All P0/P1/Level fixes (theta
+        //      buffering, banned_dealers, spawn_blocking,
+        //      audit fire-and-forget, coin-0 fast-path) remain
+        //      identically in force.
+        //
+        // appx_con is empty (Vec::new()) on the pure-PPT path
+        // (see vec_round_msgs above), so the receiver
+        // reconstructs an identical-shape BeaconMsg without needing
+        // the dealer to ship appx_con explicitly.
+        // ============================================================
+        let _ = vec_round_msgs;
+
+        // (1) Build & broadcast the public commitment.
+        let public_commit = types::beacon::AvssPublicCommitMsg::new(
+            self.myid,
+            new_round,
+            roots_vec.clone(),
+            degree_test_batch.clone(),
+        );
+        let public_commit_for_self = public_commit.clone();
+        self.broadcast(
+            CoinMsg::AVSSSecMsgPublicCommit(public_commit),
+            new_round,
+        )
+        .await;
+        // Broadcast skips self; deliver our own commit synchronously.
+        self.process_avss_secmsg_public_commit(public_commit_for_self).await;
+
+        // (2) Build per-recipient AvssRecipientPayload byte vectors.
+        //     The ordering must match SecMsgDst's recipient_idx
+        //     convention (recipient j ∈ [0, n) maps to payload[j]).
+        let mut recipient_payload_bytes: Vec<Vec<u8>> = Vec::with_capacity(self.num_nodes);
+        for (idx, (_rep, batchwss)) in vec_msgs_to_be_sent.into_iter().enumerate() {
+            let payload = types::beacon::AvssRecipientPayload::new(
+                batchwss.secrets,
+                batchwss.nonces,
                 mask_shares_per_node[idx].clone(),
                 f_large_per_node[idx].clone(),
+                batchwss.mps,
             );
-            beacon_msgs.push((rep, beacon_msg));
+            recipient_payload_bytes.push(payload.serialize_bytes());
         }
+        debug_assert_eq!(recipient_payload_bytes.len(), self.num_nodes);
 
-        for (rep, beacon_msg) in beacon_msgs.into_iter() {
-            let replica = rep - 1;
-            let sec_key = self.sec_key_map.get(&replica).unwrap().clone();
-            let transcript_root = do_hash(beacon_msg.serialize_ctrbc().as_slice());
-            if replica != self.myid {
-                let beacon_init = CoinMsg::AVSSSend(beacon_msg, transcript_root, self.myid, new_round);
-                let wrapper_msg = WrapperMsg::new(beacon_init, self.myid, &sec_key, new_round);
-                self.send(replica, wrapper_msg).await;
-            } else {
-                self.process_avss_send(beacon_msg, transcript_root, self.myid, new_round).await;
-            }
-        }
+        // (3) Initialise the per-(round, dealer-self) SecMsgDstState
+        //     and call set_input_as_sender. This synchronously samples
+        //     a master key K, derives all (k_1, ..., k_n) shares
+        //     internally, encrypts each m_j with PRG(k_j), and emits
+        //     the channel-tagged dispersal/echo/vote actions.
+        let actions = {
+            let secmsg_state = self.get_or_init_avss_secmsg(new_round, self.myid);
+            let mut rng = rand::thread_rng();
+            secmsg_state
+                .set_input_as_sender(recipient_payload_bytes, &mut rng)
+                .expect(
+                    "[PPT][SECMSG-AVSS] dealer set_input_as_sender failed -- \
+                     this should be impossible on the live path \
+                     (only fails on degenerate prime/n/t configs)",
+                )
+        };
+
+        // (4) Pump the actions through the channel-tagged wire layer.
+        //     dispatch_avss_secmsg_actions handles SendDispersal /
+        //     SendEcho / SendVote routing including the dealer's
+        //     own self-loop (recipient_idx == self.myid).
+        self.dispatch_avss_secmsg_actions(new_round, self.myid, actions).await;
+
+        // (5) Suppress unused-binding warnings for the legacy
+        //     cleartext-path locals we no longer emit. We keep
+        //     them in scope so future profiling / debugging hooks
+        //     can dump them without re-plumbing.
+        let _ = roots_vec;
+        let _ = degree_test_batch;
+        let _ = mask_shares_per_node;
+        let _ = f_large_per_node;
+        // Keep the legacy-path types referenced via PhantomData
+        // so cargo-fix / future imports stay stable. Nothing here
+        // executes at runtime.
+        let _phantom_legacy: std::marker::PhantomData<(BeaconMsg, Hash, WrapperMsg)> =
+            std::marker::PhantomData;
 
         self.increment_round(new_round).await;
         self.add_benchmark(String::from("ppt_start_round"), now.elapsed().unwrap().as_nanos());
