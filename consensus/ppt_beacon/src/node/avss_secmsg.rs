@@ -69,23 +69,89 @@ impl Context {
         dealer: Replica,
     ) -> &mut SecMsgDstState {
         if !self.avss_secmsg_state.contains_key(&(round, dealer)) {
-            let prime = self.secret_domain.clone();
-            let n = self.num_nodes;
-            let t = self.num_faults;
-            let myid = self.myid;
-            let hash_state = self.hash_context.clone();
-            // SecMsgDstState::new only fails on degenerate
-            // configuration (prime < 2 / n < 4 / t == 0 / 3t >= n);
-            // the parent Context already validates these, so the
-            // unwrap below is panic-free in any production config.
-            let state =
-                SecMsgDstState::new(myid, n, t, dealer, prime, hash_state)
-                    .expect("SecMsgDstState::new given a Context-validated config");
+            let state = self.fresh_avss_secmsg_state(dealer);
             self.avss_secmsg_state.insert((round, dealer), state);
         }
         self.avss_secmsg_state
             .get_mut(&(round, dealer))
             .expect("just inserted above")
+    }
+
+    /// Allocate a fresh `SecMsgDstState` for `(round, dealer)`
+    /// without touching `avss_secmsg_state`. Used by the
+    /// secmsg-handler spawn_blocking shim: we `remove` the
+    /// existing state, move it into the blocking closure, then
+    /// `insert` the (possibly mutated) state back. On a
+    /// first-message-for-(round, dealer) path the `remove`
+    /// returns `None`, so this helper bootstraps the initial
+    /// state independently from the lazy-create path inside
+    /// `get_or_init_avss_secmsg`.
+    fn fresh_avss_secmsg_state(&self, dealer: Replica) -> SecMsgDstState {
+        let prime = self.secret_domain.clone();
+        let n = self.num_nodes;
+        let t = self.num_faults;
+        let myid = self.myid;
+        let hash_state = self.hash_context.clone();
+        // SecMsgDstState::new only fails on degenerate
+        // configuration (prime < 2 / n < 4 / t == 0 / 3t >= n);
+        // the parent Context already validates these, so the
+        // unwrap below is panic-free in any production config.
+        SecMsgDstState::new(myid, n, t, dealer, prime, hash_state)
+            .expect("SecMsgDstState::new given a Context-validated config")
+    }
+
+    /// Take-process-put-back helper that lets a SecMsgDst-side
+    /// handler run its bincode deserialize + Merkle / Bracha
+    /// validation on tokio's blocking pool instead of on the
+    /// consensus task's worker thread.
+    ///
+    /// Semantics:
+    ///   1. Take ownership of the per-(round, dealer)
+    ///      `SecMsgDstState` (or freshly allocate one if this is
+    ///      the first inbound for that AVSS instance).
+    ///   2. Move both the state and the caller-provided closure
+    ///      into a `spawn_blocking` task. The closure receives
+    ///      `SecMsgDstState` by ownership and returns the
+    ///      (mutated state, dispatch actions) pair.
+    ///   3. `await` the blocking task. The consensus task is
+    ///      suspended during the await, so other tokio tasks
+    ///      (audit fire-and-forget, network sender's per-
+    ///      connection tasks, sync receiver) are no longer
+    ///      starved by the heavy hash work that the SecMsgDst
+    ///      handlers used to do synchronously on the main thread.
+    ///   4. Reinstate the state and return the actions.
+    ///
+    /// Safety: the take-process-put-back is safe under tokio's
+    /// single-task consensus model because between `remove` and
+    /// `insert` no other handler can run on the same task. The
+    /// `await` point hands control back to the runtime, but only
+    /// non-consensus tasks make progress -- the next
+    /// `process_msg` call waits at `self.net_recv.recv()` for
+    /// the current handler to finish.
+    async fn with_avss_secmsg_state<F, R>(
+        &mut self,
+        round: Round,
+        dealer: Replica,
+        f: F,
+    ) -> R
+    where
+        F: FnOnce(SecMsgDstState) -> (SecMsgDstState, R) + Send + 'static,
+        R: Send + 'static,
+    {
+        let state = self
+            .avss_secmsg_state
+            .remove(&(round, dealer))
+            .unwrap_or_else(|| self.fresh_avss_secmsg_state(dealer));
+
+        let (new_state, result) = tokio::task::spawn_blocking(move || f(state))
+            .await
+            .expect(
+                "[PPT][SECMSG-AVSS] spawn_blocking handler must not panic; \
+                 SecMsgDstState operations are pure + bounded",
+            );
+
+        self.avss_secmsg_state.insert((round, dealer), new_state);
+        result
     }
 
     /// Receiver entry point for a broadcast `AVSSSecMsgPublicCommit`
@@ -177,20 +243,23 @@ impl Context {
         payload: Vec<u8>,
         wire_sender: Replica,
     ) {
-        let entries: Vec<DispersalEntry> = match bincode::deserialize(&payload) {
-            Ok(v) => v,
-            Err(e) => {
-                log::warn!(
-                    "[PPT][SECMSG-AVSS][KEY-DISP] dropping malformed key-dispersal \
-                     from {} for (round={}, dealer={}): {}",
-                    wire_sender, round, dealer, e
-                );
-                return;
-            }
-        };
         let actions = self
-            .get_or_init_avss_secmsg(round, dealer)
-            .handle_key_dispersal(wire_sender, entries);
+            .with_avss_secmsg_state(round, dealer, move |mut state| {
+                let entries: Vec<DispersalEntry> = match bincode::deserialize(&payload) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        log::warn!(
+                            "[PPT][SECMSG-AVSS][KEY-DISP] dropping malformed \
+                             key-dispersal from {} for (round={}, dealer={}): {}",
+                            wire_sender, round, dealer, e
+                        );
+                        return (state, Vec::new());
+                    }
+                };
+                let acts = state.handle_key_dispersal(wire_sender, entries);
+                (state, acts)
+            })
+            .await;
         self.dispatch_avss_secmsg_actions(round, dealer, actions).await;
     }
 
@@ -202,20 +271,23 @@ impl Context {
         payload: Vec<u8>,
         wire_sender: Replica,
     ) {
-        let echo: EchoPayload = match bincode::deserialize(&payload) {
-            Ok(v) => v,
-            Err(e) => {
-                log::warn!(
-                    "[PPT][SECMSG-AVSS][KEY-ECHO] dropping malformed key-echo \
-                     from {} for (round={}, dealer={}): {}",
-                    wire_sender, round, dealer, e
-                );
-                return;
-            }
-        };
         let actions = self
-            .get_or_init_avss_secmsg(round, dealer)
-            .handle_key_echo(wire_sender, echo);
+            .with_avss_secmsg_state(round, dealer, move |mut state| {
+                let echo: EchoPayload = match bincode::deserialize(&payload) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        log::warn!(
+                            "[PPT][SECMSG-AVSS][KEY-ECHO] dropping malformed \
+                             key-echo from {} for (round={}, dealer={}): {}",
+                            wire_sender, round, dealer, e
+                        );
+                        return (state, Vec::new());
+                    }
+                };
+                let acts = state.handle_key_echo(wire_sender, echo);
+                (state, acts)
+            })
+            .await;
         self.dispatch_avss_secmsg_actions(round, dealer, actions).await;
     }
 
@@ -228,8 +300,11 @@ impl Context {
         wire_sender: Replica,
     ) {
         let actions = self
-            .get_or_init_avss_secmsg(round, dealer)
-            .handle_key_vote(wire_sender, meta_root);
+            .with_avss_secmsg_state(round, dealer, move |mut state| {
+                let acts = state.handle_key_vote(wire_sender, meta_root);
+                (state, acts)
+            })
+            .await;
         self.dispatch_avss_secmsg_actions(round, dealer, actions).await;
     }
 
@@ -243,20 +318,23 @@ impl Context {
         payload: Vec<u8>,
         wire_sender: Replica,
     ) {
-        let entries: Vec<DispersalEntry> = match bincode::deserialize(&payload) {
-            Ok(v) => v,
-            Err(e) => {
-                log::warn!(
-                    "[PPT][SECMSG-AVSS][CIPHER-DISP] dropping malformed \
-                     cipher-dispersal from {} for (round={}, dealer={}): {}",
-                    wire_sender, round, dealer, e
-                );
-                return;
-            }
-        };
         let actions = self
-            .get_or_init_avss_secmsg(round, dealer)
-            .handle_cipher_dispersal(wire_sender, entries);
+            .with_avss_secmsg_state(round, dealer, move |mut state| {
+                let entries: Vec<DispersalEntry> = match bincode::deserialize(&payload) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        log::warn!(
+                            "[PPT][SECMSG-AVSS][CIPHER-DISP] dropping malformed \
+                             cipher-dispersal from {} for (round={}, dealer={}): {}",
+                            wire_sender, round, dealer, e
+                        );
+                        return (state, Vec::new());
+                    }
+                };
+                let acts = state.handle_cipher_dispersal(wire_sender, entries);
+                (state, acts)
+            })
+            .await;
         self.dispatch_avss_secmsg_actions(round, dealer, actions).await;
     }
 
@@ -268,20 +346,23 @@ impl Context {
         payload: Vec<u8>,
         wire_sender: Replica,
     ) {
-        let echo: EchoPayload = match bincode::deserialize(&payload) {
-            Ok(v) => v,
-            Err(e) => {
-                log::warn!(
-                    "[PPT][SECMSG-AVSS][CIPHER-ECHO] dropping malformed cipher-echo \
-                     from {} for (round={}, dealer={}): {}",
-                    wire_sender, round, dealer, e
-                );
-                return;
-            }
-        };
         let actions = self
-            .get_or_init_avss_secmsg(round, dealer)
-            .handle_cipher_echo(wire_sender, echo);
+            .with_avss_secmsg_state(round, dealer, move |mut state| {
+                let echo: EchoPayload = match bincode::deserialize(&payload) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        log::warn!(
+                            "[PPT][SECMSG-AVSS][CIPHER-ECHO] dropping malformed \
+                             cipher-echo from {} for (round={}, dealer={}): {}",
+                            wire_sender, round, dealer, e
+                        );
+                        return (state, Vec::new());
+                    }
+                };
+                let acts = state.handle_cipher_echo(wire_sender, echo);
+                (state, acts)
+            })
+            .await;
         self.dispatch_avss_secmsg_actions(round, dealer, actions).await;
     }
 
@@ -294,8 +375,11 @@ impl Context {
         wire_sender: Replica,
     ) {
         let actions = self
-            .get_or_init_avss_secmsg(round, dealer)
-            .handle_cipher_vote(wire_sender, meta_root);
+            .with_avss_secmsg_state(round, dealer, move |mut state| {
+                let acts = state.handle_cipher_vote(wire_sender, meta_root);
+                (state, acts)
+            })
+            .await;
         self.dispatch_avss_secmsg_actions(round, dealer, actions).await;
     }
 
