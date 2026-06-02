@@ -8,14 +8,32 @@
 //! Sections 3, 4, and 5 of the paper:
 //!
 //! ```text
-//! Π_avss1 (Sec 5)        — top-level AVSS protocol [TODO commits 6-7]
-//!   ├─ F_Beacon (Sec 3.1)  — already provided by Context::theta_per_round / coin_per_round
-//!   ├─ F_ReliableBroadcast (Sec 3.2.2 = Π_CompactBroadcast)  [TODO commit 2]
-//!   ├─ F_OneSidedVote (Sec 3.2.5)                            [TODO commit 2]
-//!   └─ F_SecMsgDst (Sec 3.3 = Π_SecMsgDst Sec 4.3)           [TODO commit 5]
-//!       ├─ Π_RelMsgDst (Sec 4.1)                             [TODO commit 3]
-//!       └─ Π_SecKeyDst (Sec 4.2)                             [TODO commit 4]
+//! Π_avss1 (Sec 5)        — top-level AVSS protocol
+//!   ├─ F_Beacon (Sec 3.1)  — provided by Context::theta_per_round /
+//!   │                        coin_per_round (self-bootstrap; see
+//!   │                        acs::coin and context.rs).
+//!   ├─ F_ReliableBroadcast (Sec 3.2.2 = Π_CompactBroadcast)   ✓ commit 2
+//!   ├─ F_OneSidedVote (Sec 3.2.5)                              ✓ implicit in compact_broadcast
+//!   └─ F_SecMsgDst (Sec 3.3 = Π_SecMsgDst Sec 4.3)             ✓ commit 5 (sec_msg_dst)
+//!       ├─ Π_RelMsgDst (Sec 4.1)                               ✓ commit 3 (rel_msg_dst)
+//!       └─ Π_SecKeyDst (Sec 4.2)                               ✓ commit 4 (sec_key_dst)
 //! ```
+//!
+//! Commits 6 and 7 then wire the SecMsgDst stack into the live
+//! `Context` AVSS pipeline:
+//!
+//!   * **commit 6 (`avss_secmsg.rs`)** — receiver-side: lazily
+//!     creates per-(round, dealer) `SecMsgDstState`, routes wire
+//!     `AVSSSecMsgKey*` and `AVSSSecMsgCipher*` messages into it,
+//!     caches the broadcast `AVSSSecMsgPublicCommit`, and on
+//!     `DeliveredMessage` synthesises an equivalent-shape
+//!     `BeaconMsg` for the existing `process_avss_send` quorum.
+//!   * **commit 7 (`batch_wssinit.rs`)** — dealer-side cutover: the
+//!     dealer no longer broadcasts cleartext `AVSSSend(BeaconMsg)`
+//!     n times; instead it broadcasts `AVSSSecMsgPublicCommit`
+//!     (root_vec + degree_test_coeffs + transcript-binding hash)
+//!     once and disperses per-recipient confidential payloads via
+//!     Π_SecMsgDst.
 //!
 //! The implementation is built on top of the **lightweight**
 //! cryptographic primitives the paper requires: hash functions
@@ -28,9 +46,9 @@
 //!
 //! Each submodule below exposes a state-machine API plus an
 //! `Action` enum for side effects, mirroring the existing
-//! `acs::aba` / `acs::rbc` patterns. The driver code in
-//! `consensus/ppt_beacon/src/node/process.rs` will eventually wire
-//! these state machines into `Context` (commits 6-7).
+//! `acs::aba` / `acs::rbc` patterns. The wiring driver lives in
+//! `node::avss_secmsg` (receiver) and `node::batch_wss::batch_wssinit`
+//! (dealer).
 
 pub mod reed_solomon;
 pub mod compact_broadcast;
