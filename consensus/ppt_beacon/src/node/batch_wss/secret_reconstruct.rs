@@ -579,7 +579,12 @@ impl Context {
         };
 
         for (coin_num, beacon) in pending.into_iter() {
-            log::info!(
+            // Per-coin flush log demoted to debug: at batch=1000
+            // this fires ~1000 times per round per node. Kept as
+            // debug for forensics. The aggregate [STAGE][BEACON-OUT]
+            // marker in `self_coin_check_transmit` plus the
+            // round-level events still surface in INFO mode.
+            log::debug!(
                 "[PPT][BEACON-FLUSH] node {} round {} flushing coin {} via {}",
                 self.myid,
                 round,
@@ -1681,7 +1686,14 @@ impl Context {
      */
     #[async_recursion]
     pub async fn self_coin_check_transmit(&mut self, round: Round, coin_num: usize, number: Vec<u8>) {
-        log::info!(
+        // Per-coin BEACON-OUT marker demoted to debug. The
+        // round-level [STAGE][ACS-DECIDE] / [STAGE][RECON-START]
+        // markers above + the syncer-side BeaconRecon sync_send
+        // below are sufficient for production tracking; per-coin
+        // INFO logs at batch=1000 cost ~500 ms of synchronous
+        // stderr work per round on the consensus main task,
+        // measured directly in production benchmarks.
+        log::debug!(
             "[PPT][STAGE][BEACON-OUT] node {} round {} coin {}",
             self.myid,
             round,

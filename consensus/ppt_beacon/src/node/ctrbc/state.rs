@@ -445,7 +445,17 @@ impl CTRBCState {
 
         for dealer in decided_sorted.iter().copied() {
             let sec = recon_map.get(&dealer).unwrap();
-            log::info!(
+            // Demoted from `info` -> `debug`: this fires once per
+            // (coin, dealer) inside the bulk reconstruct loop.
+            // For batch=1000 / n_decided=15 that is 15000 log
+            // lines per round per node, each of which formats a
+            // BigUint -- empirically ~300-500 ms of synchronous
+            // stderr work per round at INFO level, which the
+            // main consensus loop pays directly in
+            // `recover_and_emit_coin_set`. Useful for forensics;
+            // not useful in steady-state production. Re-enable
+            // with `RUST_LOG=ppt_beacon=debug` when debugging.
+            log::debug!(
                 "[PPT][COIN-CHECK] round {} coin {} including dealer {} reconstructed secret {}",
                 round,
                 coin_number,
@@ -457,7 +467,12 @@ impl CTRBCState {
 
         let rand_fin = sum_vars % self.secret_domain.clone();
 
-        log::info!(
+        // Per-coin "beacon value computed" log demoted to debug
+        // for the same reason: this fires `batch_size` times per
+        // round (1000 lines at batch=1000) and adds no
+        // operational value over the round-level [STAGE][BEACON-OUT]
+        // marker. Re-enable via debug for per-coin tracing.
+        log::debug!(
             "[PPT][COIN-CHECK] round {} coin {} pure-PPT beacon value computed (mod p)",
             round,
             coin_number

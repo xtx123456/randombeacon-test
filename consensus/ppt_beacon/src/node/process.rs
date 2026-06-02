@@ -231,7 +231,13 @@ pub(crate) fn avss_local_packet_valid_pure(
 }
 
 impl Context {
-    pub fn check_proposal(self: &Context, wrapper_msg: Arc<WrapperMsg>) -> bool {
+    /// MAC-verify an inbound wrapper. Takes `&WrapperMsg` (was
+    /// `Arc<WrapperMsg>`) so the caller no longer needs to clone
+    /// the entire enclosed `protmsg` payload just to pass it
+    /// here. For inbound BatchBeaconConstruct at batch=1000 the
+    /// pre-clone alone was ~4.5 MB per message; eliminating it
+    /// saves tens of MB of memory bandwidth per round per node.
+    pub fn check_proposal(self: &Context, wrapper_msg: &WrapperMsg) -> bool {
         let byte_val =
             bincode::serialize(&wrapper_msg.protmsg).expect("Failed to serialize object");
 
@@ -251,8 +257,7 @@ impl Context {
     pub(crate) async fn process_msg(self: &mut Context, wrapper_msg: WrapperMsg) {
         log::debug!("Received protocol msg: {:?}", wrapper_msg);
 
-        let msg = Arc::new(wrapper_msg.clone());
-        if self.check_proposal(msg) {
+        if self.check_proposal(&wrapper_msg) {
             self.num_messages += 1;
             self.choose_fn(wrapper_msg).await;
         } else {
@@ -264,7 +269,13 @@ impl Context {
     }
 
     pub(crate) async fn choose_fn(self: &mut Context, wrapper_msg: WrapperMsg) {
-        match wrapper_msg.clone().protmsg {
+        // Destructure WrapperMsg by ownership rather than cloning
+        // `protmsg` just to match on it. The old `wrapper_msg.clone()
+        // .protmsg` pattern cloned the entire inbound payload --
+        // ~4.5 MB for BatchBeaconConstruct at batch=1000 -- on the
+        // consensus main task before we could even dispatch.
+        let wire_sender = wrapper_msg.sender;
+        match wrapper_msg.protmsg {
             // Legacy cleartext AVSSSend from a peer running an older
             // binary. Commit 7 cut the dealer over to the
             // Shoup-Smart 2024 SecMsgDst path (AVSSSecMsgPublicCommit
@@ -416,28 +427,28 @@ impl Context {
                     round,
                     proposer,
                     payload.len(),
-                    wrapper_msg.sender
+                    wire_sender
                 );
-                if wrapper_msg.sender != proposer {
+                if wire_sender != proposer {
                     log::warn!(
                         "[PPT][ACS-RBC] dropping ACSRbcSend round {} proposer {} sent by wire {} (sender mismatch)",
-                        round, proposer, wrapper_msg.sender
+                        round, proposer, wire_sender
                     );
                 } else {
                     self.process_acs_rbc_send(round, proposer, payload).await;
                 }
             }
             CoinMsg::ACSRbcEcho(round, proposer, payload_hash) => {
-                self.process_acs_rbc_echo(round, proposer, wrapper_msg.sender, payload_hash).await;
+                self.process_acs_rbc_echo(round, proposer, wire_sender, payload_hash).await;
             }
             CoinMsg::ACSRbcReady(round, proposer, payload_hash) => {
-                self.process_acs_rbc_ready(round, proposer, wrapper_msg.sender, payload_hash).await;
+                self.process_acs_rbc_ready(round, proposer, wire_sender, payload_hash).await;
             }
             CoinMsg::ACSAbaBval(round, aba_instance_id, aba_round, value) => {
-                self.process_acs_aba_bval(round, aba_instance_id, aba_round, value, wrapper_msg.sender).await;
+                self.process_acs_aba_bval(round, aba_instance_id, aba_round, value, wire_sender).await;
             }
             CoinMsg::ACSAbaAux(round, aba_instance_id, aba_round, value) => {
-                self.process_acs_aba_aux(round, aba_instance_id, aba_round, value, wrapper_msg.sender).await;
+                self.process_acs_aba_aux(round, aba_instance_id, aba_round, value, wire_sender).await;
             }
             // ---- Shoup-Smart 2024 SecMsgDst-routed AVSS (commit 6 receiver-side) ----
             //
@@ -452,38 +463,38 @@ impl Context {
                 // doc-comment on
                 // `process_avss_secmsg_public_commit` for the
                 // dealer-framing attack this guards against.
-                self.process_avss_secmsg_public_commit(commit_msg, wrapper_msg.sender)
+                self.process_avss_secmsg_public_commit(commit_msg, wire_sender)
                     .await;
             }
             CoinMsg::AVSSSecMsgKeyDispersal(round, dealer, payload) => {
                 self.process_avss_secmsg_key_dispersal(
-                    round, dealer, payload, wrapper_msg.sender,
+                    round, dealer, payload, wire_sender,
                 )
                 .await;
             }
             CoinMsg::AVSSSecMsgKeyEcho(round, dealer, payload) => {
-                self.process_avss_secmsg_key_echo(round, dealer, payload, wrapper_msg.sender)
+                self.process_avss_secmsg_key_echo(round, dealer, payload, wire_sender)
                     .await;
             }
             CoinMsg::AVSSSecMsgKeyVote(round, dealer, meta_root) => {
-                self.process_avss_secmsg_key_vote(round, dealer, meta_root, wrapper_msg.sender)
+                self.process_avss_secmsg_key_vote(round, dealer, meta_root, wire_sender)
                     .await;
             }
             CoinMsg::AVSSSecMsgCipherDispersal(round, dealer, payload) => {
                 self.process_avss_secmsg_cipher_dispersal(
-                    round, dealer, payload, wrapper_msg.sender,
+                    round, dealer, payload, wire_sender,
                 )
                 .await;
             }
             CoinMsg::AVSSSecMsgCipherEcho(round, dealer, payload) => {
                 self.process_avss_secmsg_cipher_echo(
-                    round, dealer, payload, wrapper_msg.sender,
+                    round, dealer, payload, wire_sender,
                 )
                 .await;
             }
             CoinMsg::AVSSSecMsgCipherVote(round, dealer, meta_root) => {
                 self.process_avss_secmsg_cipher_vote(
-                    round, dealer, meta_root, wrapper_msg.sender,
+                    round, dealer, meta_root, wire_sender,
                 )
                 .await;
             }
@@ -498,7 +509,7 @@ impl Context {
             // post-ACS audit all stay shared with the secmsg path.
             CoinMsg::AVSSPrivatePayload(round, dealer, payload) => {
                 self.process_avss_private_payload(
-                    round, dealer, payload, wrapper_msg.sender,
+                    round, dealer, payload, wire_sender,
                 )
                 .await;
             }
