@@ -44,6 +44,62 @@ use super::{CTRBCState, Handler, SyncHandler};
 /// without a previous beacon being available.
 pub const PPT_GENESIS_THETA_SEED: &[u8] = b"PPT_BEACON_GENESIS_THETA_v1";
 
+/// AVSS transport selector for the PPT random beacon.
+///
+/// The PPT scheme needs to deliver dealer-to-recipient confidential
+/// share material once per round per dealer. Two transports satisfy
+/// this requirement:
+///
+/// * **`Lite`** (default) — direct cleartext per-recipient unicast
+///   of `AvssRecipientPayload` (still HMAC-authenticated via the
+///   existing `WrapperMsg` + `sec_key_map` per-pair shared secret)
+///   plus a single broadcast `AvssPublicCommitMsg` carrying the
+///   public Merkle roots + degree-test coefficients. Wire complexity:
+///   `O(n)` messages per dealer per round.
+///
+///   Trust model: relies on the underlying wire transport (TLS or
+///   trusted LAN) to prevent passive eavesdroppers from reading the
+///   share material between AVSS dispersal and the post-ACS
+///   `MulticastRecoveredShares` broadcast (which reveals the same
+///   share material in cleartext for audit purposes anyway). This
+///   matches every other PPT wire message's threat model.
+///
+/// * **`SecMsg`** — Shoup-Smart 2024 Sec 4.3 Π_SecMsgDst transport:
+///   encrypts every per-recipient payload with a Shamir-shared
+///   master key + per-recipient hash-chain PRG stream, and disperses
+///   both the key shares and the ciphertexts via RBC-style RelMsgDst
+///   channels with full Bracha echo / vote agreement. Wire
+///   complexity: `O(n^2)` messages per dealer per round.
+///
+///   Trust model: tolerates passive wire eavesdroppers (no TLS
+///   required). Useful for paper-compliance testing and for
+///   deployments where the network layer cannot be relied upon for
+///   confidentiality.
+///
+/// Selected once at startup via the CLI `--transport=lite|secmsg`
+/// flag and pushed into `Context::transport`. Every honest node in
+/// a single deployment must agree on the same transport for the
+/// dealer set to converge in ACS (mixed transports would still
+/// converge because both wire variants are accepted on the
+/// receive side, but only one set of variants is ever emitted, so
+/// running mixed in one cluster is unsupported).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AvssTransport {
+    /// Default; see enum-level doc.
+    Lite,
+    /// Shoup-Smart Sec 4.3 (paper-compliant); see enum-level doc.
+    SecMsg,
+}
+
+impl AvssTransport {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AvssTransport::Lite => "lite",
+            AvssTransport::SecMsg => "secmsg",
+        }
+    }
+}
+
 /// PPT random-beacon node context (pure-PPT mode: frequency φ = 1,
 /// every honest node is always a dealer, no anytrust committee, no
 /// legacy Binary-AA / Gather / CTRBC paths).
@@ -152,6 +208,20 @@ pub struct Context {
     pub avss_secmsg_public: HashMap<(Round, Replica), types::beacon::AvssPublicCommitMsg>,
     pub avss_secmsg_delivered_bytes: HashMap<(Round, Replica), Vec<u8>>,
 
+    /// Selected AVSS transport for this node's PPT deployment.
+    /// See `AvssTransport` enum docs for the design tradeoffs.
+    ///
+    /// The dealer-side path in `batch_wssinit.rs::ppt_launch_exact_round`
+    /// branches on this field at the top: `Lite` emits
+    /// `AvssPublicCommitMsg` broadcast + `AVSSPrivatePayload` per-
+    /// recipient unicasts; `SecMsg` emits the full Sec 4.3 Π_SecMsgDst
+    /// dispersal. The receive side accepts both wire variant
+    /// families regardless of the local setting (defensive against
+    /// a peer that erroneously runs the other transport; in well-
+    /// configured deployments this never matters because all nodes
+    /// agree on the same flag).
+    pub transport: AvssTransport,
+
     // ---- Audit fire-and-forget plumbing (P0-A.1) ----
     //
     // post-ACS audit (the bulk of `process_multicast_recovered_shares`)
@@ -201,6 +271,7 @@ impl Context {
         _sleep: u128,
         batch: usize,
         frequency: Round,
+        transport: AvssTransport,
     ) -> anyhow::Result<oneshot::Sender<()>> {
         let prot_payload = &config.prot_payload;
         let v: Vec<&str> = prot_payload.split(',').collect();
@@ -304,6 +375,8 @@ impl Context {
                 avss_secmsg_state: HashMap::default(),
                 avss_secmsg_public: HashMap::default(),
                 avss_secmsg_delivered_bytes: HashMap::default(),
+
+                transport,
 
                 num_messages: 0,
                 bench: HashMap::default(),
