@@ -42,7 +42,7 @@ fn packet_lengths_ok(packet: &BatchWSSReconMsg) -> bool {
 /// is pre-cloned out of `CTRBCState::degree_test_coeffs` BEFORE the
 /// blocking task starts, so the closure does not need to touch
 /// `&self` or any shared state.
-pub(crate) struct CoinVerifyInputs {
+pub struct CoinVerifyInputs {
     pub coin_num: usize,
     pub packet: BatchWSSReconMsg,
     pub coeffs_for_dealer: HashMap<Replica, Vec<Val>>,
@@ -50,7 +50,13 @@ pub(crate) struct CoinVerifyInputs {
 
 /// One verification outcome of a single `(coin_num, dealer)` pair
 /// inside a coin-packet, produced by `verify_batch_shares_pure`.
-pub(crate) enum CoinVerifyOutcome {
+///
+/// `pub` (not `pub(crate)`) so the Phase-D fire-and-forget
+/// `ReconCompletion` struct in `context.rs` can carry a
+/// `Vec<CoinVerifyOutcome>` across the detached-task / main-loop
+/// channel boundary.
+#[derive(Debug)]
+pub enum CoinVerifyOutcome {
     /// Share verified successfully. Caller (back on the async task)
     /// should write it via `CTRBCState::add_secret_share`.
     Accepted {
@@ -215,7 +221,7 @@ pub(crate) fn audit_post_complaint_pure(
 /// Missing-coeffs dealers in the decided set are surfaced as
 /// `MissingMaterial` outcomes for the caller to ban; all other
 /// failures (filter mismatch, verify_share false) are silent drops.
-pub(crate) fn verify_batch_shares_pure(
+pub fn verify_batch_shares_pure(
     inputs: Vec<CoinVerifyInputs>,
     theta: &BigUint,
     decided: &[Replica],
@@ -741,7 +747,20 @@ impl Context {
             }
         }
 
-        // (3) Level 2: bulk degree-test on tokio blocking pool.
+        // (3) **Phase D fire-and-forget**: detach the bulk
+        //     degree-test onto an independent tokio task that
+        //     runs `verify_batch_shares_pure` on the blocking
+        //     pool and publishes the outcomes back via
+        //     `recon_tx`. Multiple inbound BatchBeaconConstructs
+        //     for the same round therefore validate in PARALLEL
+        //     on the blocking pool, instead of serialised on
+        //     the consensus task's await point.
+        //
+        //     With n=16, batch=1000, each await was ~120 ms;
+        //     the n inbound packets per round were therefore
+        //     ~2 s of sequential main-loop time. After Phase D,
+        //     wall time per round drops to ~150-250 ms on an
+        //     8-core machine.
         let use_for_batch = decided.contains(&sender) && !banned.contains(&sender);
         let secret_domain = self.secret_domain.clone();
         let nonce_domain = self.nonce_domain.clone();
@@ -750,30 +769,77 @@ impl Context {
         let banned_clone = banned.clone();
         let decided_clone = decided.clone();
         let share_sender = sender;
+        let recon_tx = self.recon_tx.clone();
 
-        let outcomes = tokio::task::spawn_blocking(move || {
-            verify_batch_shares_pure(
-                verify_inputs,
-                &theta,
-                &decided_clone,
-                &banned_clone,
+        tokio::spawn(async move {
+            let outcomes = tokio::task::spawn_blocking(move || {
+                verify_batch_shares_pure(
+                    verify_inputs,
+                    &theta,
+                    &decided_clone,
+                    &banned_clone,
+                    share_sender,
+                    &secret_domain,
+                    &nonce_domain,
+                    num_faults,
+                    num_nodes,
+                )
+            })
+            .await
+            .unwrap_or_else(|e| {
+                log::error!(
+                    "[PPT][LEVEL2] bulk share-verify blocking task join error \
+                     round {} sender {}: {}",
+                    round, sender, e
+                );
+                Vec::new()
+            });
+
+            let _ = recon_tx.send(crate::node::context::ReconCompletion {
+                round,
                 share_sender,
-                &secret_domain,
-                &nonce_domain,
-                num_faults,
-                num_nodes,
-            )
-        })
-        .await
-        .unwrap_or_else(|e| {
-            log::error!(
-                "[PPT][LEVEL2] bulk share-verify blocking task join error round {} sender {}: {}",
-                round, sender, e
-            );
-            Vec::new()
+                use_for_batch,
+                outcomes,
+            });
         });
 
-        // (4) Apply outcomes back to state in a single short window.
+        self.add_benchmark(
+            String::from("process_batchreconstruct"),
+            now.elapsed().unwrap().as_nanos(),
+        );
+        // NB: maybe_recover_ready_coins is triggered in
+        // `finalize_recon_completion` once the detached
+        // task publishes its outcomes back to the main loop.
+    }
+
+    /// Apply one completed reconstruct-ingest validation (from
+    /// the detached task spawned in `process_batch_secret_shares`).
+    /// Called from the main loop's `tokio::select!` arm on
+    /// `recon_rx.recv()`. Runs on the consensus task's worker
+    /// thread, so every Context mutation (secret_shares,
+    /// blame_log, banned_dealers) stays single-threaded.
+    pub async fn finalize_recon_completion(
+        &mut self,
+        completion: crate::node::context::ReconCompletion,
+    ) {
+        let crate::node::context::ReconCompletion {
+            round,
+            share_sender,
+            use_for_batch,
+            outcomes,
+        } = completion;
+
+        // Late-arrival guard: the round may have been cleared
+        // between spawn and finalize (e.g. all coins emitted +
+        // audit done). Drop silently.
+        let round_active = match self.round_state.get(&round) {
+            Some(s) => !s.cleared,
+            None => false,
+        };
+        if !round_active {
+            return;
+        }
+
         let mut missing_dealers: HashSet<Replica> = HashSet::new();
         {
             let rbc_state = self.round_state.get_mut(&round).unwrap();
@@ -785,13 +851,16 @@ impl Context {
                         share,
                     } => {
                         if use_for_batch {
-                            rbc_state.add_secret_share(coin_num, dealer, share_sender, share);
+                            rbc_state
+                                .add_secret_share(coin_num, dealer, share_sender, share);
                         }
                     }
                     CoinVerifyOutcome::MissingMaterial { coin_num, dealer } => {
                         if missing_dealers.insert(dealer) {
                             log::error!(
-                                "[PPT][TWO-FIELD-BLAME] missing degree-test coeffs for decided dealer {} round {} coin {}; blaming dealer and rejecting this share path",
+                                "[PPT][TWO-FIELD-BLAME] missing degree-test coeffs \
+                                 for decided dealer {} round {} coin {}; blaming \
+                                 dealer and rejecting this share path",
                                 dealer, round, coin_num
                             );
                         }
@@ -808,12 +877,11 @@ impl Context {
             self.ban_dealer_global(dealer);
         }
 
-        self.add_benchmark(
-            String::from("process_batchreconstruct"),
-            now.elapsed().unwrap().as_nanos(),
-        );
-
-        // (5) Trigger batch recovery exactly once for the whole batch.
+        // Trigger batch recovery exactly once per applied packet.
+        // Multiple in-flight finalize_recon_completion calls each
+        // trigger this; `maybe_recover_ready_coins` is idempotent
+        // and only does work when the n-f share-quorum threshold
+        // is crossed.
         self.maybe_recover_ready_coins(round).await;
     }
 

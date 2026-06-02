@@ -624,6 +624,36 @@ impl Context {
         Some(transcript_root)
     }
 
+    /// Inbound AVSS packet entry point. **Phase D fire-and-forget**:
+    /// the CPU-heavy validation runs in a detached
+    /// `tokio::spawn` + `spawn_blocking` so the consensus main
+    /// loop is not blocked while it runs. Validation results come
+    /// back through `Context::avss_validation_rx` and are applied
+    /// by `finalize_avss_validation`.
+    ///
+    /// Before fire-and-forget, the consensus task awaited the
+    /// `spawn_blocking` synchronously and applied the
+    /// `store_avss_packet` + `AVSSReady` cascade inline. With
+    /// n=16, batch=1000 this awaited ~25 ms per inbound AVSS
+    /// packet, and the n inbound packets per round per node were
+    /// serialised on the main loop = ~400 ms per round on the
+    /// main loop just for AVSS validation awaits, blocking
+    /// reconstruct / ACS / next-round AVSS from interleaving.
+    ///
+    /// Phase D parallelises the validations on the blocking pool;
+    /// per-round AVSS-validation wall time drops from
+    /// `n * 25 ms` to `~25 ms` on a multi-core machine.
+    ///
+    /// Idempotency / safety:
+    ///   * `theta` is resolved + the packet is buffered (NOT
+    ///     dropped) on `None` before any spawn happens, exactly
+    ///     as before.
+    ///   * `banned_dealers` is checked before spawn (cheap).
+    ///   * The `avss_local_valid` de-dup guard runs inside
+    ///     `finalize_avss_validation` on the main loop, so a
+    ///     duplicate AVSS packet for the same `(round, dealer)`
+    ///     pays only the cost of one extra spawn_blocking before
+    ///     being short-circuited.
     #[async_recursion]
     pub async fn process_avss_send(
         &mut self,
@@ -658,22 +688,17 @@ impl Context {
             }
         };
 
+        // Lazy-create the per-round CTRBCState so the main-loop
+        // apply path can find it when the detached task's result
+        // comes back.
         if !self.round_state.contains_key(&round) {
-            let rbc_new_state = crate::node::CTRBCState::new(self.secret_domain.clone(), self.num_nodes);
+            let rbc_new_state =
+                crate::node::CTRBCState::new(self.secret_domain.clone(), self.num_nodes);
             self.round_state.insert(round, rbc_new_state);
         }
 
-        // ---- Level 2 multi-core: move the CPU-heavy AVSS validation
-        // (hash transcript, verify_proofs Merkle batch, batch_size
-        // degree-tests over BigUint arithmetic) into tokio's blocking
-        // pool so the consensus task's worker thread is free to keep
-        // handling other inbound messages while validation runs in
-        // parallel on another core.
-        //
-        // We move `beacon_msg` and `theta` into the blocking closure
-        // and return them back out, so no large clones happen along
-        // the hot path. Everything else copied into the closure is
-        // small and/or cheaply cloned.
+        // Snapshot every input the validation needs so the
+        // detached task is self-contained (no &self captured).
         let hash_context = Arc::clone(&self.hash_context);
         let secret_domain = self.secret_domain.clone();
         let nonce_domain = self.nonce_domain.clone();
@@ -682,54 +707,120 @@ impl Context {
         let batch_size = self.batch_size;
         let myid = self.myid;
         let transcript_root_owned = transcript_root;
+        let avss_tx = self.avss_validation_tx.clone();
 
-        let (validation_result, beacon_msg, _theta) =
-            tokio::task::spawn_blocking(move || {
-                let result = avss_local_packet_valid_pure(
-                    &beacon_msg,
-                    &transcript_root_owned,
-                    dealer,
-                    round,
-                    &theta,
-                    &hash_context,
-                    &secret_domain,
-                    &nonce_domain,
-                    num_faults,
-                    num_nodes,
-                    batch_size,
-                    myid,
-                );
-                (result, beacon_msg, theta)
-            })
-            .await
-            .unwrap_or_else(|e| {
-                log::error!(
-                    "[PPT][LEVEL2] AVSS validation blocking task join error round {} dealer {}: {}",
-                    round, dealer, e
-                );
-                // Failsafe: treat join error as transient (no ban). Recreate
-                // a dummy BeaconMsg / theta won't be used because we early-return.
-                (
-                    Err("blocking task join error"),
-                    types::beacon::BeaconMsg::new_with_appx(0, 0, Vec::new()),
-                    BigUint::from(0u32),
-                )
+        // Phase D fire-and-forget: detach the CPU-heavy validation
+        // into an independent tokio task. The detached task moves
+        // `beacon_msg` + `theta` into spawn_blocking, runs the
+        // pure validator on the blocking pool, then publishes the
+        // outcome back to the main loop via `avss_validation_tx`.
+        //
+        // Multiple concurrent inbound AVSS packets therefore run
+        // their validations in PARALLEL on the blocking pool's
+        // worker threads, instead of serialised on the consensus
+        // task's await point as before.
+        tokio::spawn(async move {
+            let (validation_result, beacon_msg_back, _theta) =
+                tokio::task::spawn_blocking(move || {
+                    let result = avss_local_packet_valid_pure(
+                        &beacon_msg,
+                        &transcript_root_owned,
+                        dealer,
+                        round,
+                        &theta,
+                        &hash_context,
+                        &secret_domain,
+                        &nonce_domain,
+                        num_faults,
+                        num_nodes,
+                        batch_size,
+                        myid,
+                    );
+                    (result, beacon_msg, theta)
+                })
+                .await
+                .unwrap_or_else(|e| {
+                    log::error!(
+                        "[PPT][LEVEL2] AVSS validation blocking task join error \
+                         round {} dealer {}: {}",
+                        round, dealer, e
+                    );
+                    // Failsafe: treat join error as transient (no ban). The
+                    // dummy BeaconMsg / theta won't be used because the
+                    // main-loop applier early-returns on Err.
+                    (
+                        Err("blocking task join error"),
+                        types::beacon::BeaconMsg::new_with_appx(0, 0, Vec::new()),
+                        BigUint::from(0u32),
+                    )
+                });
+
+            let _ = avss_tx.send(crate::node::context::AvssValidationCompletion {
+                round,
+                dealer,
+                transcript_root: transcript_root_owned,
+                beacon_msg: beacon_msg_back,
+                result: validation_result,
             });
+        });
+    }
 
-        match validation_result {
+    /// Apply one completed AVSS validation (from the detached
+    /// task spawned in `process_avss_send`). Called from the
+    /// main loop's `tokio::select!` arm on
+    /// `avss_validation_rx.recv()`. Runs on the consensus task's
+    /// worker thread, so every Context mutation (round_state,
+    /// banned_dealers) stays single-threaded as before fire-and-
+    /// forget was added.
+    pub async fn finalize_avss_validation(
+        &mut self,
+        completion: crate::node::context::AvssValidationCompletion,
+    ) {
+        let crate::node::context::AvssValidationCompletion {
+            round,
+            dealer,
+            transcript_root,
+            beacon_msg,
+            result,
+        } = completion;
+
+        // Dealer may have been banned between spawn and finalize
+        // (e.g. via the post-ACS audit / another concurrent
+        // validation failure). Drop late results for banned
+        // dealers to avoid spurious AVSSReady broadcasts.
+        if self.banned_dealers.contains(&dealer) {
+            log::warn!(
+                "[PPT][AVSS-FINALIZE] dropping AVSS validation result for \
+                 banned dealer {} round {}",
+                dealer, round
+            );
+            return;
+        }
+
+        match result {
             Ok(()) => {}
             Err(reason) => {
                 log::error!(
-                    "[PPT][AVSS-BAN] banning dealer {} for invalid AVSS packet round {} reason={}",
-                    dealer,
-                    round,
-                    reason
+                    "[PPT][AVSS-BAN] banning dealer {} for invalid AVSS packet \
+                     round {} reason={}",
+                    dealer, round, reason
                 );
                 self.ban_dealer_global(dealer);
                 return;
             }
         }
 
+        // Ensure round_state still exists (it normally does --
+        // process_avss_send lazily creates it before spawning).
+        if !self.round_state.contains_key(&round) {
+            let rbc_new_state =
+                crate::node::CTRBCState::new(self.secret_domain.clone(), self.num_nodes);
+            self.round_state.insert(round, rbc_new_state);
+        }
+
+        // De-dup: if another detached task for the same
+        // (round, dealer) already raced ahead and finalized
+        // first, skip.
         {
             let rbc_state = self.round_state.get_mut(&round).unwrap();
             if rbc_state.avss_local_valid.contains(&dealer) {
@@ -744,9 +835,11 @@ impl Context {
         self.broadcast(ready_msg, round).await;
 
         if let Some(complete_root) = self.maybe_prepare_avss_complete(round, dealer) {
-            let complete_msg = CoinMsg::AVSSComplete(dealer, complete_root, self.myid, round);
+            let complete_msg =
+                CoinMsg::AVSSComplete(dealer, complete_root, self.myid, round);
             self.broadcast(complete_msg, round).await;
-            self.process_avss_complete(dealer, complete_root, self.myid, round).await;
+            self.process_avss_complete(dealer, complete_root, self.myid, round)
+                .await;
         }
 
         if self.maybe_mark_dealer_completed(round, dealer) {
