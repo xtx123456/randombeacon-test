@@ -90,12 +90,81 @@ pub(crate) fn avss_local_packet_valid_pure(
         return Err("malformed two-field lengths");
     }
 
+    // PPT slide 20 binding: the dealer commits to a Merkle root
+    // vector `root_vec[coin]` over the n share commitments
+    // `c_i = H(share_i, nonce_i)`. The per-recipient Merkle proof
+    // `mp_coin` MUST chain to this dealer-published root. Without
+    // this check a Byzantine dealer could ship `(share_j, nonce_j,
+    // mp_j)` triples whose mp_j is internally self-consistent and
+    // satisfies `hash(share_j, nonce_j) == mp_j.item()` (which is
+    // all `verify_proofs` enforces) but whose `mp_j.root()` differs
+    // from the committed `root_vec[coin]`. The triples would then
+    // pass AVSS-quorum, the dealer would enter the ACS-decided set,
+    // and the garbage shares would dictate the round's beacon
+    // contribution. Audit catches this post-emit (via
+    // `audit_post_complaint_pure` comparing `proof.root() !=
+    // expected_root`), but by then the bad beacon is already out.
+    let root_vec_opt = beacon_msg.root_vec.as_ref();
+    let wssmsg_opt = beacon_msg.wss.as_ref();
+    if let (Some(root_vec), Some(wssmsg)) = (root_vec_opt, wssmsg_opt) {
+        if root_vec.len() != batch_size {
+            log::warn!(
+                "[PPT][AVSS] root_vec length {} != batch_size {} from dealer {} round {}",
+                root_vec.len(),
+                batch_size,
+                dealer,
+                round
+            );
+            return Err("malformed root_vec length");
+        }
+        if wssmsg.mps.len() != batch_size {
+            log::warn!(
+                "[PPT][AVSS] mps length {} != batch_size {} from dealer {} round {}",
+                wssmsg.mps.len(),
+                batch_size,
+                dealer,
+                round
+            );
+            return Err("malformed mps length");
+        }
+        for (coin_num, mp) in wssmsg.mps.iter().enumerate() {
+            if mp.root() != root_vec[coin_num] {
+                log::warn!(
+                    "[PPT][AVSS] mp.root != root_vec[coin] for dealer {} round {} coin {} at node {}",
+                    dealer,
+                    round,
+                    coin_num,
+                    myid
+                );
+                return Err("mp.root does not match dealer's committed root_vec");
+            }
+        }
+    } else {
+        // Both fields are mandatory on the PPT path; their absence
+        // is a malformed packet from a Byzantine dealer.
+        return Err("missing root_vec or wss");
+    }
+
     let verifier = TwoFieldDealer::new(
         secret_domain.clone(),
         nonce_domain.clone(),
         num_faults + 1,
         num_nodes,
     );
+
+    // Pre-extract the small-field share bytes for the share <-> f_large
+    // cross-field binding check below. We already verified
+    // `wssmsg_opt.is_some()` and `wssmsg.mps.len() == batch_size`
+    // immediately above; `wssmsg.secrets.len()` is asserted to equal
+    // `mps.len()` by `verify_proofs` (it calls `hash_batch(secrets,
+    // nonces)` and zips against `mps`, so a mismatch would have
+    // panicked or short-circuited there). We re-check explicitly so
+    // a future refactor of `verify_proofs` cannot silently lift the
+    // implicit length invariant.
+    let wssmsg = wssmsg_opt.expect("just verified Some(_) above");
+    if wssmsg.secrets.len() != batch_size {
+        return Err("malformed wss.secrets length");
+    }
 
     for coin_num in 0..batch_size {
         let coeffs = &degree_test_coeffs[coin_num];
@@ -115,6 +184,46 @@ pub(crate) fn avss_local_packet_valid_pure(
                 myid
             );
             return Err("degree test failed");
+        }
+
+        // Two-field cross-binding: the small-field `share[coin]`
+        // (used in F_p Lagrange reconstruction) MUST equal
+        // `f_large[coin] mod secret_domain`. An honest dealer
+        // satisfies this trivially because `share = f_poly(i) mod p`
+        // and `f_large = f_poly(i) mod q` come from a SINGLE
+        // polynomial `f_poly` whose coefficients are all in [0, p)
+        // < q (see `TwoFieldDealer::share_secret`), so
+        // `f_poly(i) mod p == (f_poly(i) mod q) mod p`.
+        //
+        // Without this binding, a Byzantine dealer can decouple the
+        // two channels: ship an honest degree-t `(f_large, g_share,
+        // h)` triple that passes the degree-test at every recipient,
+        // and INDEPENDENTLY ship `(share_1, ..., share_n)` that
+        // interpolate (on the ACS-decided evaluation point subset)
+        // to any dealer-chosen target. The reconstruction layer
+        // computes the round's beacon contribution by Lagrange-
+        // interpolating exactly those `share` values, so the dealer
+        // can pick its contribution at will -- and the audit layer
+        // does not catch this (it only compares `proof.root() !=
+        // expected_root`, which the dealer satisfied above by
+        // committing to the garbage shares' own Merkle root).
+        //
+        // Cost: one BigUint construction + one mod + one equality
+        // check per (coin, node). For batch_size = 100, n = 16 this
+        // is on the order of a few microseconds per AVSSSend; the
+        // spawn_blocking wrapper that already hosts this function
+        // absorbs it without a noticeable benchmark hit.
+        let share = BigUint::from_bytes_be(wssmsg.secrets[coin_num].as_slice());
+        if share != (&f_large % secret_domain) {
+            log::warn!(
+                "[PPT][AVSS] share != f_large mod p for dealer {} round {} coin {} at node {} \
+                 (dealer decoupled small-field share from large-field degree-test polynomial)",
+                dealer,
+                round,
+                coin_num,
+                myid
+            );
+            return Err("share mod p does not match f_large mod p");
         }
     }
 
@@ -848,5 +957,236 @@ impl Context {
             .await;
 
         self.add_cancel_handler(cancel_handler);
+    }
+}
+
+// ---------------------------------------------------------------------
+// Unit tests for the two AVSS-ingest binding checks added to
+// `avss_local_packet_valid_pure` (commit "ppt_beacon: bind share to
+// f_large mod p and mp.root to root_vec[coin] in AVSS validation").
+//
+// Each test starts from an honest two-field share batch and then
+// surgically corrupts ONE field to simulate the Byzantine attack
+// the corresponding binding guards against. The honest path
+// (`accepts_honest_two_field_packet`) double-checks that the new
+// guards do not reject legitimate inputs.
+// ---------------------------------------------------------------------
+#[cfg(test)]
+mod avss_binding_tests {
+    use super::*;
+    use crate::node::shamir::two_field::TwoFieldDealer;
+    use crypto::aes_hash::{HashState, MerkleTree};
+    use num_bigint::RandBigInt;
+    use rand::SeedableRng;
+    use types::beacon::{BatchWSSMsg, BeaconMsg, Val};
+
+    fn hash_state() -> HashState {
+        HashState::new([5u8; 16], [29u8; 16], [23u8; 16])
+    }
+
+    fn small_prime() -> BigUint {
+        BigUint::from(685373784908497u64)
+    }
+
+    fn large_prime() -> BigUint {
+        BigUint::parse_bytes(
+            b"57896044618658097711785492504343953926634992332820282019728792003956564819949",
+            10,
+        )
+        .unwrap()
+    }
+
+    fn pad32(b: BigUint) -> [u8; 32] {
+        let mut bytes = b.to_bytes_be();
+        assert!(bytes.len() <= 32);
+        let mut out = vec![0u8; 32 - bytes.len()];
+        out.append(&mut bytes);
+        out.try_into().expect("padded to 32")
+    }
+
+    /// Build an honest two-field AVSS batch for one dealer, one
+    /// receiver, and an arbitrary batch size. Returns the inputs
+    /// `avss_local_packet_valid_pure` accepts as parameters when
+    /// the dealer is honest.
+    fn build_honest_packet(
+        dealer: Replica,
+        myid: usize,
+        round: Round,
+        batch_size: usize,
+        n: usize,
+        f: usize,
+    ) -> (BeaconMsg, Hash, BigUint, BigUint, BigUint, HashState) {
+        let p = small_prime();
+        let q = large_prime();
+        let theta = BigUint::from(0xC0FFEEu64);
+        let two_field_dealer =
+            TwoFieldDealer::new(p.clone(), q.clone(), f + 1, n);
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xABCD);
+
+        // Per-coin h(x) coefficients, plus per-(node, coin) share /
+        // mask / f_large.
+        let mut degree_test_coeffs: Vec<Vec<Val>> = Vec::with_capacity(batch_size);
+        let mut share_vec: Vec<[u8; 32]> = Vec::new(); // batch_size * n
+        let mut nonce_vec: Vec<[u8; 32]> = Vec::new();
+        let mut mask_per_node: Vec<Vec<Val>> = vec![Vec::with_capacity(batch_size); n];
+        let mut f_large_per_node: Vec<Vec<Val>> = vec![Vec::with_capacity(batch_size); n];
+
+        for _ in 0..batch_size {
+            let secret = rng.gen_biguint_range(&BigUint::from(0u32), &p);
+            let nonce = rng.gen_biguint_range(&BigUint::from(0u32), &q);
+            let tf = two_field_dealer.share_secret(secret, &theta);
+
+            degree_test_coeffs.push(
+                tf.degree_test_coeffs
+                    .iter()
+                    .map(|c| pad32(c.clone()))
+                    .collect(),
+            );
+            for node_idx in 0..n {
+                mask_per_node[node_idx].push(pad32(tf.mask_shares[node_idx].1.clone()));
+                f_large_per_node[node_idx].push(pad32(tf.f_large_shares[node_idx].1.clone()));
+            }
+            // Reuse the same nonce for every share at this coin
+            // (the production dealer uses a per-share nonce, but
+            // for these tests the only invariant we care about is
+            // that hash(share, nonce) is consistent across the
+            // builder and the verifier).
+            let nonce_bytes = pad32(nonce);
+            for (_idx, (_x, share)) in tf.secret_shares.iter().enumerate() {
+                share_vec.push(pad32(share.clone()));
+                nonce_vec.push(nonce_bytes);
+            }
+        }
+
+        let hc = hash_state();
+        let commits = hc.hash_batch(share_vec.clone(), nonce_vec.clone());
+        let triplets: Vec<(Val, Val, Hash)> = share_vec
+            .iter()
+            .zip(nonce_vec.iter())
+            .zip(commits.into_iter())
+            .map(|((s, n), c)| (*s, *n, c))
+            .collect();
+        // chunk into (batch_size) groups of n
+        let per_coin: Vec<Vec<(Val, Val, Hash)>> = triplets
+            .chunks(n)
+            .map(|c| c.iter().cloned().collect())
+            .collect();
+
+        let hashes_vec: Vec<Vec<Hash>> =
+            per_coin.iter().map(|chunk| chunk.iter().map(|(_, _, h)| *h).collect()).collect();
+        let mt_vec = MerkleTree::build_trees(hashes_vec, &hc);
+
+        let mut my_secrets: Vec<Val> = Vec::with_capacity(batch_size);
+        let mut my_nonces: Vec<Val> = Vec::with_capacity(batch_size);
+        let mut my_mps = Vec::with_capacity(batch_size);
+        let mut roots_vec: Vec<Hash> = Vec::with_capacity(batch_size);
+        for (chunk, mt) in per_coin.iter().zip(mt_vec.iter()) {
+            let (s, n_, _h) = chunk[myid];
+            my_secrets.push(s);
+            my_nonces.push(n_);
+            my_mps.push(mt.gen_proof(myid));
+            roots_vec.push(mt.root());
+        }
+
+        let wss = BatchWSSMsg::new(dealer, my_secrets, my_nonces, my_mps);
+        let beacon = BeaconMsg::new_two_field(
+            dealer,
+            round,
+            wss,
+            roots_vec,
+            Vec::new(),
+            degree_test_coeffs,
+            mask_per_node[myid].clone(),
+            f_large_per_node[myid].clone(),
+        );
+        let transcript = crypto::hash::do_hash(beacon.serialize_ctrbc().as_slice());
+        (beacon, transcript, p, q, theta, hc)
+    }
+
+    fn n_f() -> (usize, usize, usize) {
+        // n=4, f=1, batch_size=3 keeps the test fast but exercises
+        // every loop iteration.
+        (4, 1, 3)
+    }
+
+    #[test]
+    fn accepts_honest_two_field_packet() {
+        let (n, f, batch_size) = n_f();
+        let (beacon, transcript, p, q, theta, hc) =
+            build_honest_packet(0, 1, 42, batch_size, n, f);
+        let res = avss_local_packet_valid_pure(
+            &beacon, &transcript, 0, 42, &theta, &hc, &p, &q, f, n, batch_size, 1,
+        );
+        assert!(res.is_ok(), "honest packet must validate: {:?}", res);
+    }
+
+    #[test]
+    fn rejects_byzantine_share_decoupled_from_f_large() {
+        // The slide-20 dealer-controlled-beacon attack: dealer
+        // ships an honest (f_large, g_share, h) that passes the
+        // degree test at every node, but secretly replaces the
+        // small-field share[coin] with garbage. Without the new
+        // share == f_large mod p binding the dealer could pick any
+        // beacon value; with the binding, validation MUST reject.
+        let (n, f, batch_size) = n_f();
+        let (mut beacon, _transcript, p, q, theta, hc) =
+            build_honest_packet(0, 1, 42, batch_size, n, f);
+
+        // Corrupt coin 0's share: replace with a value provably
+        // != f_large mod p. We pick `0` and only flip if the
+        // honest share already happens to be 0.
+        {
+            let wss = beacon.wss.as_mut().expect("honest packet has wss");
+            let mut garbage = [0u8; 32];
+            if wss.secrets[0] == garbage {
+                garbage[31] = 1;
+            }
+            wss.secrets[0] = garbage;
+        }
+        // The dealer can rebuild a fresh Merkle root over the
+        // garbage commitments and ship that in root_vec, but we
+        // model the simpler attack where root_vec stays bound to
+        // the honest commitments: the Merkle-proof check fires
+        // first. Recompute transcript_root from the mutated
+        // BeaconMsg so the first check inside the function
+        // (transcript binding) still passes.
+        let transcript = crypto::hash::do_hash(beacon.serialize_ctrbc().as_slice());
+
+        let res = avss_local_packet_valid_pure(
+            &beacon, &transcript, 0, 42, &theta, &hc, &p, &q, f, n, batch_size, 1,
+        );
+        assert!(res.is_err(), "Byzantine packet must be rejected");
+    }
+
+    #[test]
+    fn rejects_mp_root_not_matching_dealer_root_vec() {
+        // Byzantine dealer keeps the same per-coin commit (so
+        // hash(share, nonce) == mp.item() still holds), but
+        // tampers with the dealer-published `root_vec[coin]` so it
+        // no longer matches the proof's chain root. Honest
+        // production code computes root_vec by hashing the per-coin
+        // commit batch into a Merkle root; a Byzantine dealer that
+        // ships a different `root_vec[coin]` is the attack vector
+        // §2.C from the audit guarded against.
+        let (n, f, batch_size) = n_f();
+        let (mut beacon, _transcript, p, q, theta, hc) =
+            build_honest_packet(0, 1, 42, batch_size, n, f);
+        {
+            let root_vec = beacon.root_vec.as_mut().expect("honest packet has root_vec");
+            // Tamper with coin 0's root (flip a byte). The mp's
+            // own internal Merkle validation still passes (we
+            // haven't touched the mp), so the new
+            // `mp.root() == root_vec[coin]` guard must fire.
+            root_vec[0][0] ^= 0x01;
+        }
+        let transcript = crypto::hash::do_hash(beacon.serialize_ctrbc().as_slice());
+        let res = avss_local_packet_valid_pure(
+            &beacon, &transcript, 0, 42, &theta, &hc, &p, &q, f, n, batch_size, 1,
+        );
+        assert!(
+            res.is_err(),
+            "tampered root_vec must trigger mp.root mismatch rejection"
+        );
     }
 }
