@@ -256,6 +256,54 @@ pub enum CoinMsg{
     AVSSSecMsgCipherDispersal(Round, Replica, Vec<u8>),
     AVSSSecMsgCipherEcho(Round, Replica, Vec<u8>),
     AVSSSecMsgCipherVote(Round, Replica, Hash),
+
+    /// Lite AVSS transport (PPT pluggable-transport mode `lite`).
+    ///
+    /// Carries the dealer-to-recipient confidential `AvssRecipientPayload`
+    /// (bincode-encoded `Vec<u8>`) as a single direct unicast per
+    /// recipient, paired with a broadcast `AVSSSecMsgPublicCommit` for
+    /// the shared public Merkle roots + degree-test coefficients.
+    ///
+    /// `AVSSPrivatePayload(round, dealer, payload_bytes)`:
+    ///
+    ///   * `round` and `dealer` jointly identify the AVSS instance,
+    ///     matching the `(round, dealer)` keying used by the cached
+    ///     `AvssPublicCommitMsg` on the receiver side.
+    ///   * `payload_bytes` is `AvssRecipientPayload::serialize_bytes()`
+    ///     of the recipient-specific share, nonce, mask, f_large and
+    ///     Merkle-proof vectors.
+    ///   * The wrapper-level `WrapperMsg.sender` MUST equal `dealer`;
+    ///     the receiver-side handler enforces this (sender binding).
+    ///
+    /// This variant exists as a performance-oriented alternative to
+    /// the SS-AVSS Sec 4.3 `AVSSSecMsg*` transport above. The Sec 4.3
+    /// transport encrypts every per-recipient payload with a Shamir-
+    /// shared master key + per-recipient PRG stream, and disperses
+    /// it via two RBC-style channels (key + cipher). That gives
+    /// share confidentiality against passive wire eavesdroppers --
+    /// useful if the network layer is plaintext (no TLS).
+    ///
+    /// The PPT deployment, however:
+    ///   * already pairs every WrapperMsg with a per-pair HMAC and
+    ///     typically runs over a TLS-wrapped transport, so wire
+    ///     confidentiality is provided one layer below;
+    ///   * voluntarily multicasts every ACS-decided dealer's share
+    ///     vector in cleartext during the post-ACS audit phase
+    ///     (`MulticastRecoveredShares`), so the confidentiality
+    ///     window for any share is only a few hundred milliseconds
+    ///     between AVSS-deliver and reconstruction.
+    ///
+    /// Both properties make Sec 4.3's application-layer encryption
+    /// redundant for PPT. The lite transport therefore unicasts
+    /// `AvssRecipientPayload` in cleartext (still HMAC-authenticated
+    /// via WrapperMsg), reducing the AVSS phase from `O(n^2)` wire
+    /// messages per dealer per round to `O(n)`.
+    ///
+    /// PQ-safety unchanged: no new cryptographic primitives. The
+    /// trust model shift (relying on wire-layer confidentiality
+    /// rather than application-layer) is documented in
+    /// `ppt_beacon::node::context::AvssTransport`.
+    AVSSPrivatePayload(Round, Replica, Vec<u8>),
 }
 
 /// Public AVSS commitment broadcast once per (round, dealer).
@@ -625,6 +673,11 @@ mod shoup_smart_avss_wire_tests {
             CoinMsg::AVSSSecMsgCipherDispersal(7, 2, vec![6u8, 7u8]),
             CoinMsg::AVSSSecMsgCipherEcho(7, 2, vec![8u8]),
             CoinMsg::AVSSSecMsgCipherVote(7, 2, sample_root(0xAD)),
+            CoinMsg::AVSSPrivatePayload(
+                7,
+                2,
+                vec![9u8, 10u8, 11u8, 12u8, 13u8],
+            ),
         ];
         for c in cases {
             let bytes = bincode::serialize(&c).expect("ser");
@@ -635,5 +688,33 @@ mod shoup_smart_avss_wire_tests {
             let bytes2 = bincode::serialize(&parsed).expect("re-ser");
             assert_eq!(bytes, bytes2);
         }
+    }
+
+    #[test]
+    fn private_payload_carries_recipient_bytes_unchanged() {
+        // The lite transport ships AvssRecipientPayload's bincode-
+        // serialized bytes verbatim inside AVSSPrivatePayload.
+        // Round-trip a real-shaped payload to confirm the wire
+        // format does not corrupt it.
+        let payload = AvssRecipientPayload::new(
+            vec![sample_val(0x11), sample_val(0x12)],
+            vec![sample_val(0x21), sample_val(0x22)],
+            vec![sample_val(0x31), sample_val(0x32)],
+            vec![sample_val(0x41), sample_val(0x42)],
+            Vec::new(),
+        );
+        let bytes = payload.serialize_bytes();
+        let wire = CoinMsg::AVSSPrivatePayload(11, 5, bytes.clone());
+        let ser = bincode::serialize(&wire).expect("ser");
+        let parsed: CoinMsg = bincode::deserialize(&ser).expect("de");
+        let extracted_bytes = match parsed {
+            CoinMsg::AVSSPrivatePayload(11, 5, b) => b,
+            other => panic!("wrong variant after deserialize: {:?}",
+                std::mem::discriminant(&other)),
+        };
+        assert_eq!(extracted_bytes, bytes);
+        let recovered = AvssRecipientPayload::deserialize_bytes(&extracted_bytes)
+            .expect("recovered payload deserializes");
+        assert_eq!(recovered, payload);
     }
 }
