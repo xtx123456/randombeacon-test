@@ -92,11 +92,41 @@ impl Context {
     /// from `dealer`. Verifies the transcript-binding hash, caches
     /// the commit, and triggers `try_finalize_avss_secmsg` (which
     /// is a no-op until the matching SecMsgDst delivery also lands).
+    ///
+    /// `wire_sender` is the WrapperMsg-level sender that ferried
+    /// this commit. We MUST require `wire_sender == msg.origin`:
+    /// the commit's `transcript_root` is a public hash of the
+    /// (origin, round, root_vec, degree_test_coeffs) tuple, so
+    /// **any** node can compute a valid `transcript_root` for any
+    /// `origin` they choose. Without the sender-binding check a
+    /// single Byzantine node X could broadcast a fake commit with
+    /// `origin = Y` (some honest dealer) that arrives before Y's
+    /// real one; honest receivers would cache X's fake commit,
+    /// drop Y's real one as duplicate ("first-seen-wins"), then
+    /// when Y's SecMsgDst payload finally delivers
+    /// `try_finalize_avss_secmsg` would reconstruct a BeaconMsg
+    /// with X's fake `root_vec` + `degree_test_coeffs` and Y's
+    /// honest per-recipient share material. The two-field
+    /// degree-test would fail against the fake h(x) coefficients,
+    /// causing `process_avss_send` to `ban_dealer_global(Y)`. A
+    /// single Byzantine peer could thus frame every other honest
+    /// dealer simultaneously, ban them all in round 0, and stall
+    /// liveness permanently.
     #[async_recursion]
     pub async fn process_avss_secmsg_public_commit(
         &mut self,
         msg: AvssPublicCommitMsg,
+        wire_sender: Replica,
     ) {
+        if wire_sender != msg.origin {
+            log::warn!(
+                "[PPT][SECMSG-AVSS][PUB-COMMIT] node {} dropping public-commit \
+                 with wire_sender={} != origin={} (round={}) -- attempted dealer \
+                 framing",
+                self.myid, wire_sender, msg.origin, msg.round
+            );
+            return;
+        }
         if !msg.verify_transcript_root() {
             log::warn!(
                 "[PPT][SECMSG-AVSS][PUB-COMMIT] node {} rejecting public-commit \

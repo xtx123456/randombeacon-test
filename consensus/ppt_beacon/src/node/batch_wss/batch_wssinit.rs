@@ -323,7 +323,12 @@ impl Context {
         )
         .await;
         // Broadcast skips self; deliver our own commit synchronously.
-        self.process_avss_secmsg_public_commit(public_commit_for_self).await;
+        // wire_sender on the self-deliver path equals self.myid
+        // (== public_commit.origin), so the sender-binding check
+        // inside `process_avss_secmsg_public_commit` passes.
+        let myid = self.myid;
+        self.process_avss_secmsg_public_commit(public_commit_for_self, myid)
+            .await;
 
         // (2) Build per-recipient AvssRecipientPayload byte vectors.
         //     The ordering must match SecMsgDst's recipient_idx

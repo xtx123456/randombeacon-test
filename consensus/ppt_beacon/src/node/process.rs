@@ -338,7 +338,13 @@ impl Context {
             // plaintexts so commit 7 can flip the dealer cutover
             // atomically without changing the wire dispatcher again.
             CoinMsg::AVSSSecMsgPublicCommit(commit_msg) => {
-                self.process_avss_secmsg_public_commit(commit_msg).await;
+                // Sender-binding: only the dealer themselves may
+                // broadcast their own public commit. See the
+                // doc-comment on
+                // `process_avss_secmsg_public_commit` for the
+                // dealer-framing attack this guards against.
+                self.process_avss_secmsg_public_commit(commit_msg, wrapper_msg.sender)
+                    .await;
             }
             CoinMsg::AVSSSecMsgKeyDispersal(round, dealer, payload) => {
                 self.process_avss_secmsg_key_dispersal(
