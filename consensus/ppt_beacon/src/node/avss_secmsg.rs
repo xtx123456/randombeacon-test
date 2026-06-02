@@ -500,6 +500,95 @@ impl Context {
         }
     }
 
+    /// Receiver entry point for an `AVSSPrivatePayload` wire
+    /// message (the `Lite` transport's per-recipient unicast).
+    ///
+    /// Mirrors the role `on_avss_secmsg_delivered` plays for the
+    /// `SecMsg` transport: caches the cleartext bytes in
+    /// `avss_secmsg_delivered_bytes` and triggers
+    /// `try_finalize_avss_secmsg`, which validates the payload
+    /// against the cached `AvssPublicCommitMsg` and feeds the
+    /// reconstructed `BeaconMsg` into the legacy
+    /// `process_avss_send` quorum / ACS pipeline.
+    ///
+    /// Sender-binding: only the dealer themselves may ship their
+    /// own `AVSSPrivatePayload`. We MUST verify
+    /// `wire_sender == dealer` here -- otherwise a Byzantine peer X
+    /// could fabricate a payload "from dealer Y" containing
+    /// arbitrary garbage; honest receivers would cache it,
+    /// `try_finalize_avss_secmsg` would reconstruct a BeaconMsg
+    /// against Y's legitimate cached public commit, the two-field
+    /// degree test would fail, and Y would be banned. This mirrors
+    /// the framing-via-PublicCommit guard introduced in fix
+    /// `26e1995`; the lite transport's per-recipient unicast is
+    /// the second window the same attack class could exploit
+    /// without this check.
+    #[async_recursion]
+    pub async fn process_avss_private_payload(
+        &mut self,
+        round: Round,
+        dealer: Replica,
+        plaintext: Vec<u8>,
+        wire_sender: Replica,
+    ) {
+        if wire_sender != dealer {
+            log::warn!(
+                "[PPT][AVSS-LITE][PRIVATE] node {} dropping AVSSPrivatePayload \
+                 with wire_sender={} != dealer={} (round={}, |payload|={}) -- \
+                 attempted dealer framing",
+                self.myid,
+                wire_sender,
+                dealer,
+                round,
+                plaintext.len()
+            );
+            return;
+        }
+        if self.banned_dealers.contains(&dealer) {
+            log::warn!(
+                "[PPT][AVSS-LITE][PRIVATE] dropping AVSSPrivatePayload from \
+                 banned dealer {} for round {}",
+                dealer,
+                round
+            );
+            return;
+        }
+        let public_cached = self.avss_secmsg_public.contains_key(&(round, dealer));
+        log::info!(
+            "[PPT][AVSS-LITE][PRIVATE] node {} received AVSSPrivatePayload from \
+             dealer {} for round {} -- {} plaintext bytes (public-commit cached={})",
+            self.myid,
+            dealer,
+            round,
+            plaintext.len(),
+            public_cached
+        );
+        // Idempotent: if we already cached a payload for this
+        // (round, dealer), drop the duplicate. Honest dealers send
+        // exactly one AVSSPrivatePayload per recipient per round.
+        // A Byzantine dealer that ships a different payload after
+        // the first one is silently ignored at this layer; the
+        // first-cached value remains the one
+        // `try_finalize_avss_secmsg` validates against the cached
+        // public commit (this matches the first-cached-wins
+        // pattern of `avss_secmsg_public`).
+        if self
+            .avss_secmsg_delivered_bytes
+            .contains_key(&(round, dealer))
+        {
+            log::debug!(
+                "[PPT][AVSS-LITE][PRIVATE] dropping duplicate AVSSPrivatePayload \
+                 from dealer {} for round {} (first-cached-wins)",
+                dealer,
+                round
+            );
+            return;
+        }
+        self.avss_secmsg_delivered_bytes
+            .insert((round, dealer), plaintext);
+        self.try_finalize_avss_secmsg(round, dealer).await;
+    }
+
     /// Called when the per-(round, dealer) SecMsgDst state has
     /// fully delivered our own per-recipient AVSS payload. Caches
     /// the decrypted plaintext bytes and triggers

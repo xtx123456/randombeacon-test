@@ -487,6 +487,21 @@ impl Context {
                 )
                 .await;
             }
+            // ---- Lite AVSS transport (default; pluggable-transport mode 'lite') ----
+            //
+            // Wire complement of AVSSSecMsgPublicCommit: a single
+            // unicast per recipient carrying the dealer's
+            // bincode-serialized AvssRecipientPayload. The receiver
+            // handler caches the bytes and triggers the existing
+            // try_finalize_avss_secmsg path, so AVSSReady /
+            // AVSSComplete quorum, ACS hook, theta buffering, and
+            // post-ACS audit all stay shared with the secmsg path.
+            CoinMsg::AVSSPrivatePayload(round, dealer, payload) => {
+                self.process_avss_private_payload(
+                    round, dealer, payload, wrapper_msg.sender,
+                )
+                .await;
+            }
             _ => {}
         }
     }
