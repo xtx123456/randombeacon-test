@@ -842,6 +842,28 @@ impl Context {
             rbc_state.add_avss_ready_vote(dealer, self.myid, transcript_root);
         }
 
+        // Phase F2 -- the AVSS validation cascade has now completed
+        // for (round, dealer): `store_avss_packet` copied every field
+        // we need into `CTRBCState` (root_vec, degree_test_coeffs,
+        // mask_shares, f_large_shares, BatchWSSMsg). The two
+        // SecMsgDst-side caches that fed us here -- the
+        // `AvssPublicCommitMsg` and the decrypted
+        // `AvssRecipientPayload` plaintext bytes -- are dead weight
+        // from this point on. Drop them immediately to keep memory
+        // proportional to "currently-being-validated rounds" rather
+        // than "all rounds waiting for end-of-round
+        // maybe_release_round". At batch=1000 / n=16 this frees on
+        // the order of 5 MB per round per node.
+        //
+        // Late duplicate AVSSPrivatePayload / AVSSSecMsgPublicCommit
+        // arriving for the same (round, dealer) after this point are
+        // dropped by the `avss_local_valid` guards added to
+        // `process_avss_private_payload` and
+        // `process_avss_secmsg_public_commit`, so the drop here is
+        // safe: nothing will re-allocate these entries.
+        self.avss_secmsg_public.remove(&(round, dealer));
+        self.avss_secmsg_delivered_bytes.remove(&(round, dealer));
+
         let ready_msg = CoinMsg::AVSSReady(dealer, transcript_root, self.myid, round);
         self.broadcast(ready_msg, round).await;
 

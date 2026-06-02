@@ -1528,6 +1528,26 @@ impl Context {
                 return;
             }
 
+            // Phase F1 -- guard against late-arriving MulticastRecoveredShares:
+            // once the audit task has fired (post_complaint_complete=true), any
+            // additional inbound multicast for this round is unused (the audit's
+            // n-f quorum already cleared, and audit_post_complaint_pure was
+            // already invoked with the snapshot at that time). Pre-Phase-F1 we
+            // would still `.insert(sender, recovered)` here, accumulating
+            // ~4.5 MB per late arrival in a map that nobody consumes -- a
+            // direct OOM contributor at batch=1000 / n=16 (~67 MB per round
+            // just from stale insertions).
+            if rbc_state.post_complaint_complete {
+                log::debug!(
+                    "[PPT][POST-COMPLAINT-SKIP] node {} round {} already completed; \
+                     dropping late multicast from sender {}",
+                    self.myid,
+                    round,
+                    sender
+                );
+                return;
+            }
+
             // Latest snapshot from this sender overwrites previous one.
             rbc_state.post_complaint_packets.insert(sender, recovered);
 
@@ -1538,15 +1558,6 @@ impl Context {
                 rbc_state.post_complaint_packets.len(),
                 threshold
             );
-
-            if rbc_state.post_complaint_complete {
-                log::info!(
-                    "[PPT][POST-COMPLAINT-SKIP] node {} round {} already completed",
-                    self.myid,
-                    round
-                );
-                return;
-            }
 
             // Asynchronous completion rule: n-f snapshots are enough to run the audit.
             if rbc_state.post_complaint_packets.len() < threshold {
@@ -1559,10 +1570,29 @@ impl Context {
 
             rbc_state.post_complaint_complete = true;
 
+            // Phase F1 -- MOVE (not clone) `comm_vectors` and
+            // `post_complaint_packets` into the detached audit task. The
+            // only consumer of either map for this round is
+            // `audit_post_complaint_pure` inside the detached task; cloning
+            // here used to double the in-flight memory footprint by ~67 MB
+            // per round at batch=1000 / n=16, and the original copies in
+            // `rbc_state` were never read again before
+            // `maybe_release_round` cleared them. Using `mem::take` drops
+            // the rbc_state copies the moment the audit task takes
+            // ownership.
+            //
+            // Late-arriving AVSS validations that fire after this point
+            // would call `store_avss_packet`, which writes into the
+            // (now-empty) `comm_vectors` map. That is harmless: audit has
+            // already used the pre-take snapshot, and the new entries are
+            // small (one Hash per coin per dealer) and get cleared by
+            // `maybe_release_round` at round end. Safety / correctness:
+            // verified that no other code path reads either of these maps
+            // for `round` after the audit fires.
             Some((
                 rbc_state.acs_decided_set.clone().unwrap_or_default(),
-                rbc_state.comm_vectors.clone(),
-                rbc_state.post_complaint_packets.clone(),
+                std::mem::take(&mut rbc_state.comm_vectors),
+                std::mem::take(&mut rbc_state.post_complaint_packets),
                 senders,
             ))
         };

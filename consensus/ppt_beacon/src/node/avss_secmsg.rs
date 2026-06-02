@@ -203,6 +203,26 @@ impl Context {
         }
         let round = msg.round;
         let dealer = msg.origin;
+        // Phase F2 -- once the AVSS validation cascade has completed
+        // for this (round, dealer), the cached public commit is no
+        // longer needed (the BeaconMsg has already been stored in
+        // `CTRBCState`, and `try_finalize_avss_secmsg` would early-
+        // return on the same `avss_local_valid` check). Without this
+        // guard, a late-arriving duplicate AvssPublicCommit would
+        // re-cache a fresh `AvssPublicCommitMsg` (~tens of KB) in
+        // `avss_secmsg_public` that never gets released until
+        // `maybe_release_round` runs at end-of-round. Banned dealer
+        // already filtered above.
+        if let Some(rs) = self.round_state.get(&round) {
+            if rs.avss_local_valid.contains(&dealer) {
+                log::debug!(
+                    "[PPT][SECMSG-AVSS][PUB-COMMIT] node {} dropping public-commit \
+                     from already-validated dealer {} for round {} (phase F2 guard)",
+                    self.myid, dealer, round
+                );
+                return;
+            }
+        }
         // Idempotent: first-seen-wins. Byzantine dealer that
         // re-broadcasts a different commit is silently dropped.
         let newly_cached = match self.avss_secmsg_public.entry((round, dealer)) {
@@ -636,6 +656,26 @@ impl Context {
                 round
             );
             return;
+        }
+        // Phase F2 -- once the AVSS validation cascade has completed
+        // for this (round, dealer), the cached plaintext payload is
+        // no longer needed (BeaconMsg already stored in CTRBCState;
+        // `try_finalize_avss_secmsg` would early-return on the same
+        // `avss_local_valid` check anyway). Without this guard, a
+        // late-arriving duplicate AVSSPrivatePayload would re-insert
+        // ~340 KB (at batch=1000) into `avss_secmsg_delivered_bytes`
+        // that never gets released until `maybe_release_round` runs
+        // at end-of-round. This is the per-recipient analog of the
+        // `process_avss_secmsg_public_commit` guard above.
+        if let Some(rs) = self.round_state.get(&round) {
+            if rs.avss_local_valid.contains(&dealer) {
+                log::debug!(
+                    "[PPT][AVSS-LITE][PRIVATE] node {} dropping AVSSPrivatePayload \
+                     from already-validated dealer {} for round {} (phase F2 guard)",
+                    self.myid, dealer, round
+                );
+                return;
+            }
         }
         let public_cached = self.avss_secmsg_public.contains_key(&(round, dealer));
         log::info!(
