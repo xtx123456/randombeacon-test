@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    sync::Arc,
     time::SystemTime,
 };
 
@@ -20,7 +21,10 @@ use types::{
 
 use crate::node::{Context, CTRBCState};
 use crate::node::ctrbc::state::BlameReason;
-use crate::node::shamir::two_field::TwoFieldDealer;
+use crate::node::shamir::two_field::BatchExtractor;
+use crate::node::shoup_smart::proof_leaf_index;
+use crypto::aes_hash::HashState;
+use crypto::hash::Hash;
 use std::time::UNIX_EPOCH;
 use types::SyncMsg;
 use types::SyncState;
@@ -38,33 +42,35 @@ fn packet_lengths_ok(packet: &BatchWSSReconMsg) -> bool {
 /// `tokio::task::spawn_blocking` together with all the other
 /// coin-packets in the same `BatchBeaconConstruct` message.
 ///
-/// `coeffs_for_dealer[dealer] = degree_test_coeffs[dealer][coin_num]`
-/// is pre-cloned out of `CTRBCState::degree_test_coeffs` BEFORE the
-/// blocking task starts, so the closure does not need to touch
-/// `&self` or any shared state.
+/// `roots_for_dealer[dealer] = comm_vectors[dealer][coin_num]` is
+/// pre-cloned out of `CTRBCState::comm_vectors` BEFORE the blocking
+/// task starts, so the closure does not need to touch `&self` or any
+/// shared state. A share is accepted iff it carries a Merkle proof
+/// that chains to the dealer's committed root for this coin AND whose
+/// leaf index equals the relaying provider's id (binding the share to
+/// the correct evaluation point). This makes a relayed share
+/// unforgeable: a Byzantine provider can only relay the dealer's
+/// genuine committed share for its own slot, or withhold it.
 pub(crate) struct CoinVerifyInputs {
     pub coin_num: usize,
+    /// The relaying provider (== wire sender of the BeaconConstruct).
+    pub provider: Replica,
     pub packet: BatchWSSReconMsg,
-    pub coeffs_for_dealer: HashMap<Replica, Vec<Val>>,
+    pub roots_for_dealer: HashMap<Replica, Hash>,
 }
 
 /// One verification outcome of a single `(coin_num, dealer)` pair
-/// inside a coin-packet, produced by `verify_batch_shares_pure`.
+/// inside a coin-packet, produced by `verify_recon_shares_pure`.
 pub(crate) enum CoinVerifyOutcome {
-    /// Share verified successfully. Caller (back on the async task)
-    /// should write it via `CTRBCState::add_secret_share`.
+    /// Share verified successfully against the dealer's Merkle
+    /// commitment. Caller (back on the async task) should write it
+    /// via `CTRBCState::add_secret_share(coin_num, dealer, provider,
+    /// share)`.
     Accepted {
         coin_num: usize,
         dealer: Replica,
+        provider: Replica,
         share: Val,
-    },
-    /// Dealer is in the decided set but has no degree-test
-    /// coefficients stored locally for this coin → permanent ban
-    /// (matches the pre-Level-2 `MissingDegreeTestCoeffs` blame
-    /// path).
-    MissingMaterial {
-        coin_num: usize,
-        dealer: Replica,
     },
 }
 
@@ -195,43 +201,41 @@ pub(crate) fn audit_post_complaint_pure(
     blame_events
 }
 
-/// CPU-heavy bulk verifier for a whole batch of coin-packets. This
-/// is the body that used to run inline on the consensus task's
-/// worker thread for every `BatchBeaconConstruct` message it
-/// received. Lifting it into a pure free function (no `&self`,
-/// no `&CTRBCState`) lets the Level 2 hot path call it inside
-/// `tokio::task::spawn_blocking`, so the heavy degree-test +
-/// big-int arithmetic loop runs in tokio's blocking pool on
-/// another core in parallel with consensus message handling.
+/// CPU-heavy bulk verifier for a whole batch of coin-packets. The
+/// previous implementation relied on the two-field per-share degree
+/// test (`verify_share`) for integrity, but that check leaves the
+/// relaying provider one degree of freedom: a Byzantine provider can
+/// pick an arbitrary `f_large(i)` and set `g(i) = h(i) + θ·f_large(i)`
+/// so the degree-test relation holds while the small-field `share`
+/// it interpolates is garbage. Reconstruction then used a fixed set
+/// of providers and required ALL of them, so a single Byzantine
+/// provider could either corrupt the beacon or stall the round.
 ///
-/// **Contract identical to the previous inline loop in
-/// `ingest_secret_shares_only`**: a share is accepted iff
-///   - its dealer is in the ACS-decided set,
-///   - the dealer is not in the banned set,
-///   - degree-test coefficients for `(dealer, coin_num)` are
-///     locally available,
-///   - `verify_share(share_sender + 1, f_large, g_share, h_coeffs, theta)`
-///     returns true.
-/// Missing-coeffs dealers in the decided set are surfaced as
-/// `MissingMaterial` outcomes for the caller to ban; all other
-/// failures (filter mismatch, verify_share false) are silent drops.
-pub(crate) fn verify_batch_shares_pure(
+/// This verifier instead authenticates every relayed share against
+/// the **dealer's Merkle commitment**:
+///   - the dealer must be in the ACS-decided set and not banned,
+///   - the proof's leaf index must equal the relaying `provider`
+///     (binding the share to evaluation point `provider + 1`),
+///   - `hash(share, nonce)` must equal the proof's leaf item,
+///   - the proof must validate, and
+///   - the proof's root must equal the dealer's committed
+///     `root_vec[coin_num]` (supplied in `roots_for_dealer`).
+///
+/// Because the share is now bound to the dealer's canonical
+/// committed value, a Byzantine provider can only relay the genuine
+/// share for its own slot or withhold it — it can no longer inject a
+/// wrong value or equivocate. Reconstruction can therefore safely
+/// interpolate from ANY f+1 validated providers (see
+/// `recover_and_emit_coin_set`).
+///
+/// Lifting it into a pure free function (no `&self`, no `&CTRBCState`)
+/// lets the hot path call it inside `tokio::task::spawn_blocking`.
+pub(crate) fn verify_recon_shares_pure(
     inputs: Vec<CoinVerifyInputs>,
-    theta: &BigUint,
     decided: &[Replica],
     banned: &HashSet<Replica>,
-    share_sender: Replica,
-    secret_domain: &BigUint,
-    nonce_domain: &BigUint,
-    num_faults: usize,
-    num_nodes: usize,
+    hash_context: &HashState,
 ) -> Vec<CoinVerifyOutcome> {
-    let verifier = TwoFieldDealer::new(
-        secret_domain.clone(),
-        nonce_domain.clone(),
-        num_faults + 1,
-        num_nodes,
-    );
     let decided_set: HashSet<Replica> = decided.iter().copied().collect();
 
     let mut outcomes = Vec::new();
@@ -239,47 +243,61 @@ pub(crate) fn verify_batch_shares_pure(
     for input in inputs.into_iter() {
         let CoinVerifyInputs {
             coin_num,
+            provider,
             packet,
-            coeffs_for_dealer,
+            roots_for_dealer,
         } = input;
 
-        for ((((dealer, share), _nonce), mask_share), f_large_share) in packet
+        // Structurally validate every Merkle proof in the packet in
+        // one batch (matches the post-ACS audit, which is the trusted
+        // Merkle-validation path in this codebase). A single bad proof
+        // taints the whole packet from this provider; we simply skip
+        // it and rely on the other >= 2f+1 honest providers.
+        if packet.mps.is_empty() || !crypto::aes_hash::Proof::validate_batch(&packet.mps, hash_context) {
+            continue;
+        }
+
+        for (((dealer, share), nonce), mp) in packet
             .origins
             .iter()
             .zip(packet.secrets.iter())
             .zip(packet.nonces.iter())
-            .zip(packet.mask_shares.iter())
-            .zip(packet.f_large_shares.iter())
+            .zip(packet.mps.iter())
         {
             if !decided_set.contains(dealer) || banned.contains(dealer) {
                 continue;
             }
 
-            let coeffs = match coeffs_for_dealer.get(dealer) {
-                Some(coeffs) => coeffs,
-                None => {
-                    outcomes.push(CoinVerifyOutcome::MissingMaterial {
-                        coin_num,
-                        dealer: *dealer,
-                    });
-                    continue;
-                }
+            let expected_root = match roots_for_dealer.get(dealer) {
+                Some(root) => *root,
+                // No committed root locally yet: the assembly step
+                // is responsible for buffering such packets, so this
+                // should not normally be hit. Skip defensively.
+                None => continue,
             };
 
-            let f_large = BigUint::from_bytes_be(f_large_share);
-            let g_share = BigUint::from_bytes_be(mask_share);
-            let h_coeffs: Vec<BigUint> = coeffs
-                .iter()
-                .map(|bytes| BigUint::from_bytes_be(bytes.as_slice()))
-                .collect();
-
-            if !verifier.verify_share(share_sender + 1, &f_large, &g_share, &h_coeffs, theta) {
+            // Bind the share to evaluation point `provider + 1`.
+            if proof_leaf_index(mp) != provider as usize {
+                continue;
+            }
+            // Bind the proof to the dealer's committed root for this coin.
+            if mp.root() != expected_root {
+                continue;
+            }
+            // Bind (share, nonce) to the proof's committed leaf.
+            let item = hash_context
+                .hash_batch(vec![*share], vec![*nonce])
+                .into_iter()
+                .next()
+                .expect("hash_batch returned no item");
+            if item != mp.item() {
                 continue;
             }
 
             outcomes.push(CoinVerifyOutcome::Accepted {
                 coin_num,
                 dealer: *dealer,
+                provider,
                 share: *share,
             });
         }
@@ -321,11 +339,14 @@ fn filter_packet_to_decided(
     filtered
 }
 
-fn ready_coins(state: &CTRBCState, batch_size: usize) -> Vec<usize> {
-    let extractor = match state.batch_extractor.as_ref() {
-        Some(extractor) => extractor,
-        None => return Vec::new(),
-    };
+/// A coin is ready to reconstruct once EVERY ACS-decided dealer has
+/// at least `threshold = f+1` Merkle-validated provider shares
+/// available for that coin. We no longer require a fixed set of
+/// providers to all respond: any f+1 validated shares from any
+/// providers determine the degree-f polynomial, so a Byzantine node
+/// that withholds its reconstruction share can no longer prevent a
+/// coin from becoming ready (there are >= 2f+1 honest providers).
+fn ready_coins(state: &CTRBCState, batch_size: usize, threshold: usize) -> Vec<usize> {
     let decided = match state.acs_decided_set.as_ref() {
         Some(decided) => decided,
         None => return Vec::new(),
@@ -349,23 +370,9 @@ fn ready_coins(state: &CTRBCState, batch_size: usize) -> Vec<usize> {
         let mut coin_ready = true;
 
         for dealer in decided.iter().copied() {
-            let provider_map = match coin_map.get(&dealer) {
-                Some(provider_map) => provider_map,
-                None => {
-                    coin_ready = false;
-                    break;
-                }
-            };
-
-            for eval_point in extractor.eval_points.iter().copied() {
-                let provider = eval_point - 1;
-                if !provider_map.contains_key(&provider) {
-                    coin_ready = false;
-                    break;
-                }
-            }
-
-            if !coin_ready {
+            let have = coin_map.get(&dealer).map(|m| m.len()).unwrap_or(0);
+            if have < threshold {
+                coin_ready = false;
                 break;
             }
         }
@@ -378,21 +385,36 @@ fn ready_coins(state: &CTRBCState, batch_size: usize) -> Vec<usize> {
     ready
 }
 
-fn build_batch_matrix_for_coins(
+/// One per-(coin, dealer) reconstruction task: the f+1 lowest-indexed
+/// providers that supplied a validated share, packaged as the
+/// evaluation points (`provider + 1`) and the share values in the
+/// same order. Built on the async task before the heavy Lagrange
+/// interpolation is moved into `spawn_blocking`.
+struct DealerRecoverTask {
+    coin: usize,
+    dealer: Replica,
+    eval_points: Vec<usize>,
+    shares: Vec<BigUint>,
+}
+
+/// Build the per-(coin, dealer) reconstruction tasks for the given
+/// ready coins. For each decided dealer we deterministically pick the
+/// `threshold = f+1` lowest-indexed providers that have a validated
+/// share. For an honest dealer (genuine degree-f sharing) any such
+/// subset interpolates to the same f(0), so honest nodes that happen
+/// to have different provider subsets available still agree on the
+/// reconstructed secret.
+fn build_dealer_recover_tasks(
     state: &CTRBCState,
     ready_coin_nums: &[usize],
-    num_nodes: usize,
-) -> HashMap<usize, HashMap<usize, BigUint>> {
-    let extractor = state
-        .batch_extractor
-        .as_ref()
-        .expect("batch_extractor missing");
-    let decided = state
-        .acs_decided_set
-        .as_ref()
-        .expect("acs_decided_set missing");
+    threshold: usize,
+) -> Vec<DealerRecoverTask> {
+    let decided = match state.acs_decided_set.as_ref() {
+        Some(decided) => decided,
+        None => return Vec::new(),
+    };
 
-    let mut shares_matrix: HashMap<usize, HashMap<usize, BigUint>> = HashMap::new();
+    let mut tasks = Vec::new();
 
     for coin in ready_coin_nums.iter().copied() {
         let coin_map = match state.secret_shares.get(&coin) {
@@ -406,22 +428,29 @@ fn build_batch_matrix_for_coins(
                 None => continue,
             };
 
-            let mut entry: HashMap<usize, BigUint> = HashMap::new();
-
-            for eval_point in extractor.eval_points.iter().copied() {
-                let provider = eval_point - 1;
-                if let Some(share) = provider_map.get(&provider) {
-                    entry.insert(eval_point, share.clone());
-                }
+            let mut providers: Vec<usize> = provider_map.keys().copied().collect();
+            providers.sort_unstable();
+            if providers.len() < threshold {
+                continue;
             }
+            providers.truncate(threshold);
 
-            if !entry.is_empty() {
-                shares_matrix.insert(coin * num_nodes + dealer, entry);
-            }
+            let eval_points: Vec<usize> = providers.iter().map(|p| p + 1).collect();
+            let shares: Vec<BigUint> = providers
+                .iter()
+                .map(|p| provider_map.get(p).unwrap().clone())
+                .collect();
+
+            tasks.push(DealerRecoverTask {
+                coin,
+                dealer,
+                eval_points,
+                shares,
+            });
         }
     }
 
-    shares_matrix
+    tasks
 }
 
 fn build_local_multicast_snapshot(
@@ -680,31 +709,19 @@ impl Context {
             }
         };
 
-        let theta = match self.theta_for_round(round) {
-            Some(t) => t,
-            None => {
-                log::error!(
-                    "[PPT][THETA-MISS] node {} process_batch_secret_shares: θ for round {} not yet recorded; dropping whole batch from {}",
-                    self.myid,
-                    round,
-                    sender,
-                );
-                self.add_benchmark(
-                    String::from("process_batchreconstruct"),
-                    now.elapsed().unwrap().as_nanos(),
-                );
-                return;
-            }
-        };
-
-        // (2) Assemble per-packet inputs. Snapshot only the slice of
-        //     degree_test_coeffs the verifier actually needs, so the
-        //     blocking closure stays self-contained.
+        // (2) Assemble per-packet inputs. For each coin-packet we
+        //     snapshot the committed Merkle root of every decided
+        //     dealer present in the packet. If ANY decided dealer's
+        //     commitment vector is not yet locally available (a
+        //     transient async race where a reconstruction share
+        //     overtook its dealer's AVSS commitment), we buffer the
+        //     whole packet in `pending_recon_shares` for replay once
+        //     the commitment lands, rather than dropping it.
         let mut verify_inputs: Vec<CoinVerifyInputs> =
             Vec::with_capacity(recovered.packets.len());
         let decided_set: HashSet<Replica> = decided.iter().copied().collect();
         {
-            let rbc_state = self.round_state.get(&round).unwrap();
+            let rbc_state = self.round_state.get_mut(&round).unwrap();
             for entry in recovered.packets.into_iter() {
                 if !packet_lengths_ok(&entry.packet) {
                     log::warn!(
@@ -717,51 +734,58 @@ impl Context {
                 }
                 let coin_num = entry.coin_num;
                 let packet = entry.packet;
-                let mut coeffs_for_dealer: HashMap<Replica, Vec<Val>> = HashMap::new();
+
+                let mut roots_for_dealer: HashMap<Replica, Hash> = HashMap::new();
+                let mut missing_commitment = false;
                 for dealer in packet.origins.iter() {
                     if !decided_set.contains(dealer) || banned.contains(dealer) {
                         continue;
                     }
-                    if let Some(coeffs) = rbc_state
-                        .degree_test_coeffs
+                    match rbc_state
+                        .comm_vectors
                         .get(dealer)
-                        .and_then(|cs| cs.get(coin_num))
+                        .and_then(|roots| roots.get(coin_num))
                     {
-                        coeffs_for_dealer.insert(*dealer, coeffs.clone());
+                        Some(root) => {
+                            roots_for_dealer.insert(*dealer, *root);
+                        }
+                        None => {
+                            missing_commitment = true;
+                        }
                     }
-                    // Else: leave coeffs_for_dealer empty for this dealer
-                    // → verify_batch_shares_pure will surface it as a
-                    // MissingMaterial outcome and we'll ban below.
                 }
+
+                if missing_commitment {
+                    log::info!(
+                        "[PPT][RECON-DEFER] node {} buffering recon coin-packet from {} round {} coin {} until missing dealer commitment(s) arrive",
+                        self.myid, sender, round, coin_num
+                    );
+                    rbc_state
+                        .pending_recon_shares
+                        .push((packet, sender, coin_num));
+                    continue;
+                }
+
                 verify_inputs.push(CoinVerifyInputs {
                     coin_num,
+                    provider: sender,
                     packet,
-                    coeffs_for_dealer,
+                    roots_for_dealer,
                 });
             }
         }
 
-        // (3) Level 2: bulk degree-test on tokio blocking pool.
-        let use_for_batch = decided.contains(&sender) && !banned.contains(&sender);
-        let secret_domain = self.secret_domain.clone();
-        let nonce_domain = self.nonce_domain.clone();
-        let num_faults = self.num_faults;
-        let num_nodes = self.num_nodes;
+        // (3) Bulk Merkle-validation on the tokio blocking pool.
         let banned_clone = banned.clone();
         let decided_clone = decided.clone();
-        let share_sender = sender;
+        let hash_context = Arc::clone(&self.hash_context);
 
         let outcomes = tokio::task::spawn_blocking(move || {
-            verify_batch_shares_pure(
+            verify_recon_shares_pure(
                 verify_inputs,
-                &theta,
                 &decided_clone,
                 &banned_clone,
-                share_sender,
-                &secret_domain,
-                &nonce_domain,
-                num_faults,
-                num_nodes,
+                &hash_context,
             )
         })
         .await
@@ -774,7 +798,6 @@ impl Context {
         });
 
         // (4) Apply outcomes back to state in a single short window.
-        let mut missing_dealers: HashSet<Replica> = HashSet::new();
         {
             let rbc_state = self.round_state.get_mut(&round).unwrap();
             for outcome in outcomes.into_iter() {
@@ -782,30 +805,13 @@ impl Context {
                     CoinVerifyOutcome::Accepted {
                         coin_num,
                         dealer,
+                        provider,
                         share,
                     } => {
-                        if use_for_batch {
-                            rbc_state.add_secret_share(coin_num, dealer, share_sender, share);
-                        }
-                    }
-                    CoinVerifyOutcome::MissingMaterial { coin_num, dealer } => {
-                        if missing_dealers.insert(dealer) {
-                            log::error!(
-                                "[PPT][TWO-FIELD-BLAME] missing degree-test coeffs for decided dealer {} round {} coin {}; blaming dealer and rejecting this share path",
-                                dealer, round, coin_num
-                            );
-                        }
-                        rbc_state.blame_dealer(
-                            dealer,
-                            round,
-                            BlameReason::MissingDegreeTestCoeffs { coin_num },
-                        );
+                        rbc_state.add_secret_share(coin_num, dealer, provider, share);
                     }
                 }
             }
-        }
-        for dealer in missing_dealers.into_iter() {
-            self.ban_dealer_global(dealer);
         }
 
         self.add_benchmark(
@@ -817,193 +823,97 @@ impl Context {
         self.maybe_recover_ready_coins(round).await;
     }
 
-    fn ingest_secret_shares_only(
-        &mut self,
-        recon_shares: BatchWSSReconMsg,
-        share_sender: Replica,
-        coin_num: usize,
-        round: Round,
-    ) {
-        let now = SystemTime::now();
-        log::info!(
-            "[PPT][BATCH-INGEST] node {} ingesting coin-packet from {} for round {} coin {} origins {:?}",
-            self.myid,
-            share_sender,
-            round,
-            coin_num,
-            recon_shares.origins
-        );
-
-        if !self.round_state.contains_key(&round) {
-            let rbc_new_state = CTRBCState::new(self.secret_domain.clone(), self.num_nodes);
-            self.round_state.insert(round, rbc_new_state);
-        }
-
-        if !packet_lengths_ok(&recon_shares) {
-            log::warn!(
-                "[PPT][BATCH-INGEST] dropping malformed packet from {} round {} coin {}",
-                share_sender,
-                round,
-                coin_num
-            );
-            self.add_benchmark(
-                String::from("process_batchreconstruct"),
-                now.elapsed().unwrap().as_nanos(),
-            );
-            return;
-        }
-
-        let decided = {
-            let rbc_state = self.round_state.get_mut(&round).unwrap();
-
-            if rbc_state.cleared {
-                self.add_benchmark(
-                    String::from("process_batchreconstruct"),
-                    now.elapsed().unwrap().as_nanos(),
-                );
+    /// Re-validate reconstruction coin-packets that were buffered in
+    /// `pending_recon_shares` because a decided dealer's committed
+    /// root vector was not yet locally available. Called from
+    /// `maybe_recover_ready_coins` (which fires after every ingest)
+    /// and from the AVSS path once a new dealer commitment lands.
+    /// Packets whose commitments are still missing are kept buffered.
+    fn drain_pending_recon_shares(&mut self, round: Round) {
+        let (pending, decided, banned, hc) = {
+            let rbc_state = match self.round_state.get_mut(&round) {
+                Some(rbc_state) => rbc_state,
+                None => return,
+            };
+            if rbc_state.cleared || rbc_state.batch_reconstruction_complete {
+                rbc_state.pending_recon_shares.clear();
                 return;
             }
-
-            if rbc_state.batch_reconstruction_complete {
-                self.add_benchmark(
-                    String::from("process_batchreconstruct"),
-                    now.elapsed().unwrap().as_nanos(),
-                );
+            let decided = match rbc_state.acs_decided_set.clone() {
+                Some(d) => d,
+                None => return,
+            };
+            if rbc_state.pending_recon_shares.is_empty() {
                 return;
             }
-
-            match rbc_state.acs_decided_set.clone() {
-                Some(decided) => decided,
-                None => {
-                    log::warn!(
-                        "[PPT][BATCH-CACHE] node {} caching BeaconConstruct from {} for round {} coin {} until ACS finalization",
-                        self.myid,
-                        share_sender,
-                        round,
-                        coin_num
-                    );
-                    rbc_state
-                        .pre_acs_beacon_constructs
-                        .push((recon_shares, share_sender, coin_num));
-
-                    self.add_benchmark(
-                        String::from("process_batchreconstruct"),
-                        now.elapsed().unwrap().as_nanos(),
-                    );
-                    return;
-                }
-            }
+            (
+                std::mem::take(&mut rbc_state.pending_recon_shares),
+                decided,
+                self.banned_dealers.clone(),
+                Arc::clone(&self.hash_context),
+            )
         };
 
-        // θ for this round MUST be available by the time we reach
-        // ingest: ACS-decide implies AVSS-validate, which implies
-        // theta_for_round(round) was Some at AVSS time, which is
-        // monotone (θ is only ever inserted, never removed). If it
-        // is somehow None here, refuse to validate any share rather
-        // than panicking — dropping the packet is safe (the dealer
-        // can re-announce later via the recovered-share multicast)
-        // and we surface the anomaly via [PPT][THETA-MISS].
-        let theta = match self.theta_for_round(round) {
-            Some(t) => t,
-            None => {
-                log::error!(
-                    "[PPT][THETA-MISS] node {} ingest_secret_shares_only: θ for round {} not yet recorded; dropping packet from {} coin {}",
-                    self.myid,
-                    round,
-                    share_sender,
-                    coin_num
-                );
-                self.add_benchmark(
-                    String::from("process_batchreconstruct"),
-                    now.elapsed().unwrap().as_nanos(),
-                );
-                return;
-            }
-        };
-        let verifier = TwoFieldDealer::new(
-            self.secret_domain.clone(),
-            self.nonce_domain.clone(),
-            self.num_faults + 1,
-            self.num_nodes,
-        );
+        let decided_set: HashSet<Replica> = decided.iter().copied().collect();
+        let mut accepted: Vec<(usize, Replica, Replica, Val)> = Vec::new();
+        let mut still_pending: Vec<(BatchWSSReconMsg, Replica, usize)> = Vec::new();
 
-        let mut missing_material_dealers: HashSet<Replica> = HashSet::new();
-        let banned = self.banned_dealers.clone();
-
-        {
-            let rbc_state = self.round_state.get_mut(&round).unwrap();
-            let use_for_batch = decided.contains(&share_sender) && !banned.contains(&share_sender);
-
-            for ((((dealer, share), _nonce), mask_share), f_large_share) in recon_shares
-                .origins
-                .iter()
-                .zip(recon_shares.secrets.iter())
-                .zip(recon_shares.nonces.iter())
-                .zip(recon_shares.mask_shares.iter())
-                .zip(recon_shares.f_large_shares.iter())
+        for (packet, provider, coin_num) in pending.into_iter() {
+            let mut roots_for_dealer: HashMap<Replica, Hash> = HashMap::new();
+            let mut missing = false;
             {
-                if !decided.contains(dealer) || banned.contains(dealer) {
-                    continue;
-                }
-
-                let coeffs = match rbc_state
-                    .degree_test_coeffs
-                    .get(dealer)
-                    .and_then(|coins| coins.get(coin_num))
-                {
-                    Some(coeffs) => coeffs,
-                    None => {
-                        log::error!(
-                            "[PPT][TWO-FIELD-BLAME] missing degree-test coeffs for decided dealer {} round {} coin {}; blaming dealer and rejecting this share path",
-                            dealer,
-                            round,
-                            coin_num
-                        );
-                        missing_material_dealers.insert(*dealer);
+                let rbc_state = self.round_state.get(&round).unwrap();
+                for dealer in packet.origins.iter() {
+                    if !decided_set.contains(dealer) || banned.contains(dealer) {
                         continue;
                     }
-                };
+                    match rbc_state
+                        .comm_vectors
+                        .get(dealer)
+                        .and_then(|roots| roots.get(coin_num))
+                    {
+                        Some(root) => {
+                            roots_for_dealer.insert(*dealer, *root);
+                        }
+                        None => missing = true,
+                    }
+                }
+            }
 
-                let f_large = BigUint::from_bytes_be(f_large_share);
-                let g_share = BigUint::from_bytes_be(mask_share);
-                let h_coeffs: Vec<BigUint> = coeffs
-                    .iter()
-                    .map(|bytes| BigUint::from_bytes_be(bytes.as_slice()))
-                    .collect();
+            if missing {
+                still_pending.push((packet, provider, coin_num));
+                continue;
+            }
 
-                if !verifier.verify_share(share_sender + 1, &f_large, &g_share, &h_coeffs, &theta) {
-                    log::warn!(
-                        "[PPT][TWO-FIELD] dropped share_sender {} -> dealer {} round {} coin {} due to degree-test failure",
-                        share_sender,
+            let outcomes = verify_recon_shares_pure(
+                vec![CoinVerifyInputs {
+                    coin_num,
+                    provider,
+                    packet,
+                    roots_for_dealer,
+                }],
+                &decided,
+                &banned,
+                &hc,
+            );
+            for outcome in outcomes.into_iter() {
+                match outcome {
+                    CoinVerifyOutcome::Accepted {
+                        coin_num,
                         dealer,
-                        round,
-                        coin_num
-                    );
-                    continue;
-                }
-
-                if use_for_batch {
-                    rbc_state.add_secret_share(coin_num, *dealer, share_sender, *share);
+                        provider,
+                        share,
+                    } => accepted.push((coin_num, dealer, provider, share)),
                 }
             }
+        }
 
-            // Apply blame once per dealer for this packet/coin, instead of silently continuing.
-            for dealer in missing_material_dealers.iter().copied() {
-                rbc_state.blame_dealer(
-                    dealer,
-                    round,
-                    BlameReason::MissingDegreeTestCoeffs { coin_num },
-                );
+        if let Some(rbc_state) = self.round_state.get_mut(&round) {
+            for (coin_num, dealer, provider, share) in accepted.into_iter() {
+                rbc_state.add_secret_share(coin_num, dealer, provider, share);
             }
+            rbc_state.pending_recon_shares.extend(still_pending);
         }
-        for dealer in missing_material_dealers.into_iter() {
-            self.ban_dealer_global(dealer);
-        }
-
-        self.add_benchmark(
-            String::from("process_batchreconstruct"),
-            now.elapsed().unwrap().as_nanos(),
-        );
     }
     
     /// Public entry: recover every ready coin for `round` and emit
@@ -1051,7 +961,12 @@ impl Context {
     /// (every coin's commitment validation) is preserved verbatim.
     /// ACS three-property and PQ-safety are unchanged.
     #[async_recursion]
-    async fn maybe_recover_ready_coins(&mut self, round: Round) {
+    pub(crate) async fn maybe_recover_ready_coins(&mut self, round: Round) {
+        // First, retry any reconstruction packets that were buffered
+        // because a decided dealer's commitment had not yet arrived.
+        self.drain_pending_recon_shares(round);
+
+        let threshold = self.num_faults + 1;
         let ready_initial = {
             let rbc_state = match self.round_state.get(&round) {
                 Some(rbc_state) => rbc_state,
@@ -1060,7 +975,7 @@ impl Context {
             if rbc_state.batch_reconstruction_complete {
                 return;
             }
-            ready_coins(rbc_state, self.batch_size)
+            ready_coins(rbc_state, self.batch_size, threshold)
         };
 
         if ready_initial.is_empty() {
@@ -1101,7 +1016,7 @@ impl Context {
                 if rbc_state.batch_reconstruction_complete {
                     return;
                 }
-                ready_coins(rbc_state, self.batch_size)
+                ready_coins(rbc_state, self.batch_size, threshold)
             };
 
             if remaining.is_empty() {
@@ -1202,7 +1117,7 @@ impl Context {
             return;
         }
 
-        let (extractor, shares_matrix, decided) = {
+        let (tasks, decided) = {
             let rbc_state = match self.round_state.get(&round) {
                 Some(rbc_state) => rbc_state,
                 None => return,
@@ -1214,13 +1129,10 @@ impl Context {
                 .acs_decided_set
                 .clone()
                 .expect("ACS decided set missing during ready-coin recovery");
-            let extractor = rbc_state
-                .batch_extractor
-                .clone()
-                .expect("ACS-decided BatchExtractor missing");
-            let shares_matrix =
-                build_batch_matrix_for_coins(rbc_state, coin_set.as_slice(), self.num_nodes);
-            (extractor, shares_matrix, decided)
+            let threshold = self.num_faults + 1;
+            let tasks =
+                build_dealer_recover_tasks(rbc_state, coin_set.as_slice(), threshold);
+            (tasks, decided)
         };
 
         log::info!(
@@ -1231,8 +1143,25 @@ impl Context {
         );
 
         // Heavy Lagrange interpolation runs on tokio's blocking pool.
-        let recovered = tokio::task::spawn_blocking(move || {
-            extractor.batch_recover(&shares_matrix)
+        // Each (coin, dealer) is reconstructed from its own f+1
+        // lowest-indexed validated providers; extractors are cached
+        // by the provider-set so the common case (the same f+1
+        // providers respond for every dealer) builds the Lagrange
+        // coefficients only once.
+        let secret_domain = self.secret_domain.clone();
+        let recovered: Vec<(usize, Replica, BigUint)> = tokio::task::spawn_blocking(move || {
+            let mut cache: HashMap<Vec<usize>, BatchExtractor> = HashMap::new();
+            let mut out = Vec::with_capacity(tasks.len());
+            for task in tasks.into_iter() {
+                let extractor = cache
+                    .entry(task.eval_points.clone())
+                    .or_insert_with(|| {
+                        BatchExtractor::new(task.eval_points.clone(), secret_domain.clone())
+                    });
+                let secret = extractor.recover_one(&task.shares);
+                out.push((task.coin, task.dealer, secret));
+            }
+            out
         })
         .await
         .unwrap_or_else(|e| {
@@ -1249,10 +1178,7 @@ impl Context {
                 return;
             }
 
-            for (composite_key, secret) in recovered.into_iter() {
-                let coin = composite_key / self.num_nodes;
-                let dealer = composite_key % self.num_nodes;
-
+            for (coin, dealer, secret) in recovered.into_iter() {
                 rbc_state
                     .reconstructed_secrets
                     .entry(coin)
@@ -1374,10 +1300,19 @@ impl Context {
         coin_num: usize,
         round: Round,
     ) {
-        // Legacy / compatibility path:
-        // single packet ingest, then one recovery attempt.
-        self.ingest_secret_shares_only(recon_shares, share_sender, coin_num, round);
-        self.maybe_recover_ready_coins(round).await;
+        // Single-packet replay path (e.g. draining
+        // `pre_acs_beacon_constructs` after ACS finalisation). Route
+        // it through the same Merkle-validating batch ingest so there
+        // is exactly one reconstruction code path.
+        let batch = BatchBeaconConstructMsg {
+            origin: share_sender,
+            round,
+            packets: vec![RecoveredCoinSharesMsg {
+                coin_num,
+                packet: recon_shares,
+            }],
+        };
+        self.process_batch_secret_shares(batch, share_sender, round).await;
     }
 
     /// Inbound `MulticastRecoveredShares(round, sender, snapshot)`.
@@ -1709,5 +1644,329 @@ impl Context {
             }
         ).await;
         self.add_cancel_handler(cancel_handler);
+    }
+}
+
+// ---------------------------------------------------------------------
+// Tests for the problem-2 fix: reconstruction from ANY f+1 validated
+// providers (liveness under withholding) + Merkle/leaf-index binding
+// of relayed shares (a Byzantine provider cannot inject or mis-position
+// a share).
+// ---------------------------------------------------------------------
+#[cfg(test)]
+mod recon_fix_tests {
+    use super::*;
+    use crate::node::shamir::two_field::TwoFieldDealer;
+    use crypto::aes_hash::{HashState, MerkleTree};
+    use num_bigint::BigUint;
+    use types::beacon::BatchWSSReconMsg;
+
+    fn hash_state() -> HashState {
+        HashState::new([5u8; 16], [29u8; 16], [23u8; 16])
+    }
+
+    fn small_prime() -> BigUint {
+        BigUint::from(685373784908497u64)
+    }
+
+    fn large_prime() -> BigUint {
+        BigUint::parse_bytes(
+            b"57896044618658097711785492504343953926634992332820282019728792003956564819949",
+            10,
+        )
+        .unwrap()
+    }
+
+    fn pad32(b: &BigUint) -> [u8; 32] {
+        let mut bytes = b.to_bytes_be();
+        assert!(bytes.len() <= 32);
+        let mut out = vec![0u8; 32 - bytes.len()];
+        out.append(&mut bytes);
+        out.try_into().expect("padded to 32")
+    }
+
+    /// Build one honest dealer's coin-0 sharing for `n` nodes and
+    /// return: the secret, the per-provider small-field shares, the
+    /// per-provider Merkle proofs, the committed root, and the
+    /// per-provider nonce. Provider `p` (0-based) holds the share at
+    /// evaluation point `p + 1`.
+    struct HonestSharing {
+        secret: BigUint,
+        shares: Vec<[u8; 32]>,
+        nonces: Vec<[u8; 32]>,
+        proofs: Vec<crypto::aes_hash::Proof>,
+        root: Hash,
+    }
+
+    fn build_honest_sharing(n: usize, f: usize, seed: u64) -> HonestSharing {
+        use num_bigint::RandBigInt;
+        use rand::SeedableRng;
+
+        let p = small_prime();
+        let q = large_prime();
+        let theta = BigUint::from(0xC0FFEEu64);
+        let dealer = TwoFieldDealer::new(p.clone(), q.clone(), f + 1, n);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let secret = rng.gen_biguint_range(&BigUint::from(0u32), &p);
+        let tf = dealer.share_secret(secret.clone(), &theta);
+
+        let mut shares: Vec<[u8; 32]> = Vec::with_capacity(n);
+        let mut nonces: Vec<[u8; 32]> = Vec::with_capacity(n);
+        for i in 0..n {
+            shares.push(pad32(&tf.secret_shares[i].1));
+            // Distinct nonce per share.
+            let nonce = rng.gen_biguint_range(&BigUint::from(0u32), &q);
+            nonces.push(pad32(&nonce));
+        }
+
+        let hc = hash_state();
+        let leaf_hashes: Vec<Hash> = hc.hash_batch(shares.clone(), nonces.clone());
+        let trees = MerkleTree::build_trees(vec![leaf_hashes], &hc);
+        let mt = &trees[0];
+        let proofs: Vec<crypto::aes_hash::Proof> = (0..n).map(|i| mt.gen_proof(i)).collect();
+        let root = mt.root();
+
+        HonestSharing {
+            secret,
+            shares,
+            nonces,
+            proofs,
+            root,
+        }
+    }
+
+    /// One provider's coin-0 reconstruction packet for a single dealer.
+    fn provider_packet(s: &HonestSharing, dealer: Replica, provider: usize) -> BatchWSSReconMsg {
+        BatchWSSReconMsg {
+            origin: provider as Replica,
+            secrets: vec![s.shares[provider]],
+            nonces: vec![s.nonces[provider]],
+            origins: vec![dealer],
+            mps: vec![s.proofs[provider].clone()],
+            // mask / f_large are unused by the Merkle-based recon path.
+            mask_shares: vec![[0u8; 32]],
+            f_large_shares: vec![[0u8; 32]],
+            empty: false,
+        }
+    }
+
+    fn accept_one(
+        s: &HonestSharing,
+        dealer: Replica,
+        provider: usize,
+    ) -> Vec<CoinVerifyOutcome> {
+        let mut roots = HashMap::new();
+        roots.insert(dealer, s.root);
+        let decided = vec![dealer];
+        let banned: HashSet<Replica> = HashSet::new();
+        verify_recon_shares_pure(
+            vec![CoinVerifyInputs {
+                coin_num: 0,
+                provider: provider as Replica,
+                packet: provider_packet(s, dealer, provider),
+                roots_for_dealer: roots,
+            }],
+            &decided,
+            &banned,
+            &hash_state(),
+        )
+    }
+
+    /// Liveness: any f+1 validated providers reconstruct the secret,
+    /// even when the other (n - f - 1) providers withhold. Every
+    /// distinct f+1 subset must yield the SAME secret.
+    #[test]
+    fn any_f_plus_one_providers_reconstruct_same_secret() {
+        let (n, f) = (4usize, 1usize);
+        let s = build_honest_sharing(n, f, 0x1234);
+        let threshold = f + 1;
+        let p = small_prime();
+
+        // Try several distinct provider subsets of size f+1, including
+        // ones that EXCLUDE specific nodes (simulating withholding).
+        let subsets = vec![
+            vec![0usize, 1],
+            vec![1, 2],
+            vec![2, 3],
+            vec![0, 3],
+        ];
+        for subset in subsets {
+            assert_eq!(subset.len(), threshold);
+            let eval_points: Vec<usize> = subset.iter().map(|p| p + 1).collect();
+            let shares: Vec<BigUint> = subset
+                .iter()
+                .map(|p| BigUint::from_bytes_be(&s.shares[*p]))
+                .collect();
+            let extractor = BatchExtractor::new(eval_points, p.clone());
+            let recovered = extractor.recover_one(&shares);
+            assert_eq!(
+                recovered, s.secret,
+                "subset {:?} must reconstruct the dealer's secret",
+                subset
+            );
+        }
+    }
+
+    /// Integrity: an honest provider's share validates against the
+    /// dealer's committed Merkle root with the correct leaf index.
+    #[test]
+    fn honest_provider_share_validates() {
+        let (n, f) = (4usize, 1usize);
+        let s = build_honest_sharing(n, f, 0xABCD);
+        for provider in 0..n {
+            let outcomes = accept_one(&s, 0, provider);
+            assert_eq!(outcomes.len(), 1, "provider {} share must be accepted", provider);
+            match &outcomes[0] {
+                CoinVerifyOutcome::Accepted {
+                    coin_num,
+                    dealer,
+                    provider: pv,
+                    share,
+                } => {
+                    assert_eq!(*coin_num, 0);
+                    assert_eq!(*dealer, 0);
+                    assert_eq!(*pv, provider as Replica);
+                    assert_eq!(*share, s.shares[provider]);
+                }
+            }
+        }
+    }
+
+    /// Integrity: a Byzantine provider that relays ANOTHER node's
+    /// share+proof (correct Merkle proof, but for the wrong leaf
+    /// index) must be rejected by the leaf-index binding. Without
+    /// this, the share would be interpolated at the wrong evaluation
+    /// point and corrupt the result.
+    #[test]
+    fn wrong_leaf_index_is_rejected() {
+        let (n, f) = (4usize, 1usize);
+        let s = build_honest_sharing(n, f, 0x5555);
+        let dealer = 0 as Replica;
+        let mut roots = HashMap::new();
+        roots.insert(dealer, s.root);
+
+        // Provider claims to be node 2 but relays node 0's share+proof.
+        let mut packet = provider_packet(&s, dealer, 0);
+        packet.origin = 2;
+        let outcomes = verify_recon_shares_pure(
+            vec![CoinVerifyInputs {
+                coin_num: 0,
+                provider: 2, // wire sender / claimed slot
+                packet,
+                roots_for_dealer: roots,
+            }],
+            &[dealer],
+            &HashSet::new(),
+            &hash_state(),
+        );
+        assert!(
+            outcomes.is_empty(),
+            "share whose Merkle leaf-index != claimed provider must be rejected"
+        );
+    }
+
+    /// Integrity: a tampered share (does not match the committed leaf)
+    /// is rejected even though it is presented with the dealer's real
+    /// root and the correct leaf index.
+    #[test]
+    fn tampered_share_is_rejected() {
+        let (n, f) = (4usize, 1usize);
+        let s = build_honest_sharing(n, f, 0x9999);
+        let dealer = 0 as Replica;
+        let mut roots = HashMap::new();
+        roots.insert(dealer, s.root);
+
+        let mut packet = provider_packet(&s, dealer, 1);
+        // Flip the share so hash(share, nonce) != committed leaf.
+        let mut garbage = packet.secrets[0];
+        garbage[31] ^= 0x01;
+        packet.secrets[0] = garbage;
+
+        let outcomes = verify_recon_shares_pure(
+            vec![CoinVerifyInputs {
+                coin_num: 0,
+                provider: 1,
+                packet,
+                roots_for_dealer: roots,
+            }],
+            &[dealer],
+            &HashSet::new(),
+            &hash_state(),
+        );
+        assert!(
+            outcomes.is_empty(),
+            "share that does not hash to the committed Merkle leaf must be rejected"
+        );
+    }
+
+    /// Integrity: a share presented against the WRONG dealer root
+    /// (e.g. a Byzantine provider re-roots a self-built tree) is
+    /// rejected.
+    #[test]
+    fn wrong_root_is_rejected() {
+        let (n, f) = (4usize, 1usize);
+        let s = build_honest_sharing(n, f, 0x4242);
+        let dealer = 0 as Replica;
+
+        let mut bad_root = s.root;
+        bad_root[0] ^= 0x01;
+        let mut roots = HashMap::new();
+        roots.insert(dealer, bad_root);
+
+        let outcomes = verify_recon_shares_pure(
+            vec![CoinVerifyInputs {
+                coin_num: 0,
+                provider: 0,
+                packet: provider_packet(&s, dealer, 0),
+                roots_for_dealer: roots,
+            }],
+            &[dealer],
+            &HashSet::new(),
+            &hash_state(),
+        );
+        assert!(
+            outcomes.is_empty(),
+            "share whose proof root != dealer's committed root must be rejected"
+        );
+    }
+
+    /// End-to-end (pure layer): validate shares from only f+1 providers
+    /// via `verify_recon_shares_pure`, feed the accepted shares into a
+    /// `BatchExtractor`, and confirm the dealer's secret is recovered —
+    /// the other providers withholding entirely.
+    #[test]
+    fn validate_then_reconstruct_from_f_plus_one_only() {
+        let (n, f) = (7usize, 2usize);
+        let s = build_honest_sharing(n, f, 0x0F0F);
+        let dealer = 0 as Replica;
+        let threshold = f + 1;
+
+        // Only providers {1, 3, 5} respond; the rest withhold.
+        let responding = vec![1usize, 3, 5];
+        assert_eq!(responding.len(), threshold);
+
+        let mut accepted_shares: HashMap<usize, BigUint> = HashMap::new();
+        for &provider in &responding {
+            let outcomes = accept_one(&s, dealer, provider);
+            assert_eq!(outcomes.len(), 1);
+            if let CoinVerifyOutcome::Accepted { provider: pv, share, .. } = &outcomes[0] {
+                accepted_shares.insert(*pv as usize, BigUint::from_bytes_be(share));
+            }
+        }
+
+        let mut providers: Vec<usize> = accepted_shares.keys().copied().collect();
+        providers.sort_unstable();
+        let eval_points: Vec<usize> = providers.iter().map(|p| p + 1).collect();
+        let shares: Vec<BigUint> = providers
+            .iter()
+            .map(|p| accepted_shares.get(p).unwrap().clone())
+            .collect();
+
+        let extractor = BatchExtractor::new(eval_points, small_prime());
+        let recovered = extractor.recover_one(&shares);
+        assert_eq!(
+            recovered, s.secret,
+            "secret must reconstruct from f+1 responding providers while the rest withhold"
+        );
     }
 }

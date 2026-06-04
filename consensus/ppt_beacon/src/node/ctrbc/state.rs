@@ -133,6 +133,20 @@ pub struct CTRBCState {
     /// replayed once `finalize_acs_round` runs.
     pub pre_acs_beacon_constructs: Vec<(BatchWSSReconMsg, Replica, usize)>,
 
+    /// Reconstruction coin-packets `(packet, provider, coin)` that
+    /// could not yet be Merkle-validated because at least one
+    /// ACS-decided dealer's committed root vector (`comm_vectors`)
+    /// was not locally available when the packet arrived. This is a
+    /// transient async condition: the dealer's AVSS packet is
+    /// guaranteed to eventually arrive at every honest node by AVSS
+    /// totality (a decided dealer completed at >= n-f nodes). We
+    /// therefore buffer rather than drop, and replay from
+    /// `maybe_recover_ready_coins` once the missing commitment lands.
+    /// Without this buffer a share that raced ahead of its dealer's
+    /// AVSS commitment would be lost forever, potentially stalling
+    /// reconstruction even though enough honest providers responded.
+    pub pending_recon_shares: Vec<(BatchWSSReconMsg, Replica, usize)>,
+
     // ---- Post-ACS audit / accountability ----
     pub post_complaint_packets: HashMap<
         Replica,
@@ -192,6 +206,7 @@ impl CTRBCState {
             batch_extractor: None,
             acs_decided_set: None,
             pre_acs_beacon_constructs: Vec::new(),
+            pending_recon_shares: Vec::new(),
 
             post_complaint_packets: HashMap::default(),
             recovered_shares_multicast_sent: false,
@@ -497,6 +512,7 @@ impl CTRBCState {
         self.batch_extractor = None;
         self.acs_decided_set = None;
         self.pre_acs_beacon_constructs.clear();
+        self.pending_recon_shares.clear();
 
         self.post_complaint_packets.clear();
         self.recovered_shares_multicast_sent = false;

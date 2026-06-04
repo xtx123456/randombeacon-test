@@ -737,6 +737,14 @@ impl Context {
         if self.maybe_mark_dealer_completed(round, dealer) {
             self.maybe_broadcast_acs_init_from_avss(round).await;
         }
+
+        // This dealer's commitment vector (`comm_vectors`) is now
+        // stored locally. If reconstruction for this round is already
+        // underway, any recon coin-packets that were buffered in
+        // `pending_recon_shares` because they referenced this dealer's
+        // (previously-missing) commitment can now be validated. This
+        // is a no-op until ACS has decided and is cheap otherwise.
+        self.maybe_recover_ready_coins(round).await;
     }
 
     /// Replay every AVSSSend that was buffered waiting for θ(round)
@@ -905,24 +913,22 @@ impl Context {
             rbc_state.emitted_beacon_coins.clear();
             rbc_state.ppt_round_finished = false;
 
-            use crate::node::shamir::two_field::BatchExtractor;
-            let eval_points: Vec<usize> = decided_vec.iter().map(|dealer| *dealer + 1).collect();
-
-            rbc_state.batch_extractor = if eval_points.is_empty() {
-                None
-            } else {
-                Some(BatchExtractor::new(
-                    eval_points.clone(),
-                    rbc_state.secret_domain.clone(),
-                ))
-            };
+            // PPT reconstruction is no longer pinned to a fixed
+            // evaluation-point set derived from the ACS-decided
+            // dealers. Each decided dealer's secret is reconstructed
+            // from ANY f+1 Merkle-validated shares supplied by ANY
+            // providers (see `recover_and_emit_coin_set`), so a
+            // Byzantine node admitted into the decided set can no
+            // longer stall the round by withholding its own
+            // reconstruction share. The per-(provider-set) Lagrange
+            // coefficients are built on demand at recovery time.
+            rbc_state.batch_extractor = None;
 
             log::error!(
-                "[PPT][ACS-RECON] node {} round {} immutable decided_set = {:?}, eval_points = {:?}",
+                "[PPT][ACS-RECON] node {} round {} immutable decided_set = {:?} (reconstruction uses any f+1 validated providers per dealer)",
                 self.myid,
                 round,
-                decided_vec,
-                eval_points
+                decided_vec
             );
             std::mem::take(&mut rbc_state.pre_acs_beacon_constructs)
         };

@@ -279,6 +279,35 @@ impl BatchExtractor {
         results
     }
 
+    /// Recover a single secret f(0) from shares supplied in the same
+    /// order as `self.eval_points`, reusing the precomputed Lagrange
+    /// coefficients. `shares_in_order[j]` MUST be the share evaluated
+    /// at `self.eval_points[j]`.
+    ///
+    /// Used by the PPT reconstruction path, which builds one small
+    /// `BatchExtractor` per distinct provider-set (the f+1 lowest
+    /// responding share-holders for a given dealer) instead of one
+    /// global extractor pinned to the ACS-decided set. This is what
+    /// restores reconstruction liveness: any f+1 valid shares from
+    /// *any* providers suffice, so a Byzantine node that withholds
+    /// its reconstruction share can no longer stall the round.
+    pub fn recover_one(&self, shares_in_order: &[BigUint]) -> BigUint {
+        let p_bi = BigInt::from_biguint(num_bigint::Sign::Plus, self.prime.clone());
+        let mut secret = BigInt::zero();
+        for (j, share) in shares_in_order.iter().enumerate() {
+            if j >= self.lagrange_coeffs.len() {
+                break;
+            }
+            let y_j = BigInt::from_biguint(num_bigint::Sign::Plus, share.clone());
+            secret = (secret + &self.lagrange_coeffs[j] * y_j) % &p_bi;
+        }
+        if secret < BigInt::zero() {
+            (secret + &p_bi).to_biguint().unwrap()
+        } else {
+            secret.to_biguint().unwrap()
+        }
+    }
+
     /// Extended Euclidean algorithm for modular inverse
     fn mod_inverse(a: &BigInt, modulus: &BigInt) -> BigInt {
         let a_pos = if a < &BigInt::zero() {
