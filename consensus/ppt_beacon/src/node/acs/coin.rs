@@ -22,9 +22,56 @@
 //! 256-bit hash family). No DL, no pairing, no RSA, no threshold
 //! primitive, no external VRF — exactly what the PPT scheme allows.
 
-use types::Round;
+use std::collections::{HashMap, HashSet};
 
+use async_recursion::async_recursion;
+use num_bigint::BigUint;
+
+use crypto::aes_hash::Proof;
+use crypto::hash::Hash;
+use types::beacon::{BatchWSSReconMsg, CoinMsg, Val};
+use types::{Replica, Round};
+
+use crate::node::context::PPT_COIN_RESERVE;
+use crate::node::shamir::two_field::BatchExtractor;
+use crate::node::shoup_smart::proof_leaf_index;
 use crate::node::Context;
+
+/// Everything round `(R+1)`'s ACS needs to reconstruct the
+/// unpredictable common coin from round `R`'s sealed coin-secrets:
+///
+///   - `decided`: round R's ACS-decided dealer set (agreed + stable),
+///     the canonical set whose sealed coin-secrets are summed;
+///   - `roots[d]`: dealer d's committed Merkle roots for the
+///     `PPT_COIN_RESERVE` sealed coin indices (to validate revealed
+///     shares);
+///   - `my_shares[d]`: THIS node's own `(share, nonce, proof)` for
+///     each of dealer d's sealed coin indices (what this node reveals
+///     when it queries the coin).
+#[derive(Clone, Debug)]
+pub struct CoinMaterial {
+    pub decided: Vec<Replica>,
+    pub roots: HashMap<Replica, Vec<Hash>>,
+    pub my_shares: HashMap<Replica, Vec<(Val, Val, Proof)>>,
+}
+
+const COIN_SECRET_DOMAIN: &[u8] = b"PPT_ACS_COIN_SECRET_v1::";
+
+/// Derive ABA instance `j`'s coin bit from the reconstructed common
+/// coin secret `C` for an ABA round. All honest nodes hold the same
+/// `C` (it is the sum of fixed shared secrets), so the per-instance
+/// bits are common; and `C` is unpredictable until f+1 honest reveals
+/// land, so the bits are unpredictable.
+pub fn coin_bit_from_secret(secret: &BigUint, instance: usize) -> bool {
+    let mut buf = Vec::with_capacity(COIN_SECRET_DOMAIN.len() + 40);
+    buf.extend_from_slice(COIN_SECRET_DOMAIN);
+    let sbytes = secret.to_bytes_be();
+    buf.extend_from_slice(&(sbytes.len() as u64).to_be_bytes());
+    buf.extend_from_slice(&sbytes);
+    buf.extend_from_slice(&(instance as u64).to_be_bytes());
+    let hash = crypto::hash::do_hash(buf.as_slice());
+    (hash[hash.len() - 1] & 1u8) == 1
+}
 
 /// Public, deterministic seed used to derive the round-0 ABA common
 /// coins. Every node uses this, so all ABA instances in round 0 see
@@ -95,6 +142,362 @@ impl Context {
     }
 }
 
+impl Context {
+    /// Stash round `round`'s sealed coin material for use by round
+    /// `round + 1`'s ACS common coin. Called from
+    /// `finalize_acs_round(round)` once the decided set is fixed and
+    /// the dealers' AVSS packets (commitments + this node's shares)
+    /// are locally available.
+    pub(crate) fn stash_coin_material(&mut self, round: Round, decided: &[Replica]) {
+        let batch_size = self.batch_size;
+        let total = batch_size + PPT_COIN_RESERVE;
+        let mut roots: HashMap<Replica, Vec<Hash>> = HashMap::new();
+        let mut my_shares: HashMap<Replica, Vec<(Val, Val, Proof)>> = HashMap::new();
+
+        if let Some(state) = self.round_state.get(&round) {
+            for &d in decided.iter() {
+                if let Some(rv) = state.comm_vectors.get(&d) {
+                    if rv.len() >= total {
+                        roots.insert(d, rv[batch_size..total].to_vec());
+                    }
+                }
+                if let Some(wss) = state.node_secrets.get(&d) {
+                    if wss.secrets.len() >= total
+                        && wss.nonces.len() >= total
+                        && wss.mps.len() >= total
+                    {
+                        let mut v = Vec::with_capacity(PPT_COIN_RESERVE);
+                        for rr in 0..PPT_COIN_RESERVE {
+                            let idx = batch_size + rr;
+                            v.push((wss.secrets[idx], wss.nonces[idx], wss.mps[idx].clone()));
+                        }
+                        my_shares.insert(d, v);
+                    }
+                }
+            }
+        }
+
+        log::debug!(
+            "[PPT][COIN] node {} stashed coin material for round {} ({} dealers with roots, {} with my-shares)",
+            self.myid,
+            round,
+            roots.len(),
+            my_shares.len()
+        );
+
+        self.coin_material.insert(
+            round,
+            CoinMaterial {
+                decided: decided.to_vec(),
+                roots,
+                my_shares,
+            },
+        );
+
+        // Replay any coin reveals that arrived for acs_round = round+1
+        // before this material was available.
+        let acs_round = round + 1;
+        let pending_keys: Vec<(Round, u64)> = self
+            .coin_reveal_pending
+            .keys()
+            .copied()
+            .filter(|(ar, _)| *ar == acs_round)
+            .collect();
+        for key in pending_keys {
+            if let Some(list) = self.coin_reveal_pending.remove(&key) {
+                for (packet, provider) in list.into_iter() {
+                    let _ = self.ingest_coin_reveal_shares(key.0, key.1, &packet, provider);
+                }
+            }
+        }
+    }
+
+    /// Drop coin state once round `acs_round`'s ACS has finalised:
+    /// the per-round share/reconstruction caches for `acs_round` and
+    /// the material `acs_round - 1` it consumed are no longer needed.
+    pub(crate) fn cleanup_coin_state(&mut self, acs_round: Round) {
+        self.coin_shares.retain(|(r, _), _| *r != acs_round);
+        self.coin_reconstructed.retain(|(r, _), _| *r != acs_round);
+        self.coin_reveal_sent.retain(|(r, _)| *r != acs_round);
+        self.coin_reveal_pending.retain(|(r, _), _| *r != acs_round);
+        if acs_round > 0 {
+            self.coin_material.remove(&(acs_round - 1));
+        }
+    }
+
+    /// Build this node's coin-share reveal packet for `aba_round`
+    /// from the sealed coin material of `prev_round` (= acs_round-1).
+    fn build_coin_reveal_packet(
+        &self,
+        prev_round: Round,
+        aba_round: u64,
+    ) -> Option<BatchWSSReconMsg> {
+        let material = self.coin_material.get(&prev_round)?;
+        let rr = aba_round as usize;
+        let mut origins = Vec::new();
+        let mut secrets = Vec::new();
+        let mut nonces = Vec::new();
+        let mut mps = Vec::new();
+        for &d in material.decided.iter() {
+            if let Some(v) = material.my_shares.get(&d) {
+                if let Some((share, nonce, proof)) = v.get(rr) {
+                    origins.push(d);
+                    secrets.push(*share);
+                    nonces.push(*nonce);
+                    mps.push(proof.clone());
+                }
+            }
+        }
+        if origins.is_empty() {
+            return None;
+        }
+        Some(BatchWSSReconMsg {
+            origin: self.myid,
+            secrets,
+            nonces,
+            origins,
+            mps,
+            mask_shares: Vec::new(),
+            f_large_shares: Vec::new(),
+            empty: false,
+        })
+    }
+
+    /// Validate and store the coin-shares carried in `packet` from
+    /// `provider`, then attempt to reconstruct the common coin secret
+    /// `C = Σ_d c_{d,aba_round}`. Returns `true` iff `C` was newly
+    /// reconstructed by this call.
+    pub(crate) fn ingest_coin_reveal_shares(
+        &mut self,
+        acs_round: Round,
+        aba_round: u64,
+        packet: &BatchWSSReconMsg,
+        provider: Replica,
+    ) -> bool {
+        if acs_round == 0 {
+            return false;
+        }
+        let prev = acs_round - 1;
+
+        // Snapshot the per-dealer committed root for this aba_round
+        // from the (immutably borrowed) coin material, then drop the
+        // borrow before mutating `coin_shares`.
+        let (decided, roots): (Vec<Replica>, HashMap<Replica, Hash>) = {
+            let material = match self.coin_material.get(&prev) {
+                Some(m) => m,
+                None => return false,
+            };
+            let rr = aba_round as usize;
+            let roots = material
+                .decided
+                .iter()
+                .filter_map(|d| {
+                    material
+                        .roots
+                        .get(d)
+                        .and_then(|v| v.get(rr))
+                        .map(|h| (*d, *h))
+                })
+                .collect();
+            (material.decided.clone(), roots)
+        };
+        let decided_set: HashSet<Replica> = decided.iter().copied().collect();
+
+        let hc = self.hash_context.clone();
+        let threshold = self.num_faults + 1;
+        let secret_domain = self.secret_domain.clone();
+
+        // Structurally validate all proofs in the packet in one batch
+        // (the single-proof `Proof::validate` is inconsistent with this
+        // codebase's `MerkleTree::build_trees`; `validate_batch` is the
+        // trusted path, also used by the post-ACS audit / recon).
+        let batch_ok = !packet.mps.is_empty()
+            && Proof::validate_batch(&packet.mps, &hc);
+        if batch_ok {
+            let entry = self
+                .coin_shares
+                .entry((acs_round, aba_round))
+                .or_default();
+            for (((d, share), nonce), mp) in packet
+                .origins
+                .iter()
+                .zip(packet.secrets.iter())
+                .zip(packet.nonces.iter())
+                .zip(packet.mps.iter())
+            {
+                if !decided_set.contains(d) {
+                    continue;
+                }
+                let root = match roots.get(d) {
+                    Some(r) => *r,
+                    None => continue,
+                };
+                if proof_leaf_index(mp) != provider as usize {
+                    continue;
+                }
+                if mp.root() != root {
+                    continue;
+                }
+                let item = hc
+                    .hash_batch(vec![*share], vec![*nonce])
+                    .into_iter()
+                    .next()
+                    .expect("hash_batch returned no item");
+                if item != mp.item() {
+                    continue;
+                }
+                entry
+                    .entry(*d)
+                    .or_default()
+                    .insert(provider, BigUint::from_bytes_be(share));
+            }
+        }
+
+        if self.coin_reconstructed.contains_key(&(acs_round, aba_round)) {
+            return false;
+        }
+
+        // Reconstruct each decided dealer's coin secret from f+1
+        // validated providers; sum mod p. Returns early if any dealer
+        // is short of f+1 providers.
+        let shares_map = match self.coin_shares.get(&(acs_round, aba_round)) {
+            Some(m) => m,
+            None => return false,
+        };
+        let mut sum = BigUint::from(0u32);
+        for d in decided.iter() {
+            let pmap = match shares_map.get(d) {
+                Some(p) if p.len() >= threshold => p,
+                _ => return false,
+            };
+            let mut providers: Vec<usize> = pmap.keys().copied().collect();
+            providers.sort_unstable();
+            providers.truncate(threshold);
+            let eval_points: Vec<usize> = providers.iter().map(|p| p + 1).collect();
+            let shares: Vec<BigUint> =
+                providers.iter().map(|p| pmap.get(p).unwrap().clone()).collect();
+            let extractor = BatchExtractor::new(eval_points, secret_domain.clone());
+            let c_d = extractor.recover_one(&shares);
+            sum = (sum + c_d) % &secret_domain;
+        }
+
+        self.coin_reconstructed.insert((acs_round, aba_round), sum);
+        log::debug!(
+            "[PPT][COIN] node {} reconstructed ACS common coin for acs_round {} aba_round {} ({} decided dealers)",
+            self.myid,
+            acs_round,
+            aba_round,
+            decided.len()
+        );
+        true
+    }
+
+    /// Ensure this node has broadcast its coin-share reveal for
+    /// `(acs_round, aba_round)` (releasing its share AFTER it has
+    /// entered that ABA round, i.e. after its AUX is fixed), and
+    /// return the reconstructed common coin secret if available.
+    /// `None` ⇒ caller must defer feeding the coin.
+    #[async_recursion]
+    pub(crate) async fn ensure_coin_secret(
+        &mut self,
+        acs_round: Round,
+        aba_round: u64,
+    ) -> Option<BigUint> {
+        if acs_round == 0 || (aba_round as usize) >= PPT_COIN_RESERVE {
+            return None;
+        }
+        let prev = acs_round - 1;
+        if !self.coin_material.contains_key(&prev) {
+            return None;
+        }
+
+        if !self.coin_reveal_sent.contains(&(acs_round, aba_round)) {
+            match self.build_coin_reveal_packet(prev, aba_round) {
+                Some(packet) => {
+                    self.coin_reveal_sent.insert((acs_round, aba_round));
+                    log::debug!(
+                        "[PPT][COIN] node {} broadcast coin reveal acs_round {} aba_round {} ({} dealer-shares)",
+                        self.myid, acs_round, aba_round, packet.origins.len()
+                    );
+                    let msg = CoinMsg::ACSCoinReveal(acs_round, aba_round, packet.clone());
+                    self.broadcast(msg, acs_round).await;
+                    let myid = self.myid;
+                    let _ = self.ingest_coin_reveal_shares(acs_round, aba_round, &packet, myid);
+                }
+                None => {
+                    log::warn!(
+                        "[PPT][COIN] node {} build_coin_reveal_packet returned None acs_round {} aba_round {} (prev material my_shares missing?)",
+                        self.myid, acs_round, aba_round
+                    );
+                }
+            }
+        }
+
+        self.coin_reconstructed.get(&(acs_round, aba_round)).cloned()
+    }
+
+    /// Common-coin bit for ACS `acs_round`, ABA instance `j`, ABA
+    /// round `aba_round`. For `acs_round >= 1` within the reserve
+    /// window this is the unpredictable AVSS-sealed coin; otherwise
+    /// (genesis round 0, or beyond the reserve window) it falls back
+    /// to the deterministic hash coin. Returns `None` only when the
+    /// sealed coin is not yet reconstructed (caller defers).
+    #[async_recursion]
+    pub(crate) async fn acs_coin_bit(
+        &mut self,
+        acs_round: Round,
+        j: usize,
+        aba_round: u64,
+    ) -> Option<bool> {
+        let use_sealed = acs_round >= 1
+            && (aba_round as usize) < PPT_COIN_RESERVE
+            && self.coin_material.contains_key(&(acs_round - 1));
+        if !use_sealed {
+            // Genesis / out-of-window fallback: deterministic hash coin.
+            return self.coin_bit_for(acs_round, j, aba_round);
+        }
+        match self.ensure_coin_secret(acs_round, aba_round).await {
+            Some(c) => Some(coin_bit_from_secret(&c, j)),
+            None => None,
+        }
+    }
+
+    /// Inbound `ACSCoinReveal(acs_round, aba_round, packet)` from
+    /// `provider`. Validates + stores the shares; if the coin becomes
+    /// reconstructable, re-runs the ACS scan so the now-available coin
+    /// is fed into the waiting ABA instances.
+    #[async_recursion]
+    pub(crate) async fn process_acs_coin_reveal(
+        &mut self,
+        acs_round: Round,
+        aba_round: u64,
+        packet: BatchWSSReconMsg,
+        provider: Replica,
+    ) {
+        if acs_round == 0 {
+            return;
+        }
+        let prev = acs_round - 1;
+        if !self.coin_material.contains_key(&prev) {
+            // Material not stashed yet (this node hasn't finalised the
+            // previous round locally). Buffer for replay.
+            log::debug!(
+                "[PPT][COIN] node {} buffering coin reveal from {} acs_round {} aba_round {} (material[{}] missing)",
+                self.myid, provider, acs_round, aba_round, prev
+            );
+            self.coin_reveal_pending
+                .entry((acs_round, aba_round))
+                .or_default()
+                .push((packet, provider));
+            return;
+        }
+        let newly = self.ingest_coin_reveal_shares(acs_round, aba_round, &packet, provider);
+        if newly {
+            self.acs_on_coin_ready(acs_round).await;
+        }
+    }
+}
+
 /// Pure function (no `&self`) for unit testing the coin derivation.
 /// Hash inputs are length-prefixed so an adversary cannot collide
 /// (`(round=10, aba=5, r=0)` vs `(round=1, aba=0, r=50)`) by
@@ -156,6 +559,28 @@ mod tests {
         }
         assert!(zeros > 0 && ones > 0, "coin not flipping across (inst, r): zeros={} ones={}", zeros, ones);
         assert!(differences > 16, "coin too sticky across (inst, r): {} flips out of 256", differences);
+    }
+
+    #[test]
+    fn coin_bit_from_secret_is_deterministic_and_varies() {
+        use num_bigint::BigUint;
+        let c1 = BigUint::from(123456789u64);
+        let c2 = BigUint::from(987654321u64);
+        // Deterministic per (secret, instance).
+        assert_eq!(coin_bit_from_secret(&c1, 0), coin_bit_from_secret(&c1, 0));
+        assert_eq!(coin_bit_from_secret(&c1, 5), coin_bit_from_secret(&c1, 5));
+        // Varies across instances and across secrets (statistically).
+        let mut zeros = 0usize;
+        let mut ones = 0usize;
+        for j in 0..32 {
+            if coin_bit_from_secret(&c1, j) { ones += 1; } else { zeros += 1; }
+        }
+        assert!(zeros > 0 && ones > 0, "coin too sticky across instances: z={} o={}", zeros, ones);
+        let mut diff = 0usize;
+        for j in 0..32 {
+            if coin_bit_from_secret(&c1, j) != coin_bit_from_secret(&c2, j) { diff += 1; }
+        }
+        assert!(diff > 0, "two distinct coin secrets produced identical bit streams");
     }
 
     #[test]

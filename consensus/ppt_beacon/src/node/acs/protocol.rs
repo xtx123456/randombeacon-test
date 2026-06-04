@@ -332,10 +332,23 @@ impl Context {
     /// 16 is well above any realistic upper bound).
     #[async_recursion]
     async fn acs_pump_coins(&mut self, round: Round) {
-        // We may not have the seed yet (round > 0 with previous
-        // beacon not yet recorded). In that case we cannot derive
-        // any coin; the caller will retry on the next state change.
-        if self.coin_seed_for_acs_round(round).is_none() {
+        // Once the round has finalised (every ABA instance decided),
+        // stop feeding coins. MMR ABA's "decide-and-continue" otherwise
+        // keeps advancing each decided instance to ever-higher ABA
+        // rounds forever (each advance broadcasts a fresh BVAL, peers
+        // respond, the coin -- a free local hash for genesis rounds --
+        // is always available, so it spins unboundedly). That runaway
+        // starves the single-threaded consensus task and, with the new
+        // interactive coin, prevents later rounds' coin reveals from
+        // ever being processed. The decided values have already been
+        // broadcast widely enough for agreement, so halting the pump at
+        // finalisation is safe and necessary.
+        if self
+            .acs_state
+            .get(&round)
+            .map(|s| s.finalized)
+            .unwrap_or(false)
+        {
             return;
         }
 
@@ -367,21 +380,62 @@ impl Context {
                 return;
             }
 
+            let mut progressed = false;
             for (j, r) in needed {
-                let bit = match self.coin_bit_for(round, j, r) {
+                // Skip if already fed (a previous pass in this loop or
+                // a concurrent path may have fed it).
+                if self
+                    .acs_state
+                    .get(&round)
+                    .map(|s| s.coin_fed_for.contains(&(j, r)))
+                    .unwrap_or(true)
+                {
+                    continue;
+                }
+
+                // Unpredictable AVSS-sealed coin for round >= 1
+                // (deterministic hash coin for genesis / out-of-window).
+                // `None` ⇒ coin not yet reconstructed: defer feeding
+                // this (j, r); the `ACSCoinReveal` handler will re-run
+                // this scan once enough reveals land.
+                let bit = match self.acs_coin_bit(round, j, r).await {
                     Some(b) => b,
                     None => continue,
                 };
+
                 let acts = {
                     let st = self.acs_round_mut(round);
-                    st.coin_fed_for.insert((j, r));
-                    st.aba.handle_coin(j, r, bit)
+                    if st.coin_fed_for.contains(&(j, r)) {
+                        Vec::new()
+                    } else {
+                        st.coin_fed_for.insert((j, r));
+                        st.aba.handle_coin(j, r, bit)
+                    }
                 };
+                if !acts.is_empty() {
+                    progressed = true;
+                }
                 for a in acts {
                     self.dispatch_aba_action(round, self.myid, a).await;
                 }
             }
+
+            // If this pass fed nothing new (all remaining coins are
+            // still being reconstructed), stop spinning; the reveal
+            // handler will resume us.
+            if !progressed {
+                return;
+            }
         }
+    }
+
+    /// Re-run the full external scan once a previously-deferred ACS
+    /// common coin has been reconstructed (called from
+    /// `process_acs_coin_reveal`). This feeds the now-available coin
+    /// into the waiting ABA instances and may finalise the round.
+    #[async_recursion]
+    pub(crate) async fn acs_on_coin_ready(&mut self, round: Round) {
+        self.acs_external_scan_full(round).await;
     }
 
     /// Once every ABA has decided, compute the dealer set output

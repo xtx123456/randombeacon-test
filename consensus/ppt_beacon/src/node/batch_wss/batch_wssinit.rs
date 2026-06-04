@@ -153,6 +153,11 @@ impl Context {
 
         let faults = self.num_faults;
         let batch_size = self.batch_size;
+        // Share `batch_size` beacon coins PLUS `PPT_COIN_RESERVE`
+        // sealed coin-secrets (used by the NEXT round's ACS common
+        // coin). They are dealt + validated identically to beacon
+        // coins but live at coin indices [batch_size, total_coins).
+        let total_coins = batch_size + crate::node::context::PPT_COIN_RESERVE;
         let low_r = BigUint::from(0u32);
         let prime = self.secret_domain.clone();
         let nonce_prime = self.nonce_domain.clone();
@@ -183,11 +188,11 @@ impl Context {
         let mut share_vec: Vec<[u8;32]> = Vec::new();
         let mut nonce_share_vec: Vec<[u8;32]> = Vec::new();
 
-        let mut degree_test_batch: Vec<Vec<Val>> = Vec::with_capacity(batch_size);
-        let mut mask_shares_per_node: Vec<Vec<Val>> = vec![Vec::with_capacity(batch_size); self.num_nodes];
-        let mut f_large_per_node: Vec<Vec<Val>> = vec![Vec::with_capacity(batch_size); self.num_nodes];
+        let mut degree_test_batch: Vec<Vec<Val>> = Vec::with_capacity(total_coins);
+        let mut mask_shares_per_node: Vec<Vec<Val>> = vec![Vec::with_capacity(total_coins); self.num_nodes];
+        let mut f_large_per_node: Vec<Vec<Val>> = vec![Vec::with_capacity(total_coins); self.num_nodes];
 
-        for _ in 0..batch_size {
+        for _ in 0..total_coins {
             let secret = rand::thread_rng().gen_biguint_range(&low_r, &prime);
 
             let two_field_shares = two_field_dealer.share_secret(secret, &theta);
@@ -229,10 +234,10 @@ impl Context {
 
         assert_eq!(
             triplets.len(),
-            batch_size * self.num_nodes,
-            "two-field packing mismatch: got {} triplets for batch_size={} num_nodes={}",
+            total_coins * self.num_nodes,
+            "two-field packing mismatch: got {} triplets for total_coins={} num_nodes={}",
             triplets.len(),
-            batch_size,
+            total_coins,
             self.num_nodes
         );
 
@@ -243,9 +248,9 @@ impl Context {
 
         assert_eq!(
             share_comm_hash.len(),
-            batch_size,
+            total_coins,
             "expected {} per-coin groups, got {}",
-            batch_size,
+            total_coins,
             share_comm_hash.len()
         );
 
@@ -260,7 +265,7 @@ impl Context {
             .map(|i| (i + 1, BatchWSSMsg::new(self.myid, Vec::new(), Vec::new(), Vec::new())))
             .collect();
 
-        let mut roots_vec: Vec<Hash> = Vec::with_capacity(batch_size);
+        let mut roots_vec: Vec<Hash> = Vec::with_capacity(total_coins);
         for (secret_chunk, mt) in share_comm_hash.into_iter().zip(mt_vec.into_iter()) {
             for (i, (share, nonce, _comm)) in secret_chunk.into_iter().enumerate() {
                 vec_msgs_to_be_sent[i].1.secrets.push(share);
@@ -270,8 +275,8 @@ impl Context {
             roots_vec.push(mt.root());
         }
 
-        assert_eq!(roots_vec.len(), batch_size);
-        assert_eq!(degree_test_batch.len(), batch_size);
+        assert_eq!(roots_vec.len(), total_coins);
+        assert_eq!(degree_test_batch.len(), total_coins);
 
         // ============================================================
         // Shoup-Smart 2024 Π_SecMsgDst-routed dispatch (commit 7 cutover).

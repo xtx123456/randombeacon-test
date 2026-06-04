@@ -44,6 +44,22 @@ use super::{CTRBCState, Handler, SyncHandler};
 /// without a previous beacon being available.
 pub const PPT_GENESIS_THETA_SEED: &[u8] = b"PPT_BEACON_GENESIS_THETA_v1";
 
+/// Number of extra "coin secrets" each dealer seals per round, on top
+/// of the `batch_size` beacon coins, to drive the next round's ACS
+/// common coin (PPT problem-1 fix). These occupy batch coin indices
+/// `[batch_size, batch_size + PPT_COIN_RESERVE)`; they are shared and
+/// validated like beacon coins but are NEVER reconstructed/emitted as
+/// beacon output — they stay sealed (secret) until the NEXT round's
+/// ABA reconstructs coin-secret `rr` on demand for ABA round `rr`.
+///
+/// This bounds the number of ABA rounds for which we can supply an
+/// unpredictable coin; beyond it (probability ~2^-PPT_COIN_RESERVE per
+/// instance, negligible) the ACS falls back to the deterministic
+/// genesis-style hash coin. MMR ABA terminates in O(1) expected ABA
+/// rounds, so a modest reserve covers the overwhelming majority of
+/// executions.
+pub const PPT_COIN_RESERVE: usize = 12;
+
 /// PPT random-beacon node context (pure-PPT mode: frequency φ = 1,
 /// every honest node is always a dealer, no anytrust committee, no
 /// legacy Binary-AA / Gather / CTRBC paths).
@@ -151,6 +167,34 @@ pub struct Context {
     >,
     pub avss_secmsg_public: HashMap<(Round, Replica), types::beacon::AvssPublicCommitMsg>,
     pub avss_secmsg_delivered_bytes: HashMap<(Round, Replica), Vec<u8>>,
+
+    // ---- ACS unpredictable common coin (PPT problem-1 fix) ----
+    //
+    // Round R's AVSS seals `PPT_COIN_RESERVE` coin-secrets; round
+    // (R+1)'s ACS reconstructs them on demand to drive its MMR-ABA
+    // common coin. `coin_material[R]` holds what round (R+1) needs:
+    // the agreed contributing dealer set (= round R's ACS-decided
+    // set), the per-dealer Merkle roots for the sealed coin indices,
+    // and THIS node's own shares of those sealed coins (for revealing).
+    pub coin_material: HashMap<Round, crate::node::acs::coin::CoinMaterial>,
+
+    // Per (acs_round, aba_round): collected, Merkle-validated coin
+    // shares `dealer -> provider -> share`. Reconstruction of each
+    // dealer's sealed coin-secret needs f+1 providers.
+    pub coin_shares: HashMap<
+        (Round, u64),
+        HashMap<Replica, HashMap<Replica, BigUint>>,
+    >,
+    // Reconstructed coin secret `C = Σ_d c_{d}` per (acs_round, aba_round).
+    pub coin_reconstructed: HashMap<(Round, u64), BigUint>,
+    // (acs_round, aba_round) for which this node has already broadcast
+    // its own coin-share reveal (idempotency; also enforces that we
+    // release our share at most once, after entering that ABA round).
+    pub coin_reveal_sent: HashSet<(Round, u64)>,
+    // Reveals that arrived before `coin_material[acs_round-1]` was
+    // locally available; replayed once the material is stashed.
+    pub coin_reveal_pending:
+        HashMap<(Round, u64), Vec<(types::beacon::BatchWSSReconMsg, Replica)>>,
 
     // ---- Audit fire-and-forget plumbing (P0-A.1) ----
     //
@@ -304,6 +348,12 @@ impl Context {
                 avss_secmsg_state: HashMap::default(),
                 avss_secmsg_public: HashMap::default(),
                 avss_secmsg_delivered_bytes: HashMap::default(),
+
+                coin_material: HashMap::default(),
+                coin_shares: HashMap::default(),
+                coin_reconstructed: HashMap::default(),
+                coin_reveal_sent: HashSet::new(),
+                coin_reveal_pending: HashMap::default(),
 
                 num_messages: 0,
                 bench: HashMap::default(),

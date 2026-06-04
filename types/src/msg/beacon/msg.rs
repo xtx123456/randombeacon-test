@@ -256,6 +256,23 @@ pub enum CoinMsg{
     AVSSSecMsgCipherDispersal(Round, Replica, Vec<u8>),
     AVSSSecMsgCipherEcho(Round, Replica, Vec<u8>),
     AVSSSecMsgCipherVote(Round, Replica, Hash),
+
+    /// ACS common-coin reveal (PPT problem-1 fix: unpredictable
+    /// hash-based async common coin).
+    ///
+    /// `ACSCoinReveal(acs_round, aba_round, packet)`: the wire sender
+    /// reveals its Shamir shares of the sealed coin-secrets for
+    /// `aba_round`, one per dealer in the previous round's
+    /// ACS-decided set. `packet.origins[k]` is the dealer, and the
+    /// aligned `secrets/nonces/mps` are the sender's share of that
+    /// dealer's sealed coin-secret (validated against the previous
+    /// round's Merkle commitment, exactly like a reconstruction
+    /// share). The coin value `C = Σ_d reconstruct(c_{d,aba_round})`
+    /// stays hidden until f+1 honest reveals land — and honest nodes
+    /// only reveal AFTER fixing their `aba_round` AUX — so the
+    /// adversary cannot predict the coin before honest AUX are
+    /// committed, which is what MMR ABA termination requires.
+    ACSCoinReveal(Round, u64, BatchWSSReconMsg),
 }
 
 /// Public AVSS commitment broadcast once per (round, dealer).

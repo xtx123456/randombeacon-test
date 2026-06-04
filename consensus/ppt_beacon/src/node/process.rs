@@ -44,8 +44,13 @@ pub(crate) fn avss_local_packet_valid_pure(
     num_faults: usize,
     num_nodes: usize,
     batch_size: usize,
+    coin_reserve: usize,
     myid: usize,
 ) -> Result<(), &'static str> {
+    // The dealer shares `batch_size` beacon coins plus `coin_reserve`
+    // sealed ACS-coin secrets; all are committed + degree-tested
+    // uniformly, so every length / loop below ranges over the total.
+    let batch_size = batch_size + coin_reserve;
     let public_root = crypto::hash::do_hash(beacon_msg.serialize_ctrbc().as_slice());
     if public_root != *transcript_root {
         log::warn!(
@@ -487,6 +492,12 @@ impl Context {
                 )
                 .await;
             }
+            CoinMsg::ACSCoinReveal(acs_round, aba_round, packet) => {
+                self.process_acs_coin_reveal(
+                    acs_round, aba_round, packet, wrapper_msg.sender,
+                )
+                .await;
+            }
             _ => {}
         }
     }
@@ -550,6 +561,7 @@ impl Context {
             self.num_faults,
             self.num_nodes,
             self.batch_size,
+            crate::node::context::PPT_COIN_RESERVE,
             self.myid,
         )
     }
@@ -682,6 +694,7 @@ impl Context {
                     num_faults,
                     num_nodes,
                     batch_size,
+                    crate::node::context::PPT_COIN_RESERVE,
                     myid,
                 );
                 (result, beacon_msg, theta)
@@ -952,6 +965,15 @@ impl Context {
             std::mem::take(&mut rbc_state.pre_acs_beacon_constructs)
         };
 
+        // ACS common coin (problem-1 fix):
+        //   - stash THIS round's sealed coin-secrets so round (round+1)'s
+        //     ACS can reconstruct its unpredictable common coin from a
+        //     stable, agreed dealer set (= this round's decided set);
+        //   - drop the coin state for this round and the material it
+        //     consumed (round-1), now that this round's ACS is done.
+        self.stash_coin_material(round, decided_vec.as_slice());
+        self.cleanup_coin_state(round);
+
         self.start_reconstruction_after_acs(round, decided_vec.as_slice())
             .await;
 
@@ -1141,7 +1163,7 @@ mod avss_binding_tests {
         let (beacon, transcript, p, q, theta, hc) =
             build_honest_packet(0, 1, 42, batch_size, n, f);
         let res = avss_local_packet_valid_pure(
-            &beacon, &transcript, 0, 42, &theta, &hc, &p, &q, f, n, batch_size, 1,
+            &beacon, &transcript, 0, 42, &theta, &hc, &p, &q, f, n, batch_size, 0, 1,
         );
         assert!(res.is_ok(), "honest packet must validate: {:?}", res);
     }
@@ -1179,7 +1201,7 @@ mod avss_binding_tests {
         let transcript = crypto::hash::do_hash(beacon.serialize_ctrbc().as_slice());
 
         let res = avss_local_packet_valid_pure(
-            &beacon, &transcript, 0, 42, &theta, &hc, &p, &q, f, n, batch_size, 1,
+            &beacon, &transcript, 0, 42, &theta, &hc, &p, &q, f, n, batch_size, 0, 1,
         );
         assert!(res.is_err(), "Byzantine packet must be rejected");
     }
@@ -1207,7 +1229,7 @@ mod avss_binding_tests {
         }
         let transcript = crypto::hash::do_hash(beacon.serialize_ctrbc().as_slice());
         let res = avss_local_packet_valid_pure(
-            &beacon, &transcript, 0, 42, &theta, &hc, &p, &q, f, n, batch_size, 1,
+            &beacon, &transcript, 0, 42, &theta, &hc, &p, &q, f, n, batch_size, 0, 1,
         );
         assert!(
             res.is_err(),
