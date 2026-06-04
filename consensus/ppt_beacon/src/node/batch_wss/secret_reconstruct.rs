@@ -1547,12 +1547,31 @@ impl Context {
      * still needs the full disclosure data to remain available.
      */
     #[async_recursion]
-    pub async fn self_coin_check_transmit(&mut self, round: Round, coin_num: usize, number: Vec<u8>) {
+    pub async fn self_coin_check_transmit(
+        &mut self,
+        round: Round,
+        coin_num: usize,
+        numbers: Vec<Vec<u8>>,
+    ) {
+        // `numbers` is the super-invertible extraction output for this
+        // coin column: `R = |decided| - f` independent beacon values.
+        // Each is emitted to the syncer under a distinct global index
+        // `coin_num * R + i`. `R` is identical at every honest node
+        // for this round (same ACS-decided set), so the per-index
+        // agreement check on the syncer stays well-defined.
+        let outputs_per_coin = numbers.len().max(1);
+
+        // The canonical "coin-0 beacon" used to seed θ_{r+1} and the
+        // next ACS round's common-coin derivation is sub-output 0 of
+        // coin 0 (deterministic + agreed across honest nodes).
+        let seed_value = numbers.first().cloned().unwrap_or_default();
+
         log::info!(
-            "[PPT][STAGE][BEACON-OUT] node {} round {} coin {}",
+            "[PPT][STAGE][BEACON-OUT] node {} round {} coin {} ({} extracted outputs)",
             self.myid,
             round,
-            coin_num
+            coin_num,
+            numbers.len()
         );
         let is_last_coin = self.round_state
             .get(&round)
@@ -1571,14 +1590,14 @@ impl Context {
         if coin_num == 0 {
             // PPT pg 28: θ for the next round is derived from this round's
             // coin-0 beacon, which the next round's dealer cannot influence.
-            self.record_beacon_output_for_theta(round, number.as_slice());
+            self.record_beacon_output_for_theta(round, seed_value.as_slice());
 
             // Self-bootstrap MMR ABA common coin: store the same
             // beacon output as the seed for the *next* ACS round's
-            // coin derivation. Honest nodes agree on `number` bit-
+            // coin derivation. Honest nodes agree on this value bit-
             // for-bit (ACS + batch-recover safety) so every node's
             // coin_bit_for(round+1, ..) returns the identical bit.
-            self.record_beacon_output_for_coin(round, number.as_slice());
+            self.record_beacon_output_for_coin(round, seed_value.as_slice());
 
             // Pure PPT: every node is always a dealer in the next round.
             let next_round: Round = round + self.frequency;
@@ -1620,30 +1639,36 @@ impl Context {
             log::info!("Number of messages passed between nodes: {}", self.num_messages);
         }
 
-        // PPT pg 30-32 first-match optimisation: report whether this
-        // particular coin lies in the rejection-sampling "good range",
-        // so a downstream BFT consumer that wants a uniform [1,n] beacon
-        // can deterministically pick the first matched coin in batch
-        // order across all reconstructed coins.
-        let matched_in_range = self.coin_value_matches_uniform_range(number.as_slice());
-        if matched_in_range {
-            log::info!(
-                "[PPT][FIRST-MATCH] node {} round {} coin {} value lies in the uniform-sample range [0, n*floor(p/n))",
-                self.myid,
-                round,
-                coin_num
-            );
-        }
+        // Emit each extracted beacon value under its own global index.
+        for (i, number) in numbers.into_iter().enumerate() {
+            let global_index = coin_num * outputs_per_coin + i;
 
-        let cancel_handler = self.sync_send.send(
-            0,
-            SyncMsg {
-                sender: self.myid,
-                state: SyncState::BeaconRecon(round, self.myid, coin_num, number),
-                value: 0,
+            // PPT pg 30-32 first-match optimisation: report whether this
+            // particular output lies in the rejection-sampling "good
+            // range", so a downstream BFT consumer that wants a uniform
+            // [1,n] beacon can deterministically pick the first matched
+            // value in (coin, sub-output) order.
+            if self.coin_value_matches_uniform_range(number.as_slice()) {
+                log::info!(
+                    "[PPT][FIRST-MATCH] node {} round {} coin {} sub {} (index {}) lies in the uniform-sample range [0, n*floor(p/n))",
+                    self.myid,
+                    round,
+                    coin_num,
+                    i,
+                    global_index
+                );
             }
-        ).await;
-        self.add_cancel_handler(cancel_handler);
+
+            let cancel_handler = self.sync_send.send(
+                0,
+                SyncMsg {
+                    sender: self.myid,
+                    state: SyncState::BeaconRecon(round, self.myid, global_index, number),
+                    value: 0,
+                }
+            ).await;
+            self.add_cancel_handler(cancel_handler);
+        }
     }
 }
 

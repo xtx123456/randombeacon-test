@@ -309,7 +309,7 @@ impl BatchExtractor {
     }
 
     /// Extended Euclidean algorithm for modular inverse
-    fn mod_inverse(a: &BigInt, modulus: &BigInt) -> BigInt {
+    pub(crate) fn mod_inverse(a: &BigInt, modulus: &BigInt) -> BigInt {
         let a_pos = if a < &BigInt::zero() {
             a + modulus
         } else {
@@ -333,6 +333,108 @@ impl BatchExtractor {
         } else {
             s
         }
+    }
+}
+
+// ============================================================================
+// Part 2b: Super-Invertible (Hyper-Invertible) Randomness Extraction
+// ============================================================================
+
+/// Super-invertible (a.k.a. hyper-invertible) randomness extractor
+/// implementing the PPT "batch randomness extraction" step
+/// (slides 8-10). It replaces the degenerate all-ones sum with a
+/// genuine `R × m` super-invertible matrix.
+///
+/// Construction (Beerliová-Trubíniová & Hirt): given `m` distinct
+/// input points `α_1..α_m` and `R` distinct output points
+/// `β_1..β_R` (all `m + R` points distinct), the matrix
+/// `M[i][j] = L_j(β_i)` — where `L_j` is the Lagrange basis polynomial
+/// for the nodes `{α_j}` — is hyper-invertible: EVERY square submatrix
+/// is invertible. Applying it to a column of `m` dealer secrets
+/// `x = (x_1..x_m)` is exactly "interpolate the unique degree-(<m)
+/// polynomial `P` with `P(α_j) = x_j`, then output `P(β_i)` for each
+/// `i`".
+///
+/// Security: in one coin column, at most `f` of the `m` decided
+/// dealers are Byzantine; their `x_j` are committed during AVSS,
+/// independently of (and before) the `m - f ≥ f+1` honest, uniform,
+/// secret inputs. Hyper-invertibility guarantees that for ANY choice
+/// of which `f` columns are adversarial, the `R = m - f` outputs are a
+/// bijective image of the `m - f` honest inputs (the honest-column
+/// submatrix is square and invertible). Hence the `R` outputs are
+/// uniformly random and independent — uniform extraction tolerating
+/// `f` adversarial contributions, which a single summed output cannot
+/// provide (it yields only one value).
+#[derive(Clone, Debug)]
+pub struct SuperInvExtractor {
+    pub prime: BigUint,
+    pub num_inputs: usize,
+    pub num_outputs: usize,
+    /// `matrix[i][j] = L_j(β_i) mod p`, reduced into `[0, p)`.
+    matrix: Vec<Vec<BigUint>>,
+}
+
+impl SuperInvExtractor {
+    /// Build the extractor for input evaluation points `alpha_points`
+    /// (e.g. the sorted decided dealers' ids + 1) and `num_outputs`
+    /// extracted values per column. The output points are chosen
+    /// deterministically as `max(alpha)+1 .. max(alpha)+num_outputs`,
+    /// guaranteeing they are distinct from every `alpha`.
+    pub fn new(alpha_points: Vec<usize>, num_outputs: usize, prime: BigUint) -> Self {
+        let m = alpha_points.len();
+        let p_bi = BigInt::from_biguint(num_bigint::Sign::Plus, prime.clone());
+        let alphas: Vec<BigInt> =
+            alpha_points.iter().map(|&a| BigInt::from(a as i64)).collect();
+
+        // β points strictly above the largest α so all m + num_outputs
+        // points are distinct (α are dealer ids+1 in [1, n]).
+        let max_alpha = alpha_points.iter().copied().max().unwrap_or(0);
+        let betas: Vec<BigInt> = (1..=num_outputs)
+            .map(|i| BigInt::from((max_alpha + i) as i64))
+            .collect();
+
+        let mut matrix = Vec::with_capacity(num_outputs);
+        for beta in betas.iter() {
+            let mut row = Vec::with_capacity(m);
+            for j in 0..m {
+                // L_j(β) = Π_{k != j} (β - α_k) / (α_j - α_k)
+                let mut num = BigInt::one();
+                let mut den = BigInt::one();
+                for k in 0..m {
+                    if k != j {
+                        num = (num * (beta - &alphas[k])) % &p_bi;
+                        den = (den * (&alphas[j] - &alphas[k])) % &p_bi;
+                    }
+                }
+                let den_inv = BatchExtractor::mod_inverse(&den, &p_bi);
+                let coeff = (((num * den_inv) % &p_bi) + &p_bi) % &p_bi;
+                row.push(coeff.to_biguint().expect("coeff normalized to [0, p)"));
+            }
+            matrix.push(row);
+        }
+
+        Self {
+            prime,
+            num_inputs: m,
+            num_outputs,
+            matrix,
+        }
+    }
+
+    /// Extract `num_outputs` values from one column of `m` secrets
+    /// (`inputs[j]` is the secret at evaluation point `alpha_points[j]`,
+    /// in the SAME order passed to `new`).
+    pub fn extract(&self, inputs: &[BigUint]) -> Vec<BigUint> {
+        let cols = self.num_inputs.min(inputs.len());
+        let mut out = Vec::with_capacity(self.num_outputs);
+        for i in 0..self.num_outputs {
+            let mut acc = BigUint::zero();
+            for j in 0..cols {
+                acc = (acc + &self.matrix[i][j] * &inputs[j]) % &self.prime;
+            }
+            out.push(acc);
+        }
+        out
     }
 }
 
@@ -484,6 +586,103 @@ mod tests {
         assert_eq!(recovered.len(), num_coins);
         for (coin, rec_secret) in recovered {
             assert_eq!(rec_secret, secrets[coin], "Batch recovery failed for coin {}", coin);
+        }
+    }
+
+    /// The extractor's output_i must equal P(β_i), where P is the
+    /// degree-(<m) polynomial interpolating (α_j, x_j). We verify by
+    /// recomputing P(β_i) via an independent Lagrange evaluation.
+    #[test]
+    fn super_inv_matches_polynomial_evaluation() {
+        let prime = BigUint::from(685373784908497u64);
+        let m = 7usize;
+        let f = 2usize;
+        let r = m - f; // 5 outputs
+        let alpha: Vec<usize> = (1..=m).collect();
+
+        let mut rng = rand::thread_rng();
+        let inputs: Vec<BigUint> = (0..m)
+            .map(|_| rng.gen_biguint_range(&BigUint::from(0u32), &prime))
+            .collect();
+
+        let extractor = SuperInvExtractor::new(alpha.clone(), r, prime.clone());
+        let outputs = extractor.extract(&inputs);
+        assert_eq!(outputs.len(), r);
+
+        // Independent reference: interpolate P through (alpha_j, x_j)
+        // and evaluate at beta_i = max(alpha)+1.. via a one-row
+        // BatchExtractor trick (L_j(beta) = recover_one of unit basis).
+        let max_alpha = *alpha.iter().max().unwrap();
+        for i in 0..r {
+            let beta = max_alpha + 1 + i;
+            // P(beta) = Σ_j x_j * L_j(beta). Compute L_j(beta) by
+            // interpolating the j-th unit vector through alpha and
+            // evaluating at beta is overkill; instead reuse the
+            // standard Lagrange formula directly.
+            let p_bi = num_bigint::BigInt::from_biguint(
+                num_bigint::Sign::Plus,
+                prime.clone(),
+            );
+            let alphas: Vec<num_bigint::BigInt> =
+                alpha.iter().map(|&a| num_bigint::BigInt::from(a as i64)).collect();
+            let beta_bi = num_bigint::BigInt::from(beta as i64);
+            let mut expected = num_bigint::BigInt::from(0);
+            for j in 0..m {
+                let mut num = num_bigint::BigInt::from(1);
+                let mut den = num_bigint::BigInt::from(1);
+                for k in 0..m {
+                    if k != j {
+                        num = (num * (&beta_bi - &alphas[k])) % &p_bi;
+                        den = (den * (&alphas[j] - &alphas[k])) % &p_bi;
+                    }
+                }
+                let den_inv = BatchExtractor::mod_inverse(&den, &p_bi);
+                let lj = (((num * den_inv) % &p_bi) + &p_bi) % &p_bi;
+                let xj = num_bigint::BigInt::from_biguint(
+                    num_bigint::Sign::Plus,
+                    inputs[j].clone(),
+                );
+                expected = (expected + lj * xj) % &p_bi;
+            }
+            let expected = ((expected % &p_bi) + &p_bi) % &p_bi;
+            assert_eq!(
+                outputs[i],
+                expected.to_biguint().unwrap(),
+                "output {} must equal P(beta_{})",
+                i,
+                i
+            );
+        }
+    }
+
+    /// Hyper-invertibility sanity: every output must depend on every
+    /// input. Flipping a single (honest) input must change ALL outputs
+    /// — this is what makes a single honest uniform input randomize the
+    /// whole output vector, which the all-ones sum cannot do for more
+    /// than one output.
+    #[test]
+    fn super_inv_every_output_depends_on_each_input() {
+        let prime = BigUint::from(685373784908497u64);
+        let m = 6usize;
+        let f = 1usize;
+        let r = m - f;
+        let alpha: Vec<usize> = (1..=m).collect();
+        let extractor = SuperInvExtractor::new(alpha, r, prime.clone());
+
+        let base: Vec<BigUint> = (0..m).map(|j| BigUint::from((j as u64) + 1)).collect();
+        let base_out = extractor.extract(&base);
+
+        for flip in 0..m {
+            let mut alt = base.clone();
+            alt[flip] = (&alt[flip] + BigUint::from(12345u64)) % &prime;
+            let alt_out = extractor.extract(&alt);
+            for i in 0..r {
+                assert_ne!(
+                    base_out[i], alt_out[i],
+                    "output {} did not change when input {} changed (matrix entry must be nonzero)",
+                    i, flip
+                );
+            }
         }
     }
 }

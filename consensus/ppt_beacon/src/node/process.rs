@@ -924,11 +924,30 @@ impl Context {
             // coefficients are built on demand at recovery time.
             rbc_state.batch_extractor = None;
 
+            // Build the super-invertible (hyper-invertible) randomness
+            // extraction matrix for this round's immutable decided set.
+            // `alpha = sorted(decided) + 1`, `num_outputs = m - f`
+            // (>= f+1 >= 1). `coin_check` applies it per coin column to
+            // extract `m - f` independent beacon values, tolerating the
+            // <= f Byzantine dealers in the decided set.
+            use crate::node::shamir::two_field::SuperInvExtractor;
+            let m = decided_vec.len();
+            let num_outputs = m.saturating_sub(self.num_faults).max(1);
+            let alpha_points: Vec<usize> =
+                decided_vec.iter().map(|dealer| *dealer + 1).collect();
+            rbc_state.super_inv_extractor = Some(SuperInvExtractor::new(
+                alpha_points,
+                num_outputs,
+                rbc_state.secret_domain.clone(),
+            ));
+
             log::error!(
-                "[PPT][ACS-RECON] node {} round {} immutable decided_set = {:?} (reconstruction uses any f+1 validated providers per dealer)",
+                "[PPT][ACS-RECON] node {} round {} immutable decided_set = {:?} (reconstruction: any f+1 validated providers/dealer; extraction: super-invertible {}->{} per coin)",
                 self.myid,
                 round,
-                decided_vec
+                decided_vec,
+                m,
+                num_outputs
             );
             std::mem::take(&mut rbc_state.pre_acs_beacon_constructs)
         };
