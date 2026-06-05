@@ -7,6 +7,28 @@ use super::{Replica};
 
 pub type Val = [u8; HASH_SIZE];
 
+/// AVSS Merkle-commitment leaf for one (coin, recipient) slot.
+///
+/// Binds ALL of the recipient's confidential per-coin material —
+/// the small-field secret share `f(i) mod p`, the mask share
+/// `g(i) mod q`, the large-field share `f(i) mod q`, and the
+/// per-share nonce — into a single committed leaf. Previously only
+/// `(f_share, nonce)` was committed, leaving the mask `g` free; a
+/// Byzantine dealer could then pick `g(i)` AFTER learning the
+/// degree-test challenge and pass the test with an arbitrary-degree
+/// `f`. Committing `g` (and `f_large`) here is what makes the
+/// Fiat-Shamir degree-test challenge `θ = H(round‖dealer‖root_vec)`
+/// sound: the dealer must commit `f` and `g` before `θ` is
+/// determined.
+pub fn avss_commit_leaf(f_share: &Val, g_share: &Val, f_large: &Val, nonce: &Val) -> Hash {
+    let mut buf = Vec::with_capacity(4 * HASH_SIZE);
+    buf.extend_from_slice(f_share);
+    buf.extend_from_slice(g_share);
+    buf.extend_from_slice(f_large);
+    buf.extend_from_slice(nonce);
+    do_hash(buf.as_slice())
+}
+
 #[derive(Debug,Serialize,Deserialize,Clone)]
 pub struct BeaconMsg{
     pub origin: Replica,
@@ -114,13 +136,47 @@ impl BeaconMsg {
                 log::error!("Merkle proof verification failed for wssmsg sent by {}",wssmsg.origin);
                 return false;
             }
-            let secrets = wssmsg.secrets.clone();
-            let nonces = wssmsg.nonces.clone();
-            let commitments = hf.hash_batch(secrets, nonces);
-            for (pf,comm) in wssmsg.mps.iter().zip(commitments.into_iter()){
-                if pf.item() != comm{
-                    log::error!("Commitment does not match element in proof for wssmsg sent by {}",wssmsg.origin);
-                    return false;
+            // Two leaf formats share this function:
+            //   * PPT two-field path (`mask_shares` + `f_large_shares`
+            //     present): the committed leaf binds f_share, g_share
+            //     (mask), f_large AND nonce (`avss_commit_leaf`) — this
+            //     is what makes the Fiat-Shamir degree test sound.
+            //   * Legacy / non-two-field beacons (no mask/f_large):
+            //     the leaf is `hash(secret, nonce)`, as before.
+            // Branching on the presence of the two-field fields keeps
+            // both protocols (e.g. `bea` and `ppt`) working off the
+            // same shared `BeaconMsg`.
+            match (self.mask_shares.as_ref(), self.f_large_shares.as_ref()) {
+                (Some(mask), Some(f_large)) => {
+                    if mask.len() != wssmsg.secrets.len()
+                        || f_large.len() != wssmsg.secrets.len()
+                        || wssmsg.nonces.len() != wssmsg.secrets.len()
+                    {
+                        log::error!("mismatched per-coin lengths for commitment leaf (wss from {})", wssmsg.origin);
+                        return false;
+                    }
+                    for (coin, pf) in wssmsg.mps.iter().enumerate() {
+                        let leaf = avss_commit_leaf(
+                            &wssmsg.secrets[coin],
+                            &mask[coin],
+                            &f_large[coin],
+                            &wssmsg.nonces[coin],
+                        );
+                        if pf.item() != leaf {
+                            log::error!("Commitment does not match element in proof for wssmsg sent by {}",wssmsg.origin);
+                            return false;
+                        }
+                    }
+                }
+                _ => {
+                    // Legacy leaf = hash(secret, nonce).
+                    let commitments = hf.hash_batch(wssmsg.secrets.clone(), wssmsg.nonces.clone());
+                    for (pf, comm) in wssmsg.mps.iter().zip(commitments.into_iter()) {
+                        if pf.item() != comm {
+                            log::error!("Commitment does not match element in proof for wssmsg sent by {}",wssmsg.origin);
+                            return false;
+                        }
+                    }
                 }
             }
         }
@@ -256,6 +312,37 @@ pub enum CoinMsg{
     AVSSSecMsgCipherDispersal(Round, Replica, Vec<u8>),
     AVSSSecMsgCipherEcho(Round, Replica, Vec<u8>),
     AVSSSecMsgCipherVote(Round, Replica, Hash),
+
+    /// ACS common-coin reveal (PPT problem-1 fix: unpredictable
+    /// hash-based async common coin).
+    ///
+    /// `ACSCoinReveal(acs_round, aba_round, packet)`: the wire sender
+    /// reveals its Shamir shares of the sealed coin-secrets for
+    /// `aba_round`, one per dealer in the previous round's
+    /// ACS-decided set. The coin value `C = Σ_d reconstruct(
+    /// c_{d,aba_round})` stays hidden until f+1 honest reveals land —
+    /// and honest nodes only reveal AFTER fixing their `aba_round`
+    /// AUX — so the adversary cannot predict the coin before honest
+    /// AUX are committed, which is what MMR ABA termination requires.
+    ACSCoinReveal(Round, u64, BatchWSSReconMsg),
+
+    /// Lite AVSS transport (PPT pluggable-transport mode `lite`,
+    /// default). Carries the dealer-to-recipient confidential
+    /// `AvssRecipientPayload` (bincode `Vec<u8>`) as a single direct
+    /// unicast per recipient, paired with a broadcast
+    /// `AVSSSecMsgPublicCommit` for the shared public Merkle roots +
+    /// degree-test coefficients.
+    ///
+    /// `AVSSPrivatePayload(round, dealer, payload_bytes)`: the
+    /// wrapper-level `WrapperMsg.sender` MUST equal `dealer` (sender
+    /// binding, enforced receiver-side). This is the performance-
+    /// oriented alternative to the SS-AVSS Sec 4.3 `AVSSSecMsg*`
+    /// transport: PPT does not need Sec 4.3 application-layer
+    /// encryption (shares are unicast point-to-point and revealed at
+    /// reconstruction anyway), so the lite transport reduces the AVSS
+    /// phase from O(n^2) to O(n) wire messages per dealer per round.
+    /// PQ-safety unchanged (no new primitives).
+    AVSSPrivatePayload(Round, Replica, Vec<u8>),
 }
 
 /// Public AVSS commitment broadcast once per (round, dealer).
@@ -625,6 +712,11 @@ mod shoup_smart_avss_wire_tests {
             CoinMsg::AVSSSecMsgCipherDispersal(7, 2, vec![6u8, 7u8]),
             CoinMsg::AVSSSecMsgCipherEcho(7, 2, vec![8u8]),
             CoinMsg::AVSSSecMsgCipherVote(7, 2, sample_root(0xAD)),
+            CoinMsg::AVSSPrivatePayload(
+                7,
+                2,
+                vec![9u8, 10u8, 11u8, 12u8, 13u8],
+            ),
         ];
         for c in cases {
             let bytes = bincode::serialize(&c).expect("ser");
@@ -635,5 +727,33 @@ mod shoup_smart_avss_wire_tests {
             let bytes2 = bincode::serialize(&parsed).expect("re-ser");
             assert_eq!(bytes, bytes2);
         }
+    }
+
+    #[test]
+    fn private_payload_carries_recipient_bytes_unchanged() {
+        // The lite transport ships AvssRecipientPayload's bincode-
+        // serialized bytes verbatim inside AVSSPrivatePayload.
+        // Round-trip a real-shaped payload to confirm the wire
+        // format does not corrupt it.
+        let payload = AvssRecipientPayload::new(
+            vec![sample_val(0x11), sample_val(0x12)],
+            vec![sample_val(0x21), sample_val(0x22)],
+            vec![sample_val(0x31), sample_val(0x32)],
+            vec![sample_val(0x41), sample_val(0x42)],
+            Vec::new(),
+        );
+        let bytes = payload.serialize_bytes();
+        let wire = CoinMsg::AVSSPrivatePayload(11, 5, bytes.clone());
+        let ser = bincode::serialize(&wire).expect("ser");
+        let parsed: CoinMsg = bincode::deserialize(&ser).expect("de");
+        let extracted_bytes = match parsed {
+            CoinMsg::AVSSPrivatePayload(11, 5, b) => b,
+            other => panic!("wrong variant after deserialize: {:?}",
+                std::mem::discriminant(&other)),
+        };
+        assert_eq!(extracted_bytes, bytes);
+        let recovered = AvssRecipientPayload::deserialize_bytes(&extracted_bytes)
+            .expect("recovered payload deserializes");
+        assert_eq!(recovered, payload);
     }
 }

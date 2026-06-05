@@ -38,6 +38,12 @@ async fn main() -> Result<()> {
         .expect("Unable to parse syncer ip file");
     let frequency = m.value_of("frequency")
         .expect("Unable to parse frequency").parse::<u32>().unwrap();
+    // AVSS transport selector for vsstype=ppt. Parsed once at startup
+    // and pushed into Context::spawn so the dealer / receiver paths
+    // can branch without re-reading env state on every message.
+    let avss_transport = m.value_of("transport")
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_else(|| "lite".to_string());
     let conf_file = std::path::Path::new(conf_str.clone());
     let str = String::from(conf_str.clone());
     let mut config = match conf_file
@@ -77,7 +83,22 @@ async fn main() -> Result<()> {
             exit_tx = beacon::node::Context::spawn(config,sleep,batch,frequency).unwrap();
         },
         "ppt" => {
-            exit_tx = ppt_beacon::node::Context::spawn(config,sleep,batch,frequency).unwrap();
+            let transport = match avss_transport.as_str() {
+                "lite" => ppt_beacon::node::context::AvssTransport::Lite,
+                "secmsg" => ppt_beacon::node::context::AvssTransport::SecMsg,
+                other => panic!(
+                    "Invalid --transport value '{}'; expected 'lite' or 'secmsg'",
+                    other
+                ),
+            };
+            log::info!(
+                "[PPT][BOOT] starting ppt_beacon with AVSS transport = {:?}",
+                transport
+            );
+            exit_tx = ppt_beacon::node::Context::spawn(
+                config, sleep, batch, frequency, transport,
+            )
+            .unwrap();
         },
         "glow" => {
             let mut arr_strsplit:Vec<&str> = conf_str.split("/").collect();

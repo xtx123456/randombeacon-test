@@ -28,7 +28,7 @@ use types::{
     Replica,
 };
 
-use crate::node::shamir::two_field::BatchExtractor;
+use crate::node::shamir::two_field::{BatchExtractor, SuperInvExtractor};
 
 /// Post-ACS accountability evidence: who is being blamed, in which
 /// round, and why. The driver in `Context::ban_dealer_global` is the
@@ -127,11 +127,32 @@ pub struct CTRBCState {
     /// Lagrange-coefficient cache for the immutable ACS-decided
     /// evaluation points. Populated by `finalize_acs_round`.
     pub batch_extractor: Option<BatchExtractor>,
+    /// Super-invertible (hyper-invertible) randomness-extraction
+    /// matrix for the immutable ACS-decided set. Built once per round
+    /// by `finalize_acs_round` over `alpha = sorted(decided)+1` with
+    /// `num_outputs = |decided| - f`. Used by `coin_check` to extract
+    /// `|decided| - f` independent beacon values per coin column,
+    /// replacing the degenerate all-ones sum.
+    pub super_inv_extractor: Option<SuperInvExtractor>,
     /// Immutable ACS decision used as the reconstruction basis.
     pub acs_decided_set: Option<Vec<Replica>>,
     /// `BeaconConstruct` packets that arrived before ACS finalised;
     /// replayed once `finalize_acs_round` runs.
     pub pre_acs_beacon_constructs: Vec<(BatchWSSReconMsg, Replica, usize)>,
+
+    /// Reconstruction coin-packets `(packet, provider, coin)` that
+    /// could not yet be Merkle-validated because at least one
+    /// ACS-decided dealer's committed root vector (`comm_vectors`)
+    /// was not locally available when the packet arrived. This is a
+    /// transient async condition: the dealer's AVSS packet is
+    /// guaranteed to eventually arrive at every honest node by AVSS
+    /// totality (a decided dealer completed at >= n-f nodes). We
+    /// therefore buffer rather than drop, and replay from
+    /// `maybe_recover_ready_coins` once the missing commitment lands.
+    /// Without this buffer a share that raced ahead of its dealer's
+    /// AVSS commitment would be lost forever, potentially stalling
+    /// reconstruction even though enough honest providers responded.
+    pub pending_recon_shares: Vec<(BatchWSSReconMsg, Replica, usize)>,
 
     // ---- Post-ACS audit / accountability ----
     pub post_complaint_packets: HashMap<
@@ -151,9 +172,12 @@ pub struct CTRBCState {
     /// Coins whose beacon output has already been emitted upstream.
     pub emitted_beacon_coins: HashSet<usize, nohash_hasher::BuildNoHashHasher<usize>>,
     /// Beacon outputs computed by batch recovery, held until the
-    /// post-complaint audit is allowed to release them.
+    /// post-complaint audit is allowed to release them. Each coin
+    /// column now yields a VECTOR of `|decided| - f` extracted values
+    /// (super-invertible extraction), so the map value is a
+    /// `Vec<Vec<u8>>` indexed by sub-output.
     pub pending_beacon_outputs:
-        HashMap<usize, Vec<u8>, nohash_hasher::BuildNoHashHasher<usize>>,
+        HashMap<usize, Vec<Vec<u8>>, nohash_hasher::BuildNoHashHasher<usize>>,
 
     // ---- Round bootstrap flags ----
     /// Pure-PPT mode dealer-launch idempotency flag.
@@ -190,8 +214,10 @@ impl CTRBCState {
             recon_secrets: HashSet::default(),
 
             batch_extractor: None,
+            super_inv_extractor: None,
             acs_decided_set: None,
             pre_acs_beacon_constructs: Vec::new(),
+            pending_recon_shares: Vec::new(),
 
             post_complaint_packets: HashMap::default(),
             recovered_shares_multicast_sent: false,
@@ -391,18 +417,29 @@ impl CTRBCState {
         }
     }
 
-    /// Pure-PPT beacon extraction: once every ACS-decided dealer has
-    /// been reconstructed for `coin_number`, sum their secrets modulo
-    /// the secret domain to derive the beacon value.
+    /// PPT batch randomness extraction (slides 8-10): once every
+    /// ACS-decided dealer has been reconstructed for `coin_number`,
+    /// apply the super-invertible (hyper-invertible) matrix to the
+    /// vector of decided dealers' secrets to extract
+    /// `|decided| - f` independent beacon values for this coin column.
+    ///
+    /// This replaces the previous degenerate all-ones sum (which
+    /// produced a single value per coin). The all-ones sum is the
+    /// `m'=1` special case of this extractor; using the full
+    /// `(m-f) × m` super-invertible matrix yields `m-f` independent
+    /// uniform outputs per column, tolerating up to `f` adversarial
+    /// dealer contributions — the extraction-rate the PPT design
+    /// targets.
     ///
     /// Returns `None` if reconstruction is not yet complete for the
-    /// coin or if the ACS-decided set has not been published.
+    /// coin, if the ACS-decided set has not been published, or if the
+    /// super-invertible extractor has not been built.
     pub async fn coin_check(
         &mut self,
         round: Round,
         coin_number: usize,
         _num_nodes: usize,
-    ) -> Option<Vec<u8>> {
+    ) -> Option<Vec<Vec<u8>>> {
         let decided = match self.acs_decided_set.clone() {
             Some(v) if !v.is_empty() => v,
             _ => {
@@ -439,36 +476,49 @@ impl CTRBCState {
             }
         }
 
-        let mut sum_vars = BigUint::from(0u32);
+        // Build the input column in the SAME order as the extractor's
+        // alpha points (sorted decided dealers).
         let mut decided_sorted = decided.clone();
         decided_sorted.sort_unstable();
+        let inputs: Vec<BigUint> = decided_sorted
+            .iter()
+            .map(|dealer| recon_map.get(dealer).unwrap().clone() % self.secret_domain.clone())
+            .collect();
 
-        for dealer in decided_sorted.iter().copied() {
-            let sec = recon_map.get(&dealer).unwrap();
-            log::info!(
-                "[PPT][COIN-CHECK] round {} coin {} including dealer {} reconstructed secret {}",
-                round,
-                coin_number,
-                dealer,
-                sec
-            );
-            sum_vars += sec.clone();
-        }
+        let extractor = match self.super_inv_extractor.as_ref() {
+            Some(e) => e,
+            None => {
+                log::error!(
+                    "[PPT][COIN-CHECK] round {} coin {} skipped: super-invertible extractor not built",
+                    round,
+                    coin_number
+                );
+                return None;
+            }
+        };
 
-        let rand_fin = sum_vars % self.secret_domain.clone();
+        let extracted = extractor.extract(&inputs);
 
-        log::info!(
-            "[PPT][COIN-CHECK] round {} coin {} pure-PPT beacon value computed (mod p)",
+        // Demoted to `debug` (Phase E): this fires once per coin
+        // (batch_size lines/round) and adds no operational value over
+        // the round-level [STAGE][BEACON-OUT] marker. Re-enable with
+        // `RUST_LOG=ppt_beacon=debug`.
+        log::debug!(
+            "[PPT][COIN-CHECK] round {} coin {} super-invertible extraction produced {} beacon value(s) from {} decided dealers",
             round,
-            coin_number
+            coin_number,
+            extracted.len(),
+            decided_sorted.len()
         );
+
+        let outputs: Vec<Vec<u8>> = extracted.iter().map(BigUint::to_bytes_be).collect();
 
         // Mark and clean up this coin's transient recovery state.
         self.recon_secrets.insert(coin_number);
         self.secret_shares.remove(&coin_number);
         self.reconstructed_secrets.remove(&coin_number);
 
-        Some(BigUint::to_bytes_be(&rand_fin))
+        Some(outputs)
     }
 
     /// Wipe transient state when the round is fully finished (every
@@ -495,8 +545,10 @@ impl CTRBCState {
         self.recon_secrets.clear();
 
         self.batch_extractor = None;
+        self.super_inv_extractor = None;
         self.acs_decided_set = None;
         self.pre_acs_beacon_constructs.clear();
+        self.pending_recon_shares.clear();
 
         self.post_complaint_packets.clear();
         self.recovered_shares_multicast_sent = false;

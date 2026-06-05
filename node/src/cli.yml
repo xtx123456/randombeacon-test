@@ -62,3 +62,24 @@ args:
         long: frequency
         help: Frequency of initiating batchwss
         takes_value: true
+    - transport:
+        long: transport
+        help: |
+            AVSS transport selector for vsstype=ppt. One of:
+              'lite'   (default) -- direct cleartext per-recipient unicast
+                                    of AvssRecipientPayload + broadcast
+                                    AvssPublicCommitMsg. O(n) wire msgs
+                                    per dealer per round. Assumes the
+                                    network layer (TLS or trusted LAN)
+                                    is confidential.
+              'secmsg'           -- Shoup-Smart 2024 Sec 4.3 Pi_SecMsgDst
+                                    transport: per-recipient share
+                                    encrypted with a Shamir-shared master
+                                    key + per-recipient PRG stream,
+                                    dispersed via two RBC channels.
+                                    O(n^2) wire msgs per dealer per
+                                    round. Suitable for plaintext-network
+                                    deployments and paper-compliance
+                                    benchmarks.
+            Ignored when vsstype != 'ppt'.
+        takes_value: true

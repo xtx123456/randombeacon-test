@@ -306,13 +306,34 @@ impl AbaInstance {
             }
 
             // Pair {0,1} — only if both ∈ bin_values.
+            //
+            // The MMR 2014 advancement rule requires the
+            // candidate AUX count to be the number of DISTINCT
+            // senders whose AUX(r, *) lies in `values`, not the
+            // sum of per-bucket counts. A Byzantine peer that
+            // equivocates and ships AUX(r, 0) AND AUX(r, 1) ends
+            // up in both `aux_senders_0` and `aux_senders_1`; the
+            // naive `aux0 + aux1` count double-counts that peer.
+            //
+            // For n = 4, f = 1: a single Byzantine equivocator
+            // plus one honest AUX(r, 1) gives aux0 = {B}, aux1 =
+            // {B, honest_a}, |aux0| + |aux1| = 3 = n-f, which the
+            // buggy code accepts as a pair advancement -- but the
+            // distinct-sender union is only {B, honest_a} (size 2
+            // < n-f), so MMR Theorem 6 / 7's safety + termination
+            // proof would not actually apply at that point.
+            //
+            // The singleton case above is already correct because
+            // `aux_senders_b` is itself a HashSet<Replica>, so its
+            // `.len()` is the distinct-sender count.
             if chosen.is_none() && bin.contains(&false) && bin.contains(&true) {
-                let count = aux0 + aux1;
-                if count >= nmf {
+                let pair_distinct =
+                    st.aux_senders_0.union(&st.aux_senders_1).count();
+                if pair_distinct >= nmf {
                     let mut s = BTreeSet::new();
                     s.insert(false);
                     s.insert(true);
-                    chosen = Some((s, count));
+                    chosen = Some((s, pair_distinct));
                 }
             }
 
@@ -549,6 +570,91 @@ mod tests {
         let acts = inst.handle_bval(0, true, 2);
         let any_aux = acts.iter().any(|a| matches!(a, AbaAction::SendAux { .. }));
         assert!(any_aux, "AUX should fire at the 2f+1 threshold, got {:?}", acts);
+    }
+
+    #[test]
+    fn pair_case_uses_distinct_sender_union_under_aux_equivocation() {
+        // Regression: the pair-case AUX threshold MUST count
+        // distinct senders, not the sum |aux_0| + |aux_1|.
+        //
+        // A Byzantine peer that equivocates and ships both AUX(r, 0)
+        // and AUX(r, 1) ends up in both `aux_senders_0` and
+        // `aux_senders_1`. The pre-fix code summed the bucket sizes,
+        // so that single Byzantine peer was double-counted. MMR
+        // Theorem 6/7's safety + termination proof requires a count
+        // of DISTINCT senders -- the same way the singleton rule
+        // already counted (via `HashSet::len`).
+        //
+        // We construct a scenario where:
+        //   * `bin_values = {0, 1}`,
+        //   * `aux_senders_0 = {peer 0, peer 1}`,
+        //   * `aux_senders_1 = {peer 0}`,
+        //   * neither singleton crosses n-f.
+        //
+        // Then |aux_0| + |aux_1| = 2 + 1 = 3 = n-f and pre-fix
+        // would have prematurely advanced via the pair case, but
+        // the distinct-sender union is {peer 0, peer 1} = 2 < n-f
+        // and post-fix MUST NOT advance.
+        //
+        // After feeding the coin we assert that the instance is
+        // still in round 0 and undecided.
+        let mut inst = AbaInstance::new(3, 4, 1);
+        let _ = inst.set_input(false);
+
+        // Push BVAL(0, 1) to 2f+1 = 3 distinct senders -> bin gains 1.
+        let _ = inst.handle_bval(0, true, 0);
+        let _ = inst.handle_bval(0, true, 1);
+        let _ = inst.handle_bval(0, true, 2);
+        // Self-deliver our own BVAL(0, 0).
+        let _ = inst.handle_bval(0, false, 3);
+        // Push BVAL(0, 0) to 2f+1 distinct senders -> bin gains 0.
+        let _ = inst.handle_bval(0, false, 0);
+        let _ = inst.handle_bval(0, false, 1);
+        let st = inst.rounds.get(&0).unwrap();
+        assert!(
+            st.bin_values.contains(&false) && st.bin_values.contains(&true),
+            "bin_values must be {{0, 1}} to even reach the pair-case rule"
+        );
+
+        // Feed AUXes from EXACTLY 2 distinct senders, with one of
+        // them equivocating. Crucially we do NOT self-deliver any
+        // local AUX that the state machine emitted as a side effect
+        // of BVAL -> bin_values transitions: those are returned as
+        // `AbaAction::SendAux` actions but never inserted into
+        // `aux_senders_*` unless the driver explicitly calls
+        // handle_aux(myid, ...). That matches the wire model and
+        // lets us control aux_senders_* deterministically.
+        let _ = inst.handle_aux(0, false, 0); // Byzantine peer 0 -> aux_0
+        let _ = inst.handle_aux(0, true, 0);  // Byzantine peer 0 -> aux_1 (equivocation)
+        let _ = inst.handle_aux(0, false, 1); // honest peer 1 -> aux_0
+
+        let st = inst.rounds.get(&0).unwrap();
+        assert_eq!(st.aux_senders_0.len(), 2, "aux_senders_0 = {{0, 1}}");
+        assert_eq!(st.aux_senders_1.len(), 1, "aux_senders_1 = {{0}}");
+        // sum = 3 (would pass pre-fix); distinct union = 2 (must
+        // not pass post-fix).
+        assert_eq!(
+            st.aux_senders_0.union(&st.aux_senders_1).count(),
+            2,
+            "distinct AUX-sender union counted across both buckets must be 2"
+        );
+
+        // Feed the coin and assert the instance did NOT advance.
+        let _ = inst.handle_coin(0, true);
+        let st = inst.rounds.get(&0).unwrap();
+        assert!(
+            !st.advanced,
+            "post-fix: pair-case MUST NOT advance round when only 2 distinct \
+             AUX senders contributed (pre-fix sum = 3 would have erroneously advanced)"
+        );
+        assert_eq!(
+            inst.current_round, 0,
+            "instance must still be in round 0 after pair-case rejection"
+        );
+        assert!(
+            inst.decided_value.is_none(),
+            "instance must not have decided in round 0 from Byzantine-only equivocation"
+        );
     }
 
     #[test]

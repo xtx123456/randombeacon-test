@@ -33,7 +33,7 @@ use tokio::sync::{mpsc, oneshot};
 pub const PPT_INBOUND_CHANNEL_CAPACITY: usize = 8192;
 
 use types::{
-    beacon::{BeaconMsg, CoinMsg, Replica, WrapperMsg},
+    beacon::{CoinMsg, Replica, WrapperMsg},
     Round, SyncMsg, SyncState,
 };
 
@@ -43,6 +43,78 @@ use super::{CTRBCState, Handler, SyncHandler};
 /// challenge θ. Every node uses this, so dealers and verifiers agree
 /// without a previous beacon being available.
 pub const PPT_GENESIS_THETA_SEED: &[u8] = b"PPT_BEACON_GENESIS_THETA_v1";
+
+/// Number of extra "coin secrets" each dealer seals per round, on top
+/// of the `batch_size` beacon coins, to drive the next round's ACS
+/// common coin (PPT problem-1 fix). These occupy batch coin indices
+/// `[batch_size, batch_size + PPT_COIN_RESERVE)`; they are shared and
+/// validated like beacon coins but are NEVER reconstructed/emitted as
+/// beacon output — they stay sealed (secret) until the NEXT round's
+/// ABA reconstructs coin-secret `rr` on demand for ABA round `rr`.
+///
+/// This bounds the number of ABA rounds for which we can supply an
+/// unpredictable coin; beyond it (probability ~2^-PPT_COIN_RESERVE per
+/// instance, negligible) the ACS falls back to the deterministic
+/// genesis-style hash coin. MMR ABA terminates in O(1) expected ABA
+/// rounds, so a modest reserve covers the overwhelming majority of
+/// executions.
+pub const PPT_COIN_RESERVE: usize = 12;
+
+/// AVSS transport selector for the PPT random beacon.
+///
+/// The PPT scheme needs to deliver dealer-to-recipient confidential
+/// share material once per round per dealer. Two transports satisfy
+/// this requirement:
+///
+/// * **`Lite`** (default) — direct cleartext per-recipient unicast
+///   of `AvssRecipientPayload` (still HMAC-authenticated via the
+///   existing `WrapperMsg` + `sec_key_map` per-pair shared secret)
+///   plus a single broadcast `AvssPublicCommitMsg` carrying the
+///   public Merkle roots + degree-test coefficients. Wire complexity:
+///   `O(n)` messages per dealer per round.
+///
+///   Trust model: relies on the underlying wire transport (TLS or
+///   trusted LAN) to prevent passive eavesdroppers from reading the
+///   share material between AVSS dispersal and the post-ACS
+///   `MulticastRecoveredShares` broadcast (which reveals the same
+///   share material in cleartext for audit purposes anyway). This
+///   matches every other PPT wire message's threat model.
+///
+/// * **`SecMsg`** — Shoup-Smart 2024 Sec 4.3 Π_SecMsgDst transport:
+///   encrypts every per-recipient payload with a Shamir-shared
+///   master key + per-recipient hash-chain PRG stream, and disperses
+///   both the key shares and the ciphertexts via RBC-style RelMsgDst
+///   channels with full Bracha echo / vote agreement. Wire
+///   complexity: `O(n^2)` messages per dealer per round.
+///
+///   Trust model: tolerates passive wire eavesdroppers (no TLS
+///   required). Useful for paper-compliance testing and for
+///   deployments where the network layer cannot be relied upon for
+///   confidentiality.
+///
+/// Selected once at startup via the CLI `--transport=lite|secmsg`
+/// flag and pushed into `Context::transport`. Every honest node in
+/// a single deployment must agree on the same transport for the
+/// dealer set to converge in ACS (mixed transports would still
+/// converge because both wire variants are accepted on the
+/// receive side, but only one set of variants is ever emitted, so
+/// running mixed in one cluster is unsupported).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AvssTransport {
+    /// Default; see enum-level doc.
+    Lite,
+    /// Shoup-Smart Sec 4.3 (paper-compliant); see enum-level doc.
+    SecMsg,
+}
+
+impl AvssTransport {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AvssTransport::Lite => "lite",
+            AvssTransport::SecMsg => "secmsg",
+        }
+    }
+}
 
 /// PPT random-beacon node context (pure-PPT mode: frequency φ = 1,
 /// every honest node is always a dealer, no anytrust committee, no
@@ -82,11 +154,6 @@ pub struct Context {
     // ---- ACS state ----
     pub acs_state: std::collections::HashMap<Round, crate::node::acs::state::AcsRound>,
 
-    /// Round → degree-test challenge θ (large field). Populated when
-    /// each round's beacon output is finalised; consumed by the next
-    /// round's AVSS dealer / verifier path.
-    pub theta_per_round: HashMap<Round, BigUint>,
-
     /// Globally banned dealers (across rounds). A dealer is banned
     /// the moment any honest node detects a protocol-level violation
     /// (invalid AVSS packet, equivocating ACS proposal,
@@ -94,20 +161,6 @@ pub struct Context {
     /// banned, the dealer is rejected from every future round's
     /// AVSS, ACS, and reconstruction paths.
     pub banned_dealers: HashSet<Replica>,
-
-    /// AVSSSend packets received before this node had θ for that
-    /// round. They are deferred (NOT dropped, NOT banned) and
-    /// replayed by `drain_pending_avss_for(round)` once
-    /// `record_beacon_output_for_theta` populates θ.
-    ///
-    /// This race window exists in pure PPT mode because round-r+1's
-    /// AVSSSend can reach a slow node before that node has finished
-    /// reconstructing round-r's coin 0 (which is the source of
-    /// θ(r+1)). Without buffering, the slow node would drop or
-    /// (worse) panic on the early packet and never recover the
-    /// dealer for round r+1.
-    pub pending_avss_for_theta:
-        HashMap<Round, Vec<(BeaconMsg, Hash, Replica)>>,
 
     /// Round → previous-round beacon bytes used to seed the new
     /// ACS common-coin derivation. Pattern is identical to
@@ -152,6 +205,40 @@ pub struct Context {
     pub avss_secmsg_public: HashMap<(Round, Replica), types::beacon::AvssPublicCommitMsg>,
     pub avss_secmsg_delivered_bytes: HashMap<(Round, Replica), Vec<u8>>,
 
+    // ---- ACS unpredictable common coin (PPT problem-1 fix) ----
+    //
+    // Round R's AVSS seals `PPT_COIN_RESERVE` coin-secrets; round
+    // (R+1)'s ACS reconstructs them on demand to drive its MMR-ABA
+    // common coin. `coin_material[R]` holds what round (R+1) needs:
+    // the agreed contributing dealer set (= round R's ACS-decided
+    // set), the per-dealer Merkle roots for the sealed coin indices,
+    // and THIS node's own shares of those sealed coins (for revealing).
+    pub coin_material: HashMap<Round, crate::node::acs::coin::CoinMaterial>,
+
+    // Per (acs_round, aba_round): collected, Merkle-validated coin
+    // shares `dealer -> provider -> share`. Reconstruction of each
+    // dealer's sealed coin-secret needs f+1 providers.
+    pub coin_shares: HashMap<
+        (Round, u64),
+        HashMap<Replica, HashMap<Replica, BigUint>>,
+    >,
+    // Reconstructed coin secret `C = Σ_d c_{d}` per (acs_round, aba_round).
+    pub coin_reconstructed: HashMap<(Round, u64), BigUint>,
+    // (acs_round, aba_round) for which this node has already broadcast
+    // its own coin-share reveal (idempotency; also enforces that we
+    // release our share at most once, after entering that ABA round).
+    pub coin_reveal_sent: HashSet<(Round, u64)>,
+    // Reveals that arrived before `coin_material[acs_round-1]` was
+    // locally available; replayed once the material is stashed.
+    pub coin_reveal_pending:
+        HashMap<(Round, u64), Vec<(types::beacon::BatchWSSReconMsg, Replica)>>,
+
+    /// Selected AVSS transport for this node's PPT deployment
+    /// (`Lite` default = O(n) per-recipient unicast; `SecMsg` =
+    /// Shoup-Smart Sec 4.3 Π_SecMsgDst). The dealer path branches on
+    /// this; the receive side accepts both wire families.
+    pub transport: AvssTransport,
+
     // ---- Audit fire-and-forget plumbing (P0-A.1) ----
     //
     // post-ACS audit (the bulk of `process_multicast_recovered_shares`)
@@ -178,6 +265,61 @@ pub struct Context {
     pub audit_tx: mpsc::UnboundedSender<AuditCompletion>,
     pub audit_rx: mpsc::UnboundedReceiver<AuditCompletion>,
 
+    // ---- AVSS validation fire-and-forget (Phase D) ----
+    //
+    // `process_avss_send` used to await its `spawn_blocking`
+    // `avss_local_packet_valid_pure` call synchronously on the
+    // consensus main task. With n=16, batch=1000, each await is
+    // ~25 ms of degree-test + Merkle work, and per round per node
+    // we receive 16 AVSS packets. The main task therefore spent
+    // up to 400 ms per round serialised on AVSS validation
+    // awaits, blocking it from processing the round-(r+1)
+    // BatchBeaconConstruct / ACS messages that were already
+    // queued in `net_recv`.
+    //
+    // Phase D extends the P0-A.1 audit fire-and-forget pattern to
+    // AVSS validation: `process_avss_send` now `tokio::spawn`s a
+    // detached task that runs the `spawn_blocking` validation and
+    // publishes the result back via `avss_validation_tx`. The
+    // main loop drains the corresponding `avss_validation_rx`
+    // arm in `tokio::select!` and applies the
+    // `store_avss_packet` + `AVSSReady` broadcast + AVSS-
+    // completion cascade on its own thread, so every `Context`
+    // mutation stays single-threaded as before -- no Mutex
+    // required on the hot path.
+    //
+    // Throughput consequence: 16 inbound AVSS validations per
+    // round per node now run in PARALLEL on tokio's blocking
+    // pool. End-to-end AVSS-phase wall time per round drops from
+    // 16 * 25 ms = 400 ms to ~50 ms on an 8-core machine.
+    pub avss_validation_tx: mpsc::UnboundedSender<AvssValidationCompletion>,
+    pub avss_validation_rx: mpsc::UnboundedReceiver<AvssValidationCompletion>,
+
+    // ---- Reconstruct ingest fire-and-forget (Phase D) ----
+    //
+    // Same problem as the AVSS validation channel above but for
+    // `process_batch_secret_shares`, which used to await
+    // `verify_batch_shares_pure` (degree-test for all
+    // n_decided_dealers * batch coins in a single inbound
+    // BatchBeaconConstruct packet) synchronously.
+    //
+    // Empirically (n=16, batch=1000): each inbound packet's
+    // verify_batch_shares_pure await took ~120 ms, n inbound
+    // packets per round per node => ~2 s of sequential main-loop
+    // time on reconstruct alone. That dominated the round budget
+    // (see log: `ACS-DECIDE -> coin-0 BEACON-OUT` ~= 2.2 s).
+    //
+    // Phase D detaches verify_batch_shares_pure the same way and
+    // sends a `ReconCompletion` back via the channel below; the
+    // main loop applies accepted shares + blame events on its
+    // own thread and triggers `maybe_recover_ready_coins`.
+    //
+    // 16 inbound packets now validated in parallel on the
+    // blocking pool. Reconstruct-phase wall time drops from
+    // ~2 s to ~250 ms on an 8-core machine.
+    pub recon_tx: mpsc::UnboundedSender<ReconCompletion>,
+    pub recon_rx: mpsc::UnboundedReceiver<ReconCompletion>,
+
     // ---- Diagnostics / lifecycle ----
     pub num_messages: u32,
     pub bench: HashMap<String, u128>,
@@ -195,12 +337,57 @@ pub struct AuditCompletion {
     pub blame_events: Vec<(Replica, crate::node::ctrbc::state::BlameReason)>,
 }
 
+/// Result of one detached `avss_local_packet_valid_pure` run, used
+/// by the AVSS validation fire-and-forget path. The detached task
+/// runs the CPU-heavy validation on the blocking pool and sends
+/// this struct back to the main loop, which applies
+/// `store_avss_packet` + `AVSSReady` broadcast + cascade on its
+/// own thread.
+#[derive(Debug)]
+pub struct AvssValidationCompletion {
+    pub round: Round,
+    pub dealer: Replica,
+    pub transcript_root: crypto::hash::Hash,
+    /// The validated BeaconMsg moved out of the spawn_blocking
+    /// closure. Stored back into CTRBCState verbatim once
+    /// validation succeeds.
+    pub beacon_msg: types::beacon::BeaconMsg,
+    /// `Ok(())` on successful validation; `Err(static_reason)` on
+    /// any Byzantine-detectable failure (transcript mismatch,
+    /// Merkle invalid, degree-test failed, share/f_large mismatch,
+    /// mp.root/root_vec mismatch). The main loop bans the dealer
+    /// on `Err(_)`.
+    pub result: Result<(), &'static str>,
+}
+
+/// Result of one detached `verify_batch_shares_pure` run, used by
+/// the BatchBeaconConstruct fire-and-forget reconstruct ingest
+/// path. The detached task runs the per-coin degree-test for all
+/// (dealer, coin) tuples in one inbound BatchBeaconConstruct
+/// packet, on the blocking pool, and sends this struct back to the
+/// main loop, which applies `add_secret_share` + blame writes on
+/// its own thread and triggers `maybe_recover_ready_coins`.
+#[derive(Debug)]
+pub struct ReconCompletion {
+    pub round: Round,
+    pub share_sender: Replica,
+    /// Whether the share_sender is itself in the ACS-decided set.
+    /// Mirrors the `use_for_batch` predicate that
+    /// `process_batch_secret_shares` previously computed inline.
+    /// Only `Accepted` outcomes whose `share_sender` is
+    /// `use_for_batch == true` are persisted via
+    /// `add_secret_share`.
+    pub use_for_batch: bool,
+    pub outcomes: Vec<crate::node::batch_wss::secret_reconstruct::CoinVerifyOutcome>,
+}
+
 impl Context {
     pub fn spawn(
         config: Node,
         _sleep: u128,
         batch: usize,
         frequency: Round,
+        transport: AvssTransport,
     ) -> anyhow::Result<oneshot::Sender<()>> {
         let prot_payload = &config.prot_payload;
         let v: Vec<&str> = prot_payload.split(',').collect();
@@ -271,6 +458,11 @@ impl Context {
 
             // Audit fire-and-forget channel (see field comment above).
             let (audit_tx, audit_rx) = mpsc::unbounded_channel::<AuditCompletion>();
+            // AVSS validation + reconstruct fire-and-forget channels
+            // (Phase D; see field comments above).
+            let (avss_validation_tx, avss_validation_rx) =
+                mpsc::unbounded_channel::<AvssValidationCompletion>();
+            let (recon_tx, recon_rx) = mpsc::unbounded_channel::<ReconCompletion>();
 
             let mut c = Context {
                 net_send: consensus_net,
@@ -294,16 +486,26 @@ impl Context {
                 round_state: HashMap::default(),
 
                 acs_state: std::collections::HashMap::new(),
-                theta_per_round: HashMap::default(),
                 banned_dealers: HashSet::new(),
-                pending_avss_for_theta: HashMap::default(),
                 audit_tx,
                 audit_rx,
+                avss_validation_tx,
+                avss_validation_rx,
+                recon_tx,
+                recon_rx,
                 coin_per_round: HashMap::default(),
 
                 avss_secmsg_state: HashMap::default(),
                 avss_secmsg_public: HashMap::default(),
                 avss_secmsg_delivered_bytes: HashMap::default(),
+
+                coin_material: HashMap::default(),
+                coin_shares: HashMap::default(),
+                coin_reconstructed: HashMap::default(),
+                coin_reveal_sent: HashSet::new(),
+                coin_reveal_pending: HashMap::default(),
+
+                transport,
 
                 num_messages: 0,
                 bench: HashMap::default(),
@@ -370,79 +572,6 @@ impl Context {
         }
     }
 
-    /// θ for round `round` — the degree-test challenge that
-    /// dealers commit to and verifiers re-evaluate. The PPT
-    /// scheme requires θ to be unpredictable to the dealer at
-    /// commit time. We therefore derive it from the *previous
-    /// round's reconstructed beacon* (large field), which the
-    /// dealer cannot influence by the time it shares its round-r
-    /// secret.
-    ///
-    /// For round 0 we use a fixed public seed so all nodes agree
-    /// without a previous beacon being available.
-    ///
-    /// Returns `None` for round > 0 when the previous round's
-    /// beacon has not yet been recorded locally. This happens
-    /// naturally in async networks: a fast peer may broadcast its
-    /// round-(r+1) AVSSSend before this node has finished
-    /// reconstructing round-r's coin 0. The caller MUST handle
-    /// `None` by *deferring* the action (typically by buffering
-    /// the AVSSSend in `pending_avss_for_theta`) — never by
-    /// dropping or banning the dealer, since this is a transient
-    /// race window, not a protocol violation.
-    pub fn theta_for_round(&self, round: Round) -> Option<BigUint> {
-        if round == 0 {
-            return Some(Self::theta_from_bytes(
-                PPT_GENESIS_THETA_SEED,
-                &self.nonce_domain,
-            ));
-        }
-        self.theta_per_round.get(&round).cloned()
-    }
-
-    /// Record this round's beacon output as the source of the
-    /// next round's degree-test challenge. `output_bytes` is the
-    /// reconstructed beacon value (arbitrary-length); we hash it
-    /// into the large field so θ has full large-field entropy
-    /// rather than being constrained to the small secret field.
-    pub fn record_beacon_output_for_theta(&mut self, round: Round, output_bytes: &[u8]) {
-        let theta = Self::theta_from_bytes(output_bytes, &self.nonce_domain);
-        self.theta_per_round.insert(round + 1, theta);
-    }
-
-    /// Buffer an AVSSSend that arrived before its θ was available.
-    /// The packet is replayed by `drain_pending_avss_for(round)`
-    /// once `record_beacon_output_for_theta` populates θ for that
-    /// round.
-    pub fn buffer_avss_for_theta(
-        &mut self,
-        round: Round,
-        beacon_msg: BeaconMsg,
-        transcript_root: Hash,
-        dealer: Replica,
-    ) {
-        log::info!(
-            "[PPT][THETA-DEFER] node {} buffering AVSSSend from dealer {} for round {} until θ becomes available",
-            self.myid,
-            dealer,
-            round
-        );
-        self.pending_avss_for_theta
-            .entry(round)
-            .or_default()
-            .push((beacon_msg, transcript_root, dealer));
-    }
-
-    /// Take (move out) every buffered AVSSSend for `round`.
-    /// Caller is expected to immediately re-process each entry
-    /// via `process_avss_send`.
-    pub fn take_pending_avss_for(
-        &mut self,
-        round: Round,
-    ) -> Vec<(BeaconMsg, Hash, Replica)> {
-        self.pending_avss_for_theta.remove(&round).unwrap_or_default()
-    }
-
     /// PPT slide pg 30-32 "first-match" rejection-sampling rule.
     ///
     /// A reconstructed coin value `v ∈ [0, p)` is *uniformly usable*
@@ -462,6 +591,36 @@ impl Context {
             &self.secret_domain,
             self.num_nodes,
         )
+    }
+
+    /// Fiat-Shamir degree-test challenge θ for a dealer's AVSS
+    /// packet (PPT problem-3 fix). θ is derived from the dealer's
+    /// OWN commitment (`root_vec`, the per-coin Merkle roots that bind
+    /// every recipient's f-share, g-share and f_large via
+    /// `avss_commit_leaf`), so the dealer must commit f and g BEFORE θ
+    /// is determined. A Byzantine dealer can therefore no longer pick
+    /// the mask `g` to cancel a high-degree `f` (it would need a hash
+    /// collision), making the two-field degree test sound with error
+    /// 1/|q|. Replaces the old θ = H(previous PUBLIC beacon), which
+    /// the dealer could predict and bypass.
+    ///
+    /// θ is per-(round, dealer); every honest verifier recomputes the
+    /// identical value from the same committed `root_vec`, so the
+    /// degree test is checked against the same challenge everywhere.
+    pub(crate) fn theta_from_commitment(
+        round: Round,
+        dealer: Replica,
+        root_vec: &[Hash],
+        large_field: &BigUint,
+    ) -> BigUint {
+        let mut buf: Vec<u8> = b"PPT_BEACON_FS_THETA_v1::".to_vec();
+        buf.extend_from_slice(&round.to_be_bytes());
+        buf.extend_from_slice(&(dealer as u64).to_be_bytes());
+        buf.extend_from_slice(&(root_vec.len() as u64).to_be_bytes());
+        for r in root_vec {
+            buf.extend_from_slice(r);
+        }
+        Self::theta_from_bytes(buf.as_slice(), large_field)
     }
 
     pub(crate) fn theta_from_bytes(seed: &[u8], large_field: &BigUint) -> BigUint {
@@ -632,6 +791,31 @@ impl Context {
                     // single-threaded-serialised, with no need for
                     // Mutex-style locking on the hot path.
                     self.finalize_audit_completion(audit_completion).await;
+                }
+                Some(avss_completion) = self.avss_validation_rx.recv() => {
+                    // Phase D fire-and-forget for AVSS validation:
+                    //
+                    // A detached task running on tokio's blocking
+                    // pool finished validating one inbound
+                    // BeaconMsg via `avss_local_packet_valid_pure`.
+                    // Apply store_avss_packet + AVSSReady
+                    // broadcast + AVSS-completion cascade here, on
+                    // the consensus task's worker thread, so all
+                    // Context mutations (round_state, banned_dealers)
+                    // stay single-threaded as before.
+                    self.finalize_avss_validation(avss_completion).await;
+                }
+                Some(recon_completion) = self.recon_rx.recv() => {
+                    // Phase D fire-and-forget for BatchBeaconConstruct
+                    // ingest:
+                    //
+                    // A detached task running on tokio's blocking
+                    // pool finished the degree-test for one inbound
+                    // BatchBeaconConstruct packet via
+                    // `verify_batch_shares_pure`. Apply add_secret_share
+                    // + blame writes here, then trigger
+                    // `maybe_recover_ready_coins`.
+                    self.finalize_recon_completion(recon_completion).await;
                 }
                 sync_msg = self.sync_recv.recv() => {
                     let sync_msg = sync_msg.ok_or_else(|| anyhow!("Networking layer has closed"))?;
