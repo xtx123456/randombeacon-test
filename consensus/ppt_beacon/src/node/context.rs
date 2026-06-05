@@ -33,7 +33,7 @@ use tokio::sync::{mpsc, oneshot};
 pub const PPT_INBOUND_CHANNEL_CAPACITY: usize = 8192;
 
 use types::{
-    beacon::{BeaconMsg, CoinMsg, Replica, WrapperMsg},
+    beacon::{CoinMsg, Replica, WrapperMsg},
     Round, SyncMsg, SyncState,
 };
 
@@ -98,11 +98,6 @@ pub struct Context {
     // ---- ACS state ----
     pub acs_state: std::collections::HashMap<Round, crate::node::acs::state::AcsRound>,
 
-    /// Round → degree-test challenge θ (large field). Populated when
-    /// each round's beacon output is finalised; consumed by the next
-    /// round's AVSS dealer / verifier path.
-    pub theta_per_round: HashMap<Round, BigUint>,
-
     /// Globally banned dealers (across rounds). A dealer is banned
     /// the moment any honest node detects a protocol-level violation
     /// (invalid AVSS packet, equivocating ACS proposal,
@@ -110,20 +105,6 @@ pub struct Context {
     /// banned, the dealer is rejected from every future round's
     /// AVSS, ACS, and reconstruction paths.
     pub banned_dealers: HashSet<Replica>,
-
-    /// AVSSSend packets received before this node had θ for that
-    /// round. They are deferred (NOT dropped, NOT banned) and
-    /// replayed by `drain_pending_avss_for(round)` once
-    /// `record_beacon_output_for_theta` populates θ.
-    ///
-    /// This race window exists in pure PPT mode because round-r+1's
-    /// AVSSSend can reach a slow node before that node has finished
-    /// reconstructing round-r's coin 0 (which is the source of
-    /// θ(r+1)). Without buffering, the slow node would drop or
-    /// (worse) panic on the early packet and never recover the
-    /// dealer for round r+1.
-    pub pending_avss_for_theta:
-        HashMap<Round, Vec<(BeaconMsg, Hash, Replica)>>,
 
     /// Round → previous-round beacon bytes used to seed the new
     /// ACS common-coin derivation. Pattern is identical to
@@ -338,9 +319,7 @@ impl Context {
                 round_state: HashMap::default(),
 
                 acs_state: std::collections::HashMap::new(),
-                theta_per_round: HashMap::default(),
                 banned_dealers: HashSet::new(),
-                pending_avss_for_theta: HashMap::default(),
                 audit_tx,
                 audit_rx,
                 coin_per_round: HashMap::default(),
@@ -420,79 +399,6 @@ impl Context {
         }
     }
 
-    /// θ for round `round` — the degree-test challenge that
-    /// dealers commit to and verifiers re-evaluate. The PPT
-    /// scheme requires θ to be unpredictable to the dealer at
-    /// commit time. We therefore derive it from the *previous
-    /// round's reconstructed beacon* (large field), which the
-    /// dealer cannot influence by the time it shares its round-r
-    /// secret.
-    ///
-    /// For round 0 we use a fixed public seed so all nodes agree
-    /// without a previous beacon being available.
-    ///
-    /// Returns `None` for round > 0 when the previous round's
-    /// beacon has not yet been recorded locally. This happens
-    /// naturally in async networks: a fast peer may broadcast its
-    /// round-(r+1) AVSSSend before this node has finished
-    /// reconstructing round-r's coin 0. The caller MUST handle
-    /// `None` by *deferring* the action (typically by buffering
-    /// the AVSSSend in `pending_avss_for_theta`) — never by
-    /// dropping or banning the dealer, since this is a transient
-    /// race window, not a protocol violation.
-    pub fn theta_for_round(&self, round: Round) -> Option<BigUint> {
-        if round == 0 {
-            return Some(Self::theta_from_bytes(
-                PPT_GENESIS_THETA_SEED,
-                &self.nonce_domain,
-            ));
-        }
-        self.theta_per_round.get(&round).cloned()
-    }
-
-    /// Record this round's beacon output as the source of the
-    /// next round's degree-test challenge. `output_bytes` is the
-    /// reconstructed beacon value (arbitrary-length); we hash it
-    /// into the large field so θ has full large-field entropy
-    /// rather than being constrained to the small secret field.
-    pub fn record_beacon_output_for_theta(&mut self, round: Round, output_bytes: &[u8]) {
-        let theta = Self::theta_from_bytes(output_bytes, &self.nonce_domain);
-        self.theta_per_round.insert(round + 1, theta);
-    }
-
-    /// Buffer an AVSSSend that arrived before its θ was available.
-    /// The packet is replayed by `drain_pending_avss_for(round)`
-    /// once `record_beacon_output_for_theta` populates θ for that
-    /// round.
-    pub fn buffer_avss_for_theta(
-        &mut self,
-        round: Round,
-        beacon_msg: BeaconMsg,
-        transcript_root: Hash,
-        dealer: Replica,
-    ) {
-        log::info!(
-            "[PPT][THETA-DEFER] node {} buffering AVSSSend from dealer {} for round {} until θ becomes available",
-            self.myid,
-            dealer,
-            round
-        );
-        self.pending_avss_for_theta
-            .entry(round)
-            .or_default()
-            .push((beacon_msg, transcript_root, dealer));
-    }
-
-    /// Take (move out) every buffered AVSSSend for `round`.
-    /// Caller is expected to immediately re-process each entry
-    /// via `process_avss_send`.
-    pub fn take_pending_avss_for(
-        &mut self,
-        round: Round,
-    ) -> Vec<(BeaconMsg, Hash, Replica)> {
-        self.pending_avss_for_theta.remove(&round).unwrap_or_default()
-    }
-
     /// PPT slide pg 30-32 "first-match" rejection-sampling rule.
     ///
     /// A reconstructed coin value `v ∈ [0, p)` is *uniformly usable*
@@ -512,6 +418,36 @@ impl Context {
             &self.secret_domain,
             self.num_nodes,
         )
+    }
+
+    /// Fiat-Shamir degree-test challenge θ for a dealer's AVSS
+    /// packet (PPT problem-3 fix). θ is derived from the dealer's
+    /// OWN commitment (`root_vec`, the per-coin Merkle roots that bind
+    /// every recipient's f-share, g-share and f_large via
+    /// `avss_commit_leaf`), so the dealer must commit f and g BEFORE θ
+    /// is determined. A Byzantine dealer can therefore no longer pick
+    /// the mask `g` to cancel a high-degree `f` (it would need a hash
+    /// collision), making the two-field degree test sound with error
+    /// 1/|q|. Replaces the old θ = H(previous PUBLIC beacon), which
+    /// the dealer could predict and bypass.
+    ///
+    /// θ is per-(round, dealer); every honest verifier recomputes the
+    /// identical value from the same committed `root_vec`, so the
+    /// degree test is checked against the same challenge everywhere.
+    pub(crate) fn theta_from_commitment(
+        round: Round,
+        dealer: Replica,
+        root_vec: &[Hash],
+        large_field: &BigUint,
+    ) -> BigUint {
+        let mut buf: Vec<u8> = b"PPT_BEACON_FS_THETA_v1::".to_vec();
+        buf.extend_from_slice(&round.to_be_bytes());
+        buf.extend_from_slice(&(dealer as u64).to_be_bytes());
+        buf.extend_from_slice(&(root_vec.len() as u64).to_be_bytes());
+        for r in root_vec {
+            buf.extend_from_slice(r);
+        }
+        Self::theta_from_bytes(buf.as_slice(), large_field)
     }
 
     pub(crate) fn theta_from_bytes(seed: &[u8], large_field: &BigUint) -> BigUint {

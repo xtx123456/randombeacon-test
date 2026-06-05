@@ -169,35 +169,35 @@ impl Context {
             3 * faults + 1,  // share_amount n = 3f+1
         );
 
-        // PPT degree-test challenge θ for this round. For round 0 this
-        // is a fixed public seed; for round r > 0 it is derived from
-        // round r-1's reconstructed beacon (which the dealer cannot
-        // influence at commit time). See Context::theta_for_round.
+        let n = self.num_nodes;
+
+        // ---- Fiat-Shamir degree test (problem-3 fix) ----
         //
-        // For the *dealer* path (this function), θ MUST be available
-        // by construction: the only way ppt_try_start_round(new_round)
-        // gets called is either (a) new_round == 0 (genesis seed) or
-        // (b) self_coin_check_transmit just called
-        // record_beacon_output_for_theta(new_round - 1, ...). Hence
-        // the unwrap below cannot fire on the live path; we keep an
-        // explicit expect message so any future regression is loud.
-        let theta = self
-            .theta_for_round(new_round)
-            .expect("[PPT][THETA-BUG] dealer launching round without θ recorded; should be impossible");
-
-        let mut share_vec: Vec<[u8;32]> = Vec::new();
-        let mut nonce_share_vec: Vec<[u8;32]> = Vec::new();
-
-        let mut degree_test_batch: Vec<Vec<Val>> = Vec::with_capacity(total_coins);
-        let mut mask_shares_per_node: Vec<Vec<Val>> = vec![Vec::with_capacity(total_coins); self.num_nodes];
-        let mut f_large_per_node: Vec<Vec<Val>> = vec![Vec::with_capacity(total_coins); self.num_nodes];
+        // (1) Sample f (encoding the secret) and the random mask g for
+        //     every coin, WITHOUT computing h yet (h needs θ).
+        // (2) Commit: build a Merkle tree per coin whose leaves bind
+        //     EACH recipient's (f_share, g_share, f_large, nonce) via
+        //     `avss_commit_leaf`. This pins both f and g BEFORE θ.
+        // (3) Derive θ = H(round‖dealer‖root_vec) from the commitment
+        //     (Fiat-Shamir) — the dealer cannot pick g to cancel a
+        //     high-degree f after seeing θ.
+        // (4) Compute h(x) = g(x) − θ·f(x) for every coin.
+        let mut f_polys: Vec<Vec<BigUint>> = Vec::with_capacity(total_coins);
+        let mut g_polys: Vec<Vec<BigUint>> = Vec::with_capacity(total_coins);
+        let mut mask_shares_per_node: Vec<Vec<Val>> = vec![Vec::with_capacity(total_coins); n];
+        let mut f_large_per_node: Vec<Vec<Val>> = vec![Vec::with_capacity(total_coins); n];
+        let mut secret_per_node: Vec<Vec<Val>> = vec![Vec::with_capacity(total_coins); n];
+        let mut nonce_per_node: Vec<Vec<Val>> = vec![Vec::with_capacity(total_coins); n];
+        // Per-coin leaf hashes for the Merkle trees.
+        let mut hashes_vec: Vec<Vec<Hash>> = Vec::with_capacity(total_coins);
 
         for _ in 0..total_coins {
             let secret = rand::thread_rng().gen_biguint_range(&low_r, &prime);
+            let sampled = two_field_dealer.sample_shares(secret);
+            f_polys.push(sampled.f_poly.clone());
+            g_polys.push(sampled.g_poly.clone());
 
-            let two_field_shares = two_field_dealer.share_secret(secret, &theta);
-
-            let nonce_ss = ShamirSecretSharing{
+            let nonce_ss = ShamirSecretSharing {
                 threshold: faults + 1,
                 share_amount: 3 * faults + 1,
                 prime: nonce_prime.clone(),
@@ -205,74 +205,52 @@ impl Context {
             let nonce = rand::thread_rng().gen_biguint_range(&low_r, &nonce_prime);
             let nonce_shares = nonce_ss.split(nonce);
 
-            let h_coeffs_as_val: Vec<Val> = two_field_shares.degree_test_coeffs.iter()
-                .map(|c| Self::pad_shares(c.clone()))
-                .collect();
-            degree_test_batch.push(h_coeffs_as_val);
-
-            for node_idx in 0..self.num_nodes {
-                let g_share = &two_field_shares.mask_shares[node_idx].1;
-                mask_shares_per_node[node_idx].push(Self::pad_shares(g_share.clone()));
-
-                let f_large = &two_field_shares.f_large_shares[node_idx].1;
-                f_large_per_node[node_idx].push(Self::pad_shares(f_large.clone()));
+            let mut coin_leaves: Vec<Hash> = Vec::with_capacity(n);
+            for i in 0..n {
+                let f_share = Self::pad_shares(sampled.secret_shares[i].1.clone());
+                let g_share = Self::pad_shares(sampled.mask_shares[i].1.clone());
+                let f_large = Self::pad_shares(sampled.f_large_shares[i].1.clone());
+                let nonce_share = Self::pad_shares(nonce_shares[i].1.clone());
+                let leaf = types::beacon::avss_commit_leaf(
+                    &f_share, &g_share, &f_large, &nonce_share,
+                );
+                coin_leaves.push(leaf);
+                secret_per_node[i].push(f_share);
+                nonce_per_node[i].push(nonce_share);
+                mask_shares_per_node[i].push(g_share);
+                f_large_per_node[i].push(f_large);
             }
-
-            for (share, nonce_share) in two_field_shares.secret_shares.into_iter().zip(nonce_shares.into_iter()) {
-                share_vec.push(Self::pad_shares(share.1));
-                nonce_share_vec.push(Self::pad_shares(nonce_share.1));
-            }
+            hashes_vec.push(coin_leaves);
         }
 
-        let commitments = self.hash_context.hash_batch(share_vec.clone(), nonce_share_vec.clone());
-        let triplets: Vec<(Val, Val, Hash)> = share_vec
-            .into_iter()
-            .zip(nonce_share_vec.into_iter())
-            .zip(commitments.into_iter())
-            .map(|((share, nonce), comm)| (share, nonce, comm))
-            .collect();
-
-        assert_eq!(
-            triplets.len(),
-            total_coins * self.num_nodes,
-            "two-field packing mismatch: got {} triplets for total_coins={} num_nodes={}",
-            triplets.len(),
-            total_coins,
-            self.num_nodes
-        );
-
-        let share_comm_hash: Vec<Vec<(Val, Val, Hash)>> = triplets
-            .chunks(self.num_nodes)
-            .map(|chunk| chunk.iter().cloned().collect())
-            .collect();
-
-        assert_eq!(
-            share_comm_hash.len(),
-            total_coins,
-            "expected {} per-coin groups, got {}",
-            total_coins,
-            share_comm_hash.len()
-        );
-
-        let hashes_vec: Vec<Vec<Hash>> = share_comm_hash
-            .iter()
-            .map(|secret_chunk| secret_chunk.iter().map(|(_, _, h)| *h).collect())
-            .collect();
-
         let mt_vec = MerkleTree::build_trees(hashes_vec, &self.hash_context);
+        let roots_vec: Vec<Hash> = mt_vec.iter().map(|mt| mt.root()).collect();
 
-        let mut vec_msgs_to_be_sent: Vec<(Replica, BatchWSSMsg)> = (0..self.num_nodes)
+        // (3) Fiat-Shamir challenge from the dealer's own commitment.
+        let theta = Self::theta_from_commitment(new_round, self.myid, &roots_vec, &nonce_prime);
+
+        // (4) Degree-test polynomial h per coin, under the bound θ.
+        let mut degree_test_batch: Vec<Vec<Val>> = Vec::with_capacity(total_coins);
+        for coin in 0..total_coins {
+            let h = two_field_dealer.compute_degree_test_poly_pub(
+                &f_polys[coin],
+                &g_polys[coin],
+                &theta,
+            );
+            degree_test_batch.push(h.iter().map(|c| Self::pad_shares(c.clone())).collect());
+        }
+
+        // Assemble per-recipient BatchWSSMsg (f-share, nonce, proof).
+        let mut vec_msgs_to_be_sent: Vec<(Replica, BatchWSSMsg)> = (0..n)
             .map(|i| (i + 1, BatchWSSMsg::new(self.myid, Vec::new(), Vec::new(), Vec::new())))
             .collect();
-
-        let mut roots_vec: Vec<Hash> = Vec::with_capacity(total_coins);
-        for (secret_chunk, mt) in share_comm_hash.into_iter().zip(mt_vec.into_iter()) {
-            for (i, (share, nonce, _comm)) in secret_chunk.into_iter().enumerate() {
-                vec_msgs_to_be_sent[i].1.secrets.push(share);
-                vec_msgs_to_be_sent[i].1.nonces.push(nonce);
+        for coin in 0..total_coins {
+            let mt = &mt_vec[coin];
+            for i in 0..n {
+                vec_msgs_to_be_sent[i].1.secrets.push(secret_per_node[i][coin]);
+                vec_msgs_to_be_sent[i].1.nonces.push(nonce_per_node[i][coin]);
                 vec_msgs_to_be_sent[i].1.mps.push(mt.gen_proof(i));
             }
-            roots_vec.push(mt.root());
         }
 
         assert_eq!(roots_vec.len(), total_coins);

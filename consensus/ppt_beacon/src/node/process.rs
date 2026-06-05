@@ -37,7 +37,6 @@ pub(crate) fn avss_local_packet_valid_pure(
     transcript_root: &Hash,
     dealer: Replica,
     round: Round,
-    theta: &BigUint,
     hash_context: &HashState,
     secret_domain: &BigUint,
     nonce_domain: &BigUint,
@@ -69,6 +68,22 @@ pub(crate) fn avss_local_packet_valid_pure(
         );
         return Err("merkle proof invalid");
     }
+
+    // Fiat-Shamir degree-test challenge θ (problem-3 fix): derived
+    // from the dealer's OWN committed Merkle roots, so the dealer had
+    // to commit f and g (bound into the leaves via `avss_commit_leaf`)
+    // BEFORE θ was determined. Replaces the old predictable θ =
+    // H(previous public beacon). Every honest verifier recomputes the
+    // identical θ from the same committed `root_vec`.
+    let theta = {
+        let root_vec = match beacon_msg.root_vec.as_ref() {
+            Some(rv) if rv.len() == batch_size => rv,
+            Some(_) => return Err("malformed root_vec length"),
+            None => return Err("missing root_vec or wss"),
+        };
+        Context::theta_from_commitment(round, dealer, root_vec, nonce_domain)
+    };
+    let theta = &theta;
 
     let degree_test_coeffs = match beacon_msg.degree_test_coeffs.as_ref() {
         Some(coeffs) => coeffs,
@@ -547,14 +562,12 @@ impl Context {
         transcript_root: &crypto::hash::Hash,
         dealer: Replica,
         round: Round,
-        theta: &BigUint,
     ) -> Result<(), &'static str> {
         avss_local_packet_valid_pure(
             beacon_msg,
             transcript_root,
             dealer,
             round,
-            theta,
             &self.hash_context,
             &self.secret_domain,
             &self.nonce_domain,
@@ -638,23 +651,6 @@ impl Context {
             return;
         }
 
-        // PPT slide pg 28: θ for round r is derived from round (r-1)'s
-        // reconstructed beacon. In an asynchronous network a fast peer
-        // may broadcast its round-(r+1) AVSSSend before this node has
-        // finished reconstructing round-r's coin 0. In that case
-        // `theta_for_round(round)` returns None — this is NOT a
-        // protocol violation, so we MUST NOT ban the dealer or drop
-        // the packet. Instead, buffer it and replay once
-        // `record_beacon_output_for_theta` populates θ (which the
-        // beacon-emit path does inside `self_coin_check_transmit`).
-        let theta = match self.theta_for_round(round) {
-            Some(t) => t,
-            None => {
-                self.buffer_avss_for_theta(round, beacon_msg, transcript_root, dealer);
-                return;
-            }
-        };
-
         if !self.round_state.contains_key(&round) {
             let rbc_new_state = crate::node::CTRBCState::new(self.secret_domain.clone(), self.num_nodes);
             self.round_state.insert(round, rbc_new_state);
@@ -667,10 +663,10 @@ impl Context {
         // handling other inbound messages while validation runs in
         // parallel on another core.
         //
-        // We move `beacon_msg` and `theta` into the blocking closure
-        // and return them back out, so no large clones happen along
-        // the hot path. Everything else copied into the closure is
-        // small and/or cheaply cloned.
+        // The Fiat-Shamir degree-test challenge θ is now derived
+        // INSIDE the validator from the dealer's committed `root_vec`,
+        // so there is no longer any θ to fetch / buffer here (the old
+        // "wait for previous round's beacon" race window is gone).
         let hash_context = Arc::clone(&self.hash_context);
         let secret_domain = self.secret_domain.clone();
         let nonce_domain = self.nonce_domain.clone();
@@ -680,14 +676,13 @@ impl Context {
         let myid = self.myid;
         let transcript_root_owned = transcript_root;
 
-        let (validation_result, beacon_msg, _theta) =
+        let (validation_result, beacon_msg) =
             tokio::task::spawn_blocking(move || {
                 let result = avss_local_packet_valid_pure(
                     &beacon_msg,
                     &transcript_root_owned,
                     dealer,
                     round,
-                    &theta,
                     &hash_context,
                     &secret_domain,
                     &nonce_domain,
@@ -697,7 +692,7 @@ impl Context {
                     crate::node::context::PPT_COIN_RESERVE,
                     myid,
                 );
-                (result, beacon_msg, theta)
+                (result, beacon_msg)
             })
             .await
             .unwrap_or_else(|e| {
@@ -705,12 +700,10 @@ impl Context {
                     "[PPT][LEVEL2] AVSS validation blocking task join error round {} dealer {}: {}",
                     round, dealer, e
                 );
-                // Failsafe: treat join error as transient (no ban). Recreate
-                // a dummy BeaconMsg / theta won't be used because we early-return.
+                // Failsafe: treat join error as transient (no ban).
                 (
                     Err("blocking task join error"),
                     types::beacon::BeaconMsg::new_with_appx(0, 0, Vec::new()),
-                    BigUint::from(0u32),
                 )
             });
 
@@ -758,29 +751,6 @@ impl Context {
         // (previously-missing) commitment can now be validated. This
         // is a no-op until ACS has decided and is cheap otherwise.
         self.maybe_recover_ready_coins(round).await;
-    }
-
-    /// Replay every AVSSSend that was buffered waiting for θ(round)
-    /// to become available. Idempotent — re-processed packets that
-    /// are already valid go through the normal `process_avss_send`
-    /// pipeline and the "already validated" guard short-circuits
-    /// duplicates.
-    #[async_recursion]
-    pub async fn drain_pending_avss_for(&mut self, round: Round) {
-        let pending = self.take_pending_avss_for(round);
-        if pending.is_empty() {
-            return;
-        }
-        log::info!(
-            "[PPT][THETA-REPLAY] node {} replaying {} buffered AVSSSend(s) for round {} now that θ is available",
-            self.myid,
-            pending.len(),
-            round
-        );
-        for (beacon_msg, transcript_root, dealer) in pending.into_iter() {
-            self.process_avss_send(beacon_msg, transcript_root, dealer, round)
-                .await;
-        }
     }
 
     #[async_recursion]
@@ -1062,78 +1032,74 @@ mod avss_binding_tests {
         batch_size: usize,
         n: usize,
         f: usize,
+        force_wrong_theta: bool,
     ) -> (BeaconMsg, Hash, BigUint, BigUint, BigUint, HashState) {
         let p = small_prime();
         let q = large_prime();
-        let theta = BigUint::from(0xC0FFEEu64);
         let two_field_dealer =
             TwoFieldDealer::new(p.clone(), q.clone(), f + 1, n);
+        let hc = hash_state();
 
         let mut rng = rand::rngs::StdRng::seed_from_u64(0xABCD);
 
-        // Per-coin h(x) coefficients, plus per-(node, coin) share /
-        // mask / f_large.
-        let mut degree_test_coeffs: Vec<Vec<Val>> = Vec::with_capacity(batch_size);
-        let mut share_vec: Vec<[u8; 32]> = Vec::new(); // batch_size * n
-        let mut nonce_vec: Vec<[u8; 32]> = Vec::new();
+        // (1) Sample f, g per coin (no θ yet); collect per-(coin,node)
+        //     material and build the combined-leaf Merkle trees.
+        let mut f_polys: Vec<Vec<BigUint>> = Vec::with_capacity(batch_size);
+        let mut g_polys: Vec<Vec<BigUint>> = Vec::with_capacity(batch_size);
         let mut mask_per_node: Vec<Vec<Val>> = vec![Vec::with_capacity(batch_size); n];
         let mut f_large_per_node: Vec<Vec<Val>> = vec![Vec::with_capacity(batch_size); n];
+        let mut secret_per_node: Vec<Vec<Val>> = vec![Vec::with_capacity(batch_size); n];
+        let mut nonce_per_node: Vec<Vec<Val>> = vec![Vec::with_capacity(batch_size); n];
+        let mut hashes_vec: Vec<Vec<Hash>> = Vec::with_capacity(batch_size);
 
         for _ in 0..batch_size {
             let secret = rng.gen_biguint_range(&BigUint::from(0u32), &p);
             let nonce = rng.gen_biguint_range(&BigUint::from(0u32), &q);
-            let tf = two_field_dealer.share_secret(secret, &theta);
-
-            degree_test_coeffs.push(
-                tf.degree_test_coeffs
-                    .iter()
-                    .map(|c| pad32(c.clone()))
-                    .collect(),
-            );
-            for node_idx in 0..n {
-                mask_per_node[node_idx].push(pad32(tf.mask_shares[node_idx].1.clone()));
-                f_large_per_node[node_idx].push(pad32(tf.f_large_shares[node_idx].1.clone()));
-            }
-            // Reuse the same nonce for every share at this coin
-            // (the production dealer uses a per-share nonce, but
-            // for these tests the only invariant we care about is
-            // that hash(share, nonce) is consistent across the
-            // builder and the verifier).
+            let sampled = two_field_dealer.sample_shares(secret);
+            f_polys.push(sampled.f_poly.clone());
+            g_polys.push(sampled.g_poly.clone());
             let nonce_bytes = pad32(nonce);
-            for (_idx, (_x, share)) in tf.secret_shares.iter().enumerate() {
-                share_vec.push(pad32(share.clone()));
-                nonce_vec.push(nonce_bytes);
+            let mut coin_leaves: Vec<Hash> = Vec::with_capacity(n);
+            for i in 0..n {
+                let f_share = pad32(sampled.secret_shares[i].1.clone());
+                let g_share = pad32(sampled.mask_shares[i].1.clone());
+                let f_large = pad32(sampled.f_large_shares[i].1.clone());
+                let leaf = types::beacon::avss_commit_leaf(&f_share, &g_share, &f_large, &nonce_bytes);
+                coin_leaves.push(leaf);
+                secret_per_node[i].push(f_share);
+                nonce_per_node[i].push(nonce_bytes);
+                mask_per_node[i].push(g_share);
+                f_large_per_node[i].push(f_large);
             }
+            hashes_vec.push(coin_leaves);
         }
 
-        let hc = hash_state();
-        let commits = hc.hash_batch(share_vec.clone(), nonce_vec.clone());
-        let triplets: Vec<(Val, Val, Hash)> = share_vec
-            .iter()
-            .zip(nonce_vec.iter())
-            .zip(commits.into_iter())
-            .map(|((s, n), c)| (*s, *n, c))
-            .collect();
-        // chunk into (batch_size) groups of n
-        let per_coin: Vec<Vec<(Val, Val, Hash)>> = triplets
-            .chunks(n)
-            .map(|c| c.iter().cloned().collect())
-            .collect();
-
-        let hashes_vec: Vec<Vec<Hash>> =
-            per_coin.iter().map(|chunk| chunk.iter().map(|(_, _, h)| *h).collect()).collect();
         let mt_vec = MerkleTree::build_trees(hashes_vec, &hc);
+        let roots_vec: Vec<Hash> = mt_vec.iter().map(|mt| mt.root()).collect();
+
+        // (2) Fiat-Shamir θ from the dealer's own commitment, then h.
+        //     `force_wrong_theta` models a Byzantine dealer that
+        //     computes h under a θ NOT bound to its commitment (e.g.
+        //     the old predictable θ); the verifier recomputes the
+        //     real FS θ from root_vec and MUST reject it.
+        let theta = if force_wrong_theta {
+            BigUint::from(0xC0FFEEu64)
+        } else {
+            Context::theta_from_commitment(round, dealer, &roots_vec, &q)
+        };
+        let mut degree_test_coeffs: Vec<Vec<Val>> = Vec::with_capacity(batch_size);
+        for coin in 0..batch_size {
+            let h = two_field_dealer.compute_degree_test_poly_pub(&f_polys[coin], &g_polys[coin], &theta);
+            degree_test_coeffs.push(h.iter().map(|c| pad32(c.clone())).collect());
+        }
 
         let mut my_secrets: Vec<Val> = Vec::with_capacity(batch_size);
         let mut my_nonces: Vec<Val> = Vec::with_capacity(batch_size);
         let mut my_mps = Vec::with_capacity(batch_size);
-        let mut roots_vec: Vec<Hash> = Vec::with_capacity(batch_size);
-        for (chunk, mt) in per_coin.iter().zip(mt_vec.iter()) {
-            let (s, n_, _h) = chunk[myid];
-            my_secrets.push(s);
-            my_nonces.push(n_);
-            my_mps.push(mt.gen_proof(myid));
-            roots_vec.push(mt.root());
+        for coin in 0..batch_size {
+            my_secrets.push(secret_per_node[myid][coin]);
+            my_nonces.push(nonce_per_node[myid][coin]);
+            my_mps.push(mt_vec[coin].gen_proof(myid));
         }
 
         let wss = BatchWSSMsg::new(dealer, my_secrets, my_nonces, my_mps);
@@ -1161,11 +1127,31 @@ mod avss_binding_tests {
     fn accepts_honest_two_field_packet() {
         let (n, f, batch_size) = n_f();
         let (beacon, transcript, p, q, theta, hc) =
-            build_honest_packet(0, 1, 42, batch_size, n, f);
+            build_honest_packet(0, 1, 42, batch_size, n, f, false);
         let res = avss_local_packet_valid_pure(
-            &beacon, &transcript, 0, 42, &theta, &hc, &p, &q, f, n, batch_size, 0, 1,
+            &beacon, &transcript, 0, 42, &hc, &p, &q, f, n, batch_size, 0, 1,
         );
         assert!(res.is_ok(), "honest packet must validate: {:?}", res);
+    }
+
+    #[test]
+    fn rejects_degree_test_not_bound_to_fiat_shamir_theta() {
+        // Problem-3 fix: the degree-test challenge θ is derived from
+        // the dealer's OWN committed root_vec (Fiat-Shamir). A dealer
+        // that computes h under any θ NOT equal to H(round‖dealer‖
+        // root_vec) — e.g. the old predictable θ — is rejected,
+        // because every honest verifier recomputes the real θ from the
+        // commitment and the degree-test relation no longer holds.
+        let (n, f, batch_size) = n_f();
+        let (beacon, transcript, p, q, _theta, hc) =
+            build_honest_packet(0, 1, 42, batch_size, n, f, /* force_wrong_theta = */ true);
+        let res = avss_local_packet_valid_pure(
+            &beacon, &transcript, 0, 42, &hc, &p, &q, f, n, batch_size, 0, 1,
+        );
+        assert!(
+            res.is_err(),
+            "h computed under a θ not bound to the commitment must be rejected (Fiat-Shamir)"
+        );
     }
 
     #[test]
@@ -1178,7 +1164,7 @@ mod avss_binding_tests {
         // beacon value; with the binding, validation MUST reject.
         let (n, f, batch_size) = n_f();
         let (mut beacon, _transcript, p, q, theta, hc) =
-            build_honest_packet(0, 1, 42, batch_size, n, f);
+            build_honest_packet(0, 1, 42, batch_size, n, f, false);
 
         // Corrupt coin 0's share: replace with a value provably
         // != f_large mod p. We pick `0` and only flip if the
@@ -1201,7 +1187,7 @@ mod avss_binding_tests {
         let transcript = crypto::hash::do_hash(beacon.serialize_ctrbc().as_slice());
 
         let res = avss_local_packet_valid_pure(
-            &beacon, &transcript, 0, 42, &theta, &hc, &p, &q, f, n, batch_size, 0, 1,
+            &beacon, &transcript, 0, 42, &hc, &p, &q, f, n, batch_size, 0, 1,
         );
         assert!(res.is_err(), "Byzantine packet must be rejected");
     }
@@ -1218,7 +1204,7 @@ mod avss_binding_tests {
         // §2.C from the audit guarded against.
         let (n, f, batch_size) = n_f();
         let (mut beacon, _transcript, p, q, theta, hc) =
-            build_honest_packet(0, 1, 42, batch_size, n, f);
+            build_honest_packet(0, 1, 42, batch_size, n, f, false);
         {
             let root_vec = beacon.root_vec.as_mut().expect("honest packet has root_vec");
             // Tamper with coin 0's root (flip a byte). The mp's
@@ -1229,7 +1215,7 @@ mod avss_binding_tests {
         }
         let transcript = crypto::hash::do_hash(beacon.serialize_ctrbc().as_slice());
         let res = avss_local_packet_valid_pure(
-            &beacon, &transcript, 0, 42, &theta, &hc, &p, &q, f, n, batch_size, 0, 1,
+            &beacon, &transcript, 0, 42, &hc, &p, &q, f, n, batch_size, 0, 1,
         );
         assert!(
             res.is_err(),

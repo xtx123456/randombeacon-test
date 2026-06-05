@@ -159,11 +159,18 @@ pub(crate) fn audit_post_complaint_pure(
                 let nonce = packet.nonces[idx];
                 let proof = &packet.mps[idx];
 
-                let item = hash_context
-                    .hash_batch(vec![share], vec![nonce])
-                    .into_iter()
-                    .next()
-                    .expect("hash_batch returned no item");
+                // Recompute the committed leaf binding f_share, g_share
+                // (mask), f_large and nonce (see `avss_commit_leaf`).
+                if idx >= packet.mask_shares.len() || idx >= packet.f_large_shares.len() {
+                    complete = false;
+                    break;
+                }
+                let item = types::beacon::avss_commit_leaf(
+                    &share,
+                    &packet.mask_shares[idx],
+                    &packet.f_large_shares[idx],
+                    &nonce,
+                );
 
                 if item != proof.item() {
                     blame_events.push((
@@ -257,16 +264,23 @@ pub(crate) fn verify_recon_shares_pure(
             continue;
         }
 
-        for (((dealer, share), nonce), mp) in packet
-            .origins
-            .iter()
-            .zip(packet.secrets.iter())
-            .zip(packet.nonces.iter())
-            .zip(packet.mps.iter())
-        {
+        for idx in 0..packet.origins.len() {
+            let dealer = &packet.origins[idx];
             if !decided_set.contains(dealer) || banned.contains(dealer) {
                 continue;
             }
+            // All per-coin vectors must be aligned with origins.
+            if idx >= packet.secrets.len()
+                || idx >= packet.nonces.len()
+                || idx >= packet.mps.len()
+                || idx >= packet.mask_shares.len()
+                || idx >= packet.f_large_shares.len()
+            {
+                continue;
+            }
+            let share = &packet.secrets[idx];
+            let nonce = &packet.nonces[idx];
+            let mp = &packet.mps[idx];
 
             let expected_root = match roots_for_dealer.get(dealer) {
                 Some(root) => *root,
@@ -284,12 +298,13 @@ pub(crate) fn verify_recon_shares_pure(
             if mp.root() != expected_root {
                 continue;
             }
-            // Bind (share, nonce) to the proof's committed leaf.
-            let item = hash_context
-                .hash_batch(vec![*share], vec![*nonce])
-                .into_iter()
-                .next()
-                .expect("hash_batch returned no item");
+            // Bind (f_share, g_share, f_large, nonce) to the committed leaf.
+            let item = types::beacon::avss_commit_leaf(
+                share,
+                &packet.mask_shares[idx],
+                &packet.f_large_shares[idx],
+                nonce,
+            );
             if item != mp.item() {
                 continue;
             }
@@ -1588,27 +1603,17 @@ impl Context {
         }
 
         if coin_num == 0 {
-            // PPT pg 28: θ for the next round is derived from this round's
-            // coin-0 beacon, which the next round's dealer cannot influence.
-            self.record_beacon_output_for_theta(round, seed_value.as_slice());
-
-            // Self-bootstrap MMR ABA common coin: store the same
-            // beacon output as the seed for the *next* ACS round's
-            // coin derivation. Honest nodes agree on this value bit-
-            // for-bit (ACS + batch-recover safety) so every node's
-            // coin_bit_for(round+1, ..) returns the identical bit.
+            // ACS common-coin fallback seed: the previous-round beacon
+            // bytes seed the deterministic genesis/out-of-window hash
+            // coin (`coin_bit_for`). The unpredictable in-window ACS
+            // coin no longer uses this (it is AVSS-sealed), and the
+            // degree-test θ no longer uses it either (Fiat-Shamir from
+            // the dealer's commitment) — so the old per-round θ
+            // recording + AVSS theta-buffer replay are gone.
             self.record_beacon_output_for_coin(round, seed_value.as_slice());
 
             // Pure PPT: every node is always a dealer in the next round.
             let next_round: Round = round + self.frequency;
-
-            // Now that θ(next_round) is in the cache, replay any
-            // AVSSSend packets that arrived for `next_round` BEFORE
-            // we had θ available (the async race window between fast
-            // and slow peers). This is the live-path fix for the
-            // "[PPT][THETA] requested theta but no previous-round
-            // beacon recorded" panic that used to crash slow nodes.
-            self.drain_pending_avss_for(next_round).await;
 
             if next_round <= self.max_rounds {
                 if !self.round_state.contains_key(&next_round) {
@@ -1718,6 +1723,8 @@ mod recon_fix_tests {
     struct HonestSharing {
         secret: BigUint,
         shares: Vec<[u8; 32]>,
+        masks: Vec<[u8; 32]>,
+        f_larges: Vec<[u8; 32]>,
         nonces: Vec<[u8; 32]>,
         proofs: Vec<crypto::aes_hash::Proof>,
         root: Hash,
@@ -1729,23 +1736,29 @@ mod recon_fix_tests {
 
         let p = small_prime();
         let q = large_prime();
-        let theta = BigUint::from(0xC0FFEEu64);
         let dealer = TwoFieldDealer::new(p.clone(), q.clone(), f + 1, n);
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
         let secret = rng.gen_biguint_range(&BigUint::from(0u32), &p);
-        let tf = dealer.share_secret(secret.clone(), &theta);
+        let sampled = dealer.sample_shares(secret.clone());
 
         let mut shares: Vec<[u8; 32]> = Vec::with_capacity(n);
+        let mut masks: Vec<[u8; 32]> = Vec::with_capacity(n);
+        let mut f_larges: Vec<[u8; 32]> = Vec::with_capacity(n);
         let mut nonces: Vec<[u8; 32]> = Vec::with_capacity(n);
+        let hc = hash_state();
+        let mut leaf_hashes: Vec<Hash> = Vec::with_capacity(n);
         for i in 0..n {
-            shares.push(pad32(&tf.secret_shares[i].1));
-            // Distinct nonce per share.
-            let nonce = rng.gen_biguint_range(&BigUint::from(0u32), &q);
-            nonces.push(pad32(&nonce));
+            let f_share = pad32(&sampled.secret_shares[i].1);
+            let g_share = pad32(&sampled.mask_shares[i].1);
+            let f_large = pad32(&sampled.f_large_shares[i].1);
+            let nonce = pad32(&rng.gen_biguint_range(&BigUint::from(0u32), &q));
+            leaf_hashes.push(types::beacon::avss_commit_leaf(&f_share, &g_share, &f_large, &nonce));
+            shares.push(f_share);
+            masks.push(g_share);
+            f_larges.push(f_large);
+            nonces.push(nonce);
         }
 
-        let hc = hash_state();
-        let leaf_hashes: Vec<Hash> = hc.hash_batch(shares.clone(), nonces.clone());
         let trees = MerkleTree::build_trees(vec![leaf_hashes], &hc);
         let mt = &trees[0];
         let proofs: Vec<crypto::aes_hash::Proof> = (0..n).map(|i| mt.gen_proof(i)).collect();
@@ -1754,6 +1767,8 @@ mod recon_fix_tests {
         HonestSharing {
             secret,
             shares,
+            masks,
+            f_larges,
             nonces,
             proofs,
             root,
@@ -1768,9 +1783,8 @@ mod recon_fix_tests {
             nonces: vec![s.nonces[provider]],
             origins: vec![dealer],
             mps: vec![s.proofs[provider].clone()],
-            // mask / f_large are unused by the Merkle-based recon path.
-            mask_shares: vec![[0u8; 32]],
-            f_large_shares: vec![[0u8; 32]],
+            mask_shares: vec![s.masks[provider]],
+            f_large_shares: vec![s.f_larges[provider]],
             empty: false,
         }
     }

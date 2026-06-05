@@ -45,14 +45,15 @@ use crate::node::Context;
 ///   - `roots[d]`: dealer d's committed Merkle roots for the
 ///     `PPT_COIN_RESERVE` sealed coin indices (to validate revealed
 ///     shares);
-///   - `my_shares[d]`: THIS node's own `(share, nonce, proof)` for
-///     each of dealer d's sealed coin indices (what this node reveals
-///     when it queries the coin).
+///   - `my_shares[d]`: THIS node's own `(f_share, g_share, f_large,
+///     nonce, proof)` for each of dealer d's sealed coin indices —
+///     all four committed values are needed to recompute the
+///     `avss_commit_leaf` when revealing, plus the Merkle proof.
 #[derive(Clone, Debug)]
 pub struct CoinMaterial {
     pub decided: Vec<Replica>,
     pub roots: HashMap<Replica, Vec<Hash>>,
-    pub my_shares: HashMap<Replica, Vec<(Val, Val, Proof)>>,
+    pub my_shares: HashMap<Replica, Vec<(Val, Val, Val, Val, Proof)>>,
 }
 
 const COIN_SECRET_DOMAIN: &[u8] = b"PPT_ACS_COIN_SECRET_v1::";
@@ -152,7 +153,7 @@ impl Context {
         let batch_size = self.batch_size;
         let total = batch_size + PPT_COIN_RESERVE;
         let mut roots: HashMap<Replica, Vec<Hash>> = HashMap::new();
-        let mut my_shares: HashMap<Replica, Vec<(Val, Val, Proof)>> = HashMap::new();
+        let mut my_shares: HashMap<Replica, Vec<(Val, Val, Val, Val, Proof)>> = HashMap::new();
 
         if let Some(state) = self.round_state.get(&round) {
             for &d in decided.iter() {
@@ -161,15 +162,30 @@ impl Context {
                         roots.insert(d, rv[batch_size..total].to_vec());
                     }
                 }
-                if let Some(wss) = state.node_secrets.get(&d) {
+                // This node's own (f_share, g_share, f_large, nonce,
+                // proof) for each sealed coin index — all four
+                // committed values are needed to recompute the
+                // combined `avss_commit_leaf` when revealing.
+                let wss = state.node_secrets.get(&d);
+                let masks = state.mask_shares.get(&d);
+                let f_larges = state.f_large_shares.get(&d);
+                if let (Some(wss), Some(masks), Some(f_larges)) = (wss, masks, f_larges) {
                     if wss.secrets.len() >= total
                         && wss.nonces.len() >= total
                         && wss.mps.len() >= total
+                        && masks.len() >= total
+                        && f_larges.len() >= total
                     {
                         let mut v = Vec::with_capacity(PPT_COIN_RESERVE);
                         for rr in 0..PPT_COIN_RESERVE {
                             let idx = batch_size + rr;
-                            v.push((wss.secrets[idx], wss.nonces[idx], wss.mps[idx].clone()));
+                            v.push((
+                                wss.secrets[idx],
+                                masks[idx],
+                                f_larges[idx],
+                                wss.nonces[idx],
+                                wss.mps[idx].clone(),
+                            ));
                         }
                         my_shares.insert(d, v);
                     }
@@ -238,11 +254,15 @@ impl Context {
         let mut secrets = Vec::new();
         let mut nonces = Vec::new();
         let mut mps = Vec::new();
+        let mut mask_shares = Vec::new();
+        let mut f_large_shares = Vec::new();
         for &d in material.decided.iter() {
             if let Some(v) = material.my_shares.get(&d) {
-                if let Some((share, nonce, proof)) = v.get(rr) {
+                if let Some((share, g_share, f_large, nonce, proof)) = v.get(rr) {
                     origins.push(d);
                     secrets.push(*share);
+                    mask_shares.push(*g_share);
+                    f_large_shares.push(*f_large);
                     nonces.push(*nonce);
                     mps.push(proof.clone());
                 }
@@ -257,8 +277,8 @@ impl Context {
             nonces,
             origins,
             mps,
-            mask_shares: Vec::new(),
-            f_large_shares: Vec::new(),
+            mask_shares,
+            f_large_shares,
             empty: false,
         })
     }
@@ -318,16 +338,22 @@ impl Context {
                 .coin_shares
                 .entry((acs_round, aba_round))
                 .or_default();
-            for (((d, share), nonce), mp) in packet
-                .origins
-                .iter()
-                .zip(packet.secrets.iter())
-                .zip(packet.nonces.iter())
-                .zip(packet.mps.iter())
-            {
+            for idx in 0..packet.origins.len() {
+                let d = &packet.origins[idx];
                 if !decided_set.contains(d) {
                     continue;
                 }
+                if idx >= packet.secrets.len()
+                    || idx >= packet.nonces.len()
+                    || idx >= packet.mps.len()
+                    || idx >= packet.mask_shares.len()
+                    || idx >= packet.f_large_shares.len()
+                {
+                    continue;
+                }
+                let share = &packet.secrets[idx];
+                let nonce = &packet.nonces[idx];
+                let mp = &packet.mps[idx];
                 let root = match roots.get(d) {
                     Some(r) => *r,
                     None => continue,
@@ -338,11 +364,13 @@ impl Context {
                 if mp.root() != root {
                     continue;
                 }
-                let item = hc
-                    .hash_batch(vec![*share], vec![*nonce])
-                    .into_iter()
-                    .next()
-                    .expect("hash_batch returned no item");
+                // Combined leaf binds f_share, g_share, f_large, nonce.
+                let item = types::beacon::avss_commit_leaf(
+                    share,
+                    &packet.mask_shares[idx],
+                    &packet.f_large_shares[idx],
+                    nonce,
+                );
                 if item != mp.item() {
                     continue;
                 }

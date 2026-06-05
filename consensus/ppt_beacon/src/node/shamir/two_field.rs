@@ -49,29 +49,60 @@ pub struct TwoFieldShares {
     pub degree_test_coeffs: Vec<BigUint>,
 }
 
+/// Sampled two-field shares WITHOUT the degree-test polynomial `h`
+/// (which needs θ). Used by the Fiat-Shamir dealer path to commit
+/// f and g before deriving θ from the commitment.
+#[derive(Clone, Debug)]
+pub struct TwoFieldSampled {
+    pub secret_shares: Vec<(usize, BigUint)>,
+    pub f_large_shares: Vec<(usize, BigUint)>,
+    pub mask_shares: Vec<(usize, BigUint)>,
+    pub f_poly: Vec<BigUint>,
+    pub g_poly: Vec<BigUint>,
+}
+
 impl TwoFieldDealer {
     pub fn new(small_field: BigUint, large_field: BigUint, threshold: usize, share_amount: usize) -> Self {
         Self { small_field, large_field, threshold, share_amount }
     }
 
     /// Generate two-field shares for a single secret.
-    /// theta is the previous round's beacon output (used for degree testing).
+    /// theta is the degree-test challenge.
+    ///
+    /// Convenience wrapper kept for tests / call sites that already
+    /// know θ. Production (Fiat-Shamir) uses `sample_shares` to commit
+    /// f and g FIRST, derives θ from the commitment, then calls
+    /// `compute_degree_test_poly_pub`.
     pub fn share_secret(&self, secret: BigUint, theta: &BigUint) -> TwoFieldShares {
-        // 1. Generate f(x) over small field with f(0) = secret
+        let sampled = self.sample_shares(secret);
+        let h_coeffs =
+            self.compute_degree_test_poly(&sampled.f_poly, &sampled.g_poly, theta);
+        TwoFieldShares {
+            secret_shares: sampled.secret_shares,
+            f_large_shares: sampled.f_large_shares,
+            mask_shares: sampled.mask_shares,
+            degree_test_coeffs: h_coeffs,
+        }
+    }
+
+    /// Sample f (encoding the secret) and the random mask g, returning
+    /// all per-recipient shares PLUS the raw polynomials, WITHOUT
+    /// computing the degree-test polynomial `h` (which needs θ). The
+    /// Fiat-Shamir dealer path commits these shares first, derives θ
+    /// from the commitment, then computes `h` via
+    /// `compute_degree_test_poly_pub`.
+    pub fn sample_shares(&self, secret: BigUint) -> TwoFieldSampled {
         let f_ss = ShamirSecretSharing {
             threshold: self.threshold,
             share_amount: self.share_amount,
             prime: self.small_field.clone(),
         };
-        let f_poly = f_ss.sample_polynomial_pub(secret.clone());
+        let f_poly = f_ss.sample_polynomial_pub(secret);
 
-        // Evaluate f(i) in small field (mod p) — for secret reconstruction
-        let f_shares: Vec<(usize, BigUint)> = (1..=self.share_amount)
+        let secret_shares: Vec<(usize, BigUint)> = (1..=self.share_amount)
             .map(|x| (x, f_ss.mod_evaluate_at_pub(&f_poly, x)))
             .collect();
 
-        // Evaluate f(i) in large field (mod q) — for degree test verification
-        // Since f_poly coefficients are all < p < q, we can evaluate them mod q directly
         let f_large_ss = ShamirSecretSharing {
             threshold: self.threshold,
             share_amount: self.share_amount,
@@ -81,31 +112,36 @@ impl TwoFieldDealer {
             .map(|x| (x, f_large_ss.mod_evaluate_at_pub(&f_poly, x)))
             .collect();
 
-        // 2. Generate g(x) over large field with random g(0)
         let g_ss = ShamirSecretSharing {
             threshold: self.threshold,
             share_amount: self.share_amount,
             prime: self.large_field.clone(),
         };
-        let g_secret = rand::thread_rng().gen_biguint_range(
-            &BigUint::from(0u32),
-            &self.large_field,
-        );
+        let g_secret =
+            rand::thread_rng().gen_biguint_range(&BigUint::from(0u32), &self.large_field);
         let g_poly = g_ss.sample_polynomial_pub(g_secret);
-        let g_shares: Vec<(usize, BigUint)> = (1..=self.share_amount)
+        let mask_shares: Vec<(usize, BigUint)> = (1..=self.share_amount)
             .map(|x| (x, g_ss.mod_evaluate_at_pub(&g_poly, x)))
             .collect();
 
-        // 3. Compute h(x) = g(x) - θ·f(x) mod q
-        // f_poly coefficients are used as-is (they're < p < q, so valid in F_q)
-        let h_coeffs = self.compute_degree_test_poly(&f_poly, &g_poly, theta);
-
-        TwoFieldShares {
-            secret_shares: f_shares,
+        TwoFieldSampled {
+            secret_shares,
             f_large_shares,
-            mask_shares: g_shares,
-            degree_test_coeffs: h_coeffs,
+            mask_shares,
+            f_poly,
+            g_poly,
         }
+    }
+
+    /// Public wrapper around the degree-test polynomial computation
+    /// `h(x) = g(x) - θ·f(x) mod q`, for the Fiat-Shamir dealer path.
+    pub fn compute_degree_test_poly_pub(
+        &self,
+        f_coeffs: &[BigUint],
+        g_coeffs: &[BigUint],
+        theta: &BigUint,
+    ) -> Vec<BigUint> {
+        self.compute_degree_test_poly(f_coeffs, g_coeffs, theta)
     }
 
     /// Compute h(x) = g(x) - θ·f(x) mod q

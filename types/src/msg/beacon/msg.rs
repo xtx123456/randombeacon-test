@@ -7,6 +7,28 @@ use super::{Replica};
 
 pub type Val = [u8; HASH_SIZE];
 
+/// AVSS Merkle-commitment leaf for one (coin, recipient) slot.
+///
+/// Binds ALL of the recipient's confidential per-coin material —
+/// the small-field secret share `f(i) mod p`, the mask share
+/// `g(i) mod q`, the large-field share `f(i) mod q`, and the
+/// per-share nonce — into a single committed leaf. Previously only
+/// `(f_share, nonce)` was committed, leaving the mask `g` free; a
+/// Byzantine dealer could then pick `g(i)` AFTER learning the
+/// degree-test challenge and pass the test with an arbitrary-degree
+/// `f`. Committing `g` (and `f_large`) here is what makes the
+/// Fiat-Shamir degree-test challenge `θ = H(round‖dealer‖root_vec)`
+/// sound: the dealer must commit `f` and `g` before `θ` is
+/// determined.
+pub fn avss_commit_leaf(f_share: &Val, g_share: &Val, f_large: &Val, nonce: &Val) -> Hash {
+    let mut buf = Vec::with_capacity(4 * HASH_SIZE);
+    buf.extend_from_slice(f_share);
+    buf.extend_from_slice(g_share);
+    buf.extend_from_slice(f_large);
+    buf.extend_from_slice(nonce);
+    do_hash(buf.as_slice())
+}
+
 #[derive(Debug,Serialize,Deserialize,Clone)]
 pub struct BeaconMsg{
     pub origin: Replica,
@@ -114,11 +136,38 @@ impl BeaconMsg {
                 log::error!("Merkle proof verification failed for wssmsg sent by {}",wssmsg.origin);
                 return false;
             }
-            let secrets = wssmsg.secrets.clone();
-            let nonces = wssmsg.nonces.clone();
-            let commitments = hf.hash_batch(secrets, nonces);
-            for (pf,comm) in wssmsg.mps.iter().zip(commitments.into_iter()){
-                if pf.item() != comm{
+            // The committed leaf binds f_share, g_share (mask),
+            // f_large AND nonce (see `avss_commit_leaf`). The mask /
+            // f_large shares live in the BeaconMsg's per-recipient
+            // `mask_shares` / `f_large_shares`, aligned by coin with
+            // `wssmsg.secrets`. Without all three present we cannot
+            // recompute the leaf, so a packet missing them is invalid.
+            let mask = match self.mask_shares.as_ref() {
+                Some(m) => m,
+                None => {
+                    log::error!("missing mask_shares for commitment leaf (wss from {})", wssmsg.origin);
+                    return false;
+                }
+            };
+            let f_large = match self.f_large_shares.as_ref() {
+                Some(m) => m,
+                None => {
+                    log::error!("missing f_large_shares for commitment leaf (wss from {})", wssmsg.origin);
+                    return false;
+                }
+            };
+            if mask.len() != wssmsg.secrets.len() || f_large.len() != wssmsg.secrets.len() || wssmsg.nonces.len() != wssmsg.secrets.len() {
+                log::error!("mismatched per-coin lengths for commitment leaf (wss from {})", wssmsg.origin);
+                return false;
+            }
+            for (coin, pf) in wssmsg.mps.iter().enumerate() {
+                let leaf = avss_commit_leaf(
+                    &wssmsg.secrets[coin],
+                    &mask[coin],
+                    &f_large[coin],
+                    &wssmsg.nonces[coin],
+                );
+                if pf.item() != leaf {
                     log::error!("Commitment does not match element in proof for wssmsg sent by {}",wssmsg.origin);
                     return false;
                 }
