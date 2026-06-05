@@ -499,7 +499,11 @@ impl CTRBCState {
 
         let extracted = extractor.extract(&inputs);
 
-        log::info!(
+        // Demoted to `debug` (Phase E): this fires once per coin
+        // (batch_size lines/round) and adds no operational value over
+        // the round-level [STAGE][BEACON-OUT] marker. Re-enable with
+        // `RUST_LOG=ppt_beacon=debug`.
+        log::debug!(
             "[PPT][COIN-CHECK] round {} coin {} super-invertible extraction produced {} beacon value(s) from {} decided dealers",
             round,
             coin_number,

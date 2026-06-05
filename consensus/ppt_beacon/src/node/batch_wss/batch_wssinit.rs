@@ -257,42 +257,54 @@ impl Context {
         assert_eq!(degree_test_batch.len(), total_coins);
 
         // ============================================================
-        // Shoup-Smart 2024 Π_SecMsgDst-routed dispatch (commit 7 cutover).
+        // AVSS share-distribution dispatch.
         //
-        // Replaces the legacy per-recipient AVSSSend(BeaconMsg, ...)
-        // unicast loop:
+        // Step 1 (common to both transports): broadcast a single
+        // AvssPublicCommitMsg carrying root_vec + degree_test_coeffs
+        // + transcript-binding hash. Same wire payload regardless
+        // of transport; saves (n-1)x bytes vs the historical per-
+        // recipient duplication of these public fields.
         //
-        //   1. Public commitment (root_vec, degree_test_coeffs, +
-        //      transcript binding hash) is broadcast ONCE via
-        //      AVSSSecMsgPublicCommit, instead of being duplicated
-        //      across n cleartext BeaconMsg copies.
+        // Step 2 (transport-specific): ship the per-recipient
+        // AvssRecipientPayload (secrets, nonces, mask_shares,
+        // f_large_shares, mps) to every other node. Two transports:
         //
-        //   2. Per-recipient confidential payload (secrets, nonces,
-        //      mask_shares, f_large_shares, mps) is dispersed via
-        //      Π_SecMsgDst. SecKeyDst gives every P_j a private
-        //      Shamir share k_j of a fresh master key K; RelMsgDst
-        //      publicly distributes the n hash-chain-encrypted
-        //      ciphertexts c_j = m_j XOR PRG(k_j). Each P_j
-        //      decrypts its own c_j with its own k_j.
+        //   * AvssTransport::Lite (default): single AVSSPrivatePayload
+        //     unicast per recipient. O(n) wire messages per dealer
+        //     per round. Wire-layer confidentiality is provided by
+        //     the existing WrapperMsg HMAC + (typically) TLS, plus
+        //     the PPT-design observation that the post-ACS
+        //     MulticastRecoveredShares phase reveals these same
+        //     share bytes in cleartext anyway -- so application-
+        //     layer encryption only delays the leak by a few
+        //     hundred milliseconds and does not change any
+        //     adversary's information set in the steady-state PPT
+        //     beacon protocol.
         //
-        //   3. AVSSReady / AVSSComplete quorum + AVSS-completion +
-        //      ACS hook are unchanged: the receiver's
-        //      `try_finalize_avss_secmsg` reconstructs an
-        //      equivalent-shaped BeaconMsg and feeds it into the
-        //      same `process_avss_send` pipeline that the legacy
-        //      cleartext path used. All P0/P1/Level fixes (theta
-        //      buffering, banned_dealers, spawn_blocking,
-        //      audit fire-and-forget, coin-0 fast-path) remain
-        //      identically in force.
+        //   * AvssTransport::SecMsg: full Shoup-Smart 2024 Sec 4.3
+        //     Pi_SecMsgDst dispersal (Shamir-shared master key +
+        //     per-recipient hash-chain PRG + RBC-style key &
+        //     cipher channels with Bracha echo / vote). O(n^2)
+        //     wire messages per dealer per round. Suitable for
+        //     paper-compliance benchmarks and for deployments
+        //     that cannot rely on wire-layer confidentiality.
+        //
+        // Step 3 (common): the receiver's try_finalize_avss_secmsg
+        // reconstructs an equivalent-shaped BeaconMsg and feeds it
+        // into the same process_avss_send pipeline the legacy
+        // cleartext AVSSSend path used. Every P0/P1/Level fix
+        // (theta buffering, banned_dealers, spawn_blocking,
+        // audit fire-and-forget, coin-0 fast-path) remains in
+        // force regardless of which transport delivered the bytes.
         //
         // appx_con is empty (Vec::new()) on the pure-PPT path
-        // (see vec_round_msgs above), so the receiver
-        // reconstructs an identical-shape BeaconMsg without needing
-        // the dealer to ship appx_con explicitly.
+        // (see vec_round_msgs above) so the BeaconMsg
+        // reconstruction on the receiver side does not need the
+        // dealer to ship appx_con explicitly.
         // ============================================================
         let _ = vec_round_msgs;
 
-        // (1) Build & broadcast the public commitment.
+        // ----- Step 1: shared public commit broadcast -----
         let public_commit = types::beacon::AvssPublicCommitMsg::new(
             self.myid,
             new_round,
@@ -313,9 +325,10 @@ impl Context {
         self.process_avss_secmsg_public_commit(public_commit_for_self, myid)
             .await;
 
-        // (2) Build per-recipient AvssRecipientPayload byte vectors.
-        //     The ordering must match SecMsgDst's recipient_idx
-        //     convention (recipient j ∈ [0, n) maps to payload[j]).
+        // ----- Step 2: build per-recipient AvssRecipientPayload byte vectors -----
+        // The ordering matches the SecMsgDst recipient_idx convention
+        // (recipient j in [0, n) -> payload[j]) so both transports
+        // reuse the same per-recipient byte vector.
         let mut recipient_payload_bytes: Vec<Vec<u8>> = Vec::with_capacity(self.num_nodes);
         for (idx, (_rep, batchwss)) in vec_msgs_to_be_sent.into_iter().enumerate() {
             let payload = types::beacon::AvssRecipientPayload::new(
@@ -329,33 +342,80 @@ impl Context {
         }
         debug_assert_eq!(recipient_payload_bytes.len(), self.num_nodes);
 
-        // (3) Initialise the per-(round, dealer-self) SecMsgDstState
-        //     and call set_input_as_sender. This synchronously samples
-        //     a master key K, derives all (k_1, ..., k_n) shares
-        //     internally, encrypts each m_j with PRG(k_j), and emits
-        //     the channel-tagged dispersal/echo/vote actions.
-        let actions = {
-            let secmsg_state = self.get_or_init_avss_secmsg(new_round, self.myid);
-            let mut rng = rand::thread_rng();
-            secmsg_state
-                .set_input_as_sender(recipient_payload_bytes, &mut rng)
-                .expect(
-                    "[PPT][SECMSG-AVSS] dealer set_input_as_sender failed -- \
-                     this should be impossible on the live path \
-                     (only fails on degenerate prime/n/t configs)",
-                )
-        };
+        // ----- Step 3: transport-specific dispatch -----
+        match self.transport {
+            crate::node::context::AvssTransport::Lite => {
+                log::info!(
+                    "[PPT][AVSS-LITE] node {} dispatching {} per-recipient \
+                     AVSSPrivatePayload unicasts for round {} (transport=lite)",
+                    self.myid,
+                    self.num_nodes,
+                    new_round
+                );
+                // One direct unicast per recipient. The byte vector
+                // for recipient `j` is recipient_payload_bytes[j].
+                // The self-deliver path (j == self.myid) re-enters
+                // process_avss_private_payload synchronously below,
+                // which mirrors the broadcast-skips-self pattern
+                // used by Context::broadcast.
+                for (j, bytes) in recipient_payload_bytes.into_iter().enumerate() {
+                    let recipient = j as Replica;
+                    if recipient == self.myid {
+                        // Self-deliver: wire_sender = self.myid
+                        // == dealer, so the sender-binding check
+                        // inside process_avss_private_payload passes.
+                        self.process_avss_private_payload(
+                            new_round,
+                            self.myid,
+                            bytes,
+                            self.myid,
+                        )
+                        .await;
+                    } else {
+                        let coin_msg =
+                            CoinMsg::AVSSPrivatePayload(new_round, self.myid, bytes);
+                        let sec_key = self
+                            .sec_key_map
+                            .get(&recipient)
+                            .cloned()
+                            .expect("sec_key for recipient must exist");
+                        let wrapper = types::beacon::WrapperMsg::new(
+                            coin_msg,
+                            self.myid,
+                            &sec_key,
+                            new_round,
+                        );
+                        let cancel = self.net_send.send(recipient, wrapper).await;
+                        self.add_cancel_handler(cancel);
+                    }
+                }
+            }
+            crate::node::context::AvssTransport::SecMsg => {
+                log::info!(
+                    "[PPT][AVSS-SECMSG] node {} dispatching Pi_SecMsgDst Sec 4.3 \
+                     transport for round {} (transport=secmsg)",
+                    self.myid,
+                    new_round
+                );
+                let actions = {
+                    let secmsg_state =
+                        self.get_or_init_avss_secmsg(new_round, self.myid);
+                    let mut rng = rand::thread_rng();
+                    secmsg_state
+                        .set_input_as_sender(recipient_payload_bytes, &mut rng)
+                        .expect(
+                            "[PPT][SECMSG-AVSS] dealer set_input_as_sender failed -- \
+                             this should be impossible on the live path \
+                             (only fails on degenerate prime/n/t configs)",
+                        )
+                };
+                self.dispatch_avss_secmsg_actions(new_round, self.myid, actions)
+                    .await;
+            }
+        }
 
-        // (4) Pump the actions through the channel-tagged wire layer.
-        //     dispatch_avss_secmsg_actions handles SendDispersal /
-        //     SendEcho / SendVote routing including the dealer's
-        //     own self-loop (recipient_idx == self.myid).
-        self.dispatch_avss_secmsg_actions(new_round, self.myid, actions).await;
-
-        // (5) Suppress unused-binding warnings for the legacy
-        //     cleartext-path locals we no longer emit. We keep
-        //     them in scope so future profiling / debugging hooks
-        //     can dump them without re-plumbing.
+        // Suppress unused-binding warnings for the local variables
+        // that the lite path's match-arm closure moves out of scope.
         let _ = roots_vec;
         let _ = degree_test_batch;
         let _ = mask_shares_per_node;

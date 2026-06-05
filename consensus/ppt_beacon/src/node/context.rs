@@ -60,6 +60,62 @@ pub const PPT_GENESIS_THETA_SEED: &[u8] = b"PPT_BEACON_GENESIS_THETA_v1";
 /// executions.
 pub const PPT_COIN_RESERVE: usize = 12;
 
+/// AVSS transport selector for the PPT random beacon.
+///
+/// The PPT scheme needs to deliver dealer-to-recipient confidential
+/// share material once per round per dealer. Two transports satisfy
+/// this requirement:
+///
+/// * **`Lite`** (default) — direct cleartext per-recipient unicast
+///   of `AvssRecipientPayload` (still HMAC-authenticated via the
+///   existing `WrapperMsg` + `sec_key_map` per-pair shared secret)
+///   plus a single broadcast `AvssPublicCommitMsg` carrying the
+///   public Merkle roots + degree-test coefficients. Wire complexity:
+///   `O(n)` messages per dealer per round.
+///
+///   Trust model: relies on the underlying wire transport (TLS or
+///   trusted LAN) to prevent passive eavesdroppers from reading the
+///   share material between AVSS dispersal and the post-ACS
+///   `MulticastRecoveredShares` broadcast (which reveals the same
+///   share material in cleartext for audit purposes anyway). This
+///   matches every other PPT wire message's threat model.
+///
+/// * **`SecMsg`** — Shoup-Smart 2024 Sec 4.3 Π_SecMsgDst transport:
+///   encrypts every per-recipient payload with a Shamir-shared
+///   master key + per-recipient hash-chain PRG stream, and disperses
+///   both the key shares and the ciphertexts via RBC-style RelMsgDst
+///   channels with full Bracha echo / vote agreement. Wire
+///   complexity: `O(n^2)` messages per dealer per round.
+///
+///   Trust model: tolerates passive wire eavesdroppers (no TLS
+///   required). Useful for paper-compliance testing and for
+///   deployments where the network layer cannot be relied upon for
+///   confidentiality.
+///
+/// Selected once at startup via the CLI `--transport=lite|secmsg`
+/// flag and pushed into `Context::transport`. Every honest node in
+/// a single deployment must agree on the same transport for the
+/// dealer set to converge in ACS (mixed transports would still
+/// converge because both wire variants are accepted on the
+/// receive side, but only one set of variants is ever emitted, so
+/// running mixed in one cluster is unsupported).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AvssTransport {
+    /// Default; see enum-level doc.
+    Lite,
+    /// Shoup-Smart Sec 4.3 (paper-compliant); see enum-level doc.
+    SecMsg,
+}
+
+impl AvssTransport {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AvssTransport::Lite => "lite",
+            AvssTransport::SecMsg => "secmsg",
+        }
+    }
+}
+
 /// PPT random-beacon node context (pure-PPT mode: frequency φ = 1,
 /// every honest node is always a dealer, no anytrust committee, no
 /// legacy Binary-AA / Gather / CTRBC paths).
@@ -177,6 +233,12 @@ pub struct Context {
     pub coin_reveal_pending:
         HashMap<(Round, u64), Vec<(types::beacon::BatchWSSReconMsg, Replica)>>,
 
+    /// Selected AVSS transport for this node's PPT deployment
+    /// (`Lite` default = O(n) per-recipient unicast; `SecMsg` =
+    /// Shoup-Smart Sec 4.3 Π_SecMsgDst). The dealer path branches on
+    /// this; the receive side accepts both wire families.
+    pub transport: AvssTransport,
+
     // ---- Audit fire-and-forget plumbing (P0-A.1) ----
     //
     // post-ACS audit (the bulk of `process_multicast_recovered_shares`)
@@ -203,6 +265,61 @@ pub struct Context {
     pub audit_tx: mpsc::UnboundedSender<AuditCompletion>,
     pub audit_rx: mpsc::UnboundedReceiver<AuditCompletion>,
 
+    // ---- AVSS validation fire-and-forget (Phase D) ----
+    //
+    // `process_avss_send` used to await its `spawn_blocking`
+    // `avss_local_packet_valid_pure` call synchronously on the
+    // consensus main task. With n=16, batch=1000, each await is
+    // ~25 ms of degree-test + Merkle work, and per round per node
+    // we receive 16 AVSS packets. The main task therefore spent
+    // up to 400 ms per round serialised on AVSS validation
+    // awaits, blocking it from processing the round-(r+1)
+    // BatchBeaconConstruct / ACS messages that were already
+    // queued in `net_recv`.
+    //
+    // Phase D extends the P0-A.1 audit fire-and-forget pattern to
+    // AVSS validation: `process_avss_send` now `tokio::spawn`s a
+    // detached task that runs the `spawn_blocking` validation and
+    // publishes the result back via `avss_validation_tx`. The
+    // main loop drains the corresponding `avss_validation_rx`
+    // arm in `tokio::select!` and applies the
+    // `store_avss_packet` + `AVSSReady` broadcast + AVSS-
+    // completion cascade on its own thread, so every `Context`
+    // mutation stays single-threaded as before -- no Mutex
+    // required on the hot path.
+    //
+    // Throughput consequence: 16 inbound AVSS validations per
+    // round per node now run in PARALLEL on tokio's blocking
+    // pool. End-to-end AVSS-phase wall time per round drops from
+    // 16 * 25 ms = 400 ms to ~50 ms on an 8-core machine.
+    pub avss_validation_tx: mpsc::UnboundedSender<AvssValidationCompletion>,
+    pub avss_validation_rx: mpsc::UnboundedReceiver<AvssValidationCompletion>,
+
+    // ---- Reconstruct ingest fire-and-forget (Phase D) ----
+    //
+    // Same problem as the AVSS validation channel above but for
+    // `process_batch_secret_shares`, which used to await
+    // `verify_batch_shares_pure` (degree-test for all
+    // n_decided_dealers * batch coins in a single inbound
+    // BatchBeaconConstruct packet) synchronously.
+    //
+    // Empirically (n=16, batch=1000): each inbound packet's
+    // verify_batch_shares_pure await took ~120 ms, n inbound
+    // packets per round per node => ~2 s of sequential main-loop
+    // time on reconstruct alone. That dominated the round budget
+    // (see log: `ACS-DECIDE -> coin-0 BEACON-OUT` ~= 2.2 s).
+    //
+    // Phase D detaches verify_batch_shares_pure the same way and
+    // sends a `ReconCompletion` back via the channel below; the
+    // main loop applies accepted shares + blame events on its
+    // own thread and triggers `maybe_recover_ready_coins`.
+    //
+    // 16 inbound packets now validated in parallel on the
+    // blocking pool. Reconstruct-phase wall time drops from
+    // ~2 s to ~250 ms on an 8-core machine.
+    pub recon_tx: mpsc::UnboundedSender<ReconCompletion>,
+    pub recon_rx: mpsc::UnboundedReceiver<ReconCompletion>,
+
     // ---- Diagnostics / lifecycle ----
     pub num_messages: u32,
     pub bench: HashMap<String, u128>,
@@ -220,12 +337,57 @@ pub struct AuditCompletion {
     pub blame_events: Vec<(Replica, crate::node::ctrbc::state::BlameReason)>,
 }
 
+/// Result of one detached `avss_local_packet_valid_pure` run, used
+/// by the AVSS validation fire-and-forget path. The detached task
+/// runs the CPU-heavy validation on the blocking pool and sends
+/// this struct back to the main loop, which applies
+/// `store_avss_packet` + `AVSSReady` broadcast + cascade on its
+/// own thread.
+#[derive(Debug)]
+pub struct AvssValidationCompletion {
+    pub round: Round,
+    pub dealer: Replica,
+    pub transcript_root: crypto::hash::Hash,
+    /// The validated BeaconMsg moved out of the spawn_blocking
+    /// closure. Stored back into CTRBCState verbatim once
+    /// validation succeeds.
+    pub beacon_msg: types::beacon::BeaconMsg,
+    /// `Ok(())` on successful validation; `Err(static_reason)` on
+    /// any Byzantine-detectable failure (transcript mismatch,
+    /// Merkle invalid, degree-test failed, share/f_large mismatch,
+    /// mp.root/root_vec mismatch). The main loop bans the dealer
+    /// on `Err(_)`.
+    pub result: Result<(), &'static str>,
+}
+
+/// Result of one detached `verify_batch_shares_pure` run, used by
+/// the BatchBeaconConstruct fire-and-forget reconstruct ingest
+/// path. The detached task runs the per-coin degree-test for all
+/// (dealer, coin) tuples in one inbound BatchBeaconConstruct
+/// packet, on the blocking pool, and sends this struct back to the
+/// main loop, which applies `add_secret_share` + blame writes on
+/// its own thread and triggers `maybe_recover_ready_coins`.
+#[derive(Debug)]
+pub struct ReconCompletion {
+    pub round: Round,
+    pub share_sender: Replica,
+    /// Whether the share_sender is itself in the ACS-decided set.
+    /// Mirrors the `use_for_batch` predicate that
+    /// `process_batch_secret_shares` previously computed inline.
+    /// Only `Accepted` outcomes whose `share_sender` is
+    /// `use_for_batch == true` are persisted via
+    /// `add_secret_share`.
+    pub use_for_batch: bool,
+    pub outcomes: Vec<crate::node::batch_wss::secret_reconstruct::CoinVerifyOutcome>,
+}
+
 impl Context {
     pub fn spawn(
         config: Node,
         _sleep: u128,
         batch: usize,
         frequency: Round,
+        transport: AvssTransport,
     ) -> anyhow::Result<oneshot::Sender<()>> {
         let prot_payload = &config.prot_payload;
         let v: Vec<&str> = prot_payload.split(',').collect();
@@ -296,6 +458,11 @@ impl Context {
 
             // Audit fire-and-forget channel (see field comment above).
             let (audit_tx, audit_rx) = mpsc::unbounded_channel::<AuditCompletion>();
+            // AVSS validation + reconstruct fire-and-forget channels
+            // (Phase D; see field comments above).
+            let (avss_validation_tx, avss_validation_rx) =
+                mpsc::unbounded_channel::<AvssValidationCompletion>();
+            let (recon_tx, recon_rx) = mpsc::unbounded_channel::<ReconCompletion>();
 
             let mut c = Context {
                 net_send: consensus_net,
@@ -322,6 +489,10 @@ impl Context {
                 banned_dealers: HashSet::new(),
                 audit_tx,
                 audit_rx,
+                avss_validation_tx,
+                avss_validation_rx,
+                recon_tx,
+                recon_rx,
                 coin_per_round: HashMap::default(),
 
                 avss_secmsg_state: HashMap::default(),
@@ -333,6 +504,8 @@ impl Context {
                 coin_reconstructed: HashMap::default(),
                 coin_reveal_sent: HashSet::new(),
                 coin_reveal_pending: HashMap::default(),
+
+                transport,
 
                 num_messages: 0,
                 bench: HashMap::default(),
@@ -618,6 +791,31 @@ impl Context {
                     // single-threaded-serialised, with no need for
                     // Mutex-style locking on the hot path.
                     self.finalize_audit_completion(audit_completion).await;
+                }
+                Some(avss_completion) = self.avss_validation_rx.recv() => {
+                    // Phase D fire-and-forget for AVSS validation:
+                    //
+                    // A detached task running on tokio's blocking
+                    // pool finished validating one inbound
+                    // BeaconMsg via `avss_local_packet_valid_pure`.
+                    // Apply store_avss_packet + AVSSReady
+                    // broadcast + AVSS-completion cascade here, on
+                    // the consensus task's worker thread, so all
+                    // Context mutations (round_state, banned_dealers)
+                    // stay single-threaded as before.
+                    self.finalize_avss_validation(avss_completion).await;
+                }
+                Some(recon_completion) = self.recon_rx.recv() => {
+                    // Phase D fire-and-forget for BatchBeaconConstruct
+                    // ingest:
+                    //
+                    // A detached task running on tokio's blocking
+                    // pool finished the degree-test for one inbound
+                    // BatchBeaconConstruct packet via
+                    // `verify_batch_shares_pure`. Apply add_secret_share
+                    // + blame writes here, then trigger
+                    // `maybe_recover_ready_coins`.
+                    self.finalize_recon_completion(recon_completion).await;
                 }
                 sync_msg = self.sync_recv.recv() => {
                     let sync_msg = sync_msg.ok_or_else(|| anyhow!("Networking layer has closed"))?;

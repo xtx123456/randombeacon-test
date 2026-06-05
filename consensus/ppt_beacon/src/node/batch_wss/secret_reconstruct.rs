@@ -51,7 +51,10 @@ fn packet_lengths_ok(packet: &BatchWSSReconMsg) -> bool {
 /// the correct evaluation point). This makes a relayed share
 /// unforgeable: a Byzantine provider can only relay the dealer's
 /// genuine committed share for its own slot, or withhold it.
-pub(crate) struct CoinVerifyInputs {
+///
+/// `pub` so the Phase-D fire-and-forget recon-completion struct in
+/// `context.rs` can carry these across the detached-task boundary.
+pub struct CoinVerifyInputs {
     pub coin_num: usize,
     /// The relaying provider (== wire sender of the BeaconConstruct).
     pub provider: Replica,
@@ -59,13 +62,16 @@ pub(crate) struct CoinVerifyInputs {
     pub roots_for_dealer: HashMap<Replica, Hash>,
 }
 
-/// One verification outcome of a single `(coin_num, dealer)` pair
 /// inside a coin-packet, produced by `verify_recon_shares_pure`.
-pub(crate) enum CoinVerifyOutcome {
+///
+/// `pub` + `Debug` so the Phase-D fire-and-forget recon-completion
+/// struct in `context.rs` can carry a `Vec<CoinVerifyOutcome>` across
+/// the detached-task / main-loop channel boundary.
+#[derive(Debug)]
+pub enum CoinVerifyOutcome {
     /// Share verified successfully against the dealer's Merkle
-    /// commitment. Caller (back on the async task) should write it
-    /// via `CTRBCState::add_secret_share(coin_num, dealer, provider,
-    /// share)`.
+    /// commitment. Caller writes it via
+    /// `CTRBCState::add_secret_share(coin_num, dealer, provider, share)`.
     Accepted {
         coin_num: usize,
         dealer: Replica,
@@ -236,8 +242,9 @@ pub(crate) fn audit_post_complaint_pure(
 /// `recover_and_emit_coin_set`).
 ///
 /// Lifting it into a pure free function (no `&self`, no `&CTRBCState`)
-/// lets the hot path call it inside `tokio::task::spawn_blocking`.
-pub(crate) fn verify_recon_shares_pure(
+/// lets the hot path call it inside `tokio::task::spawn_blocking`
+/// (Phase D fire-and-forget recon ingest).
+pub fn verify_recon_shares_pure(
     inputs: Vec<CoinVerifyInputs>,
     decided: &[Replica],
     banned: &HashSet<Replica>,
@@ -617,7 +624,12 @@ impl Context {
         };
 
         for (coin_num, beacon) in pending.into_iter() {
-            log::info!(
+            // Per-coin flush log demoted to debug: at batch=1000
+            // this fires ~1000 times per round per node. Kept as
+            // debug for forensics. The aggregate [STAGE][BEACON-OUT]
+            // marker in `self_coin_check_transmit` plus the
+            // round-level events still surface in INFO mode.
+            log::debug!(
                 "[PPT][BEACON-FLUSH] node {} round {} flushing coin {} via {}",
                 self.myid,
                 round,
@@ -790,29 +802,88 @@ impl Context {
             }
         }
 
-        // (3) Bulk Merkle-validation on the tokio blocking pool.
+        // (3) Phase D fire-and-forget (PR#6) + Merkle verifier (PR#5):
+        //     detach the bulk Merkle-validation onto an independent
+        //     tokio task that runs `verify_recon_shares_pure` on the
+        //     blocking pool and publishes the outcomes back via
+        //     `recon_tx`. Multiple inbound BatchBeaconConstructs for
+        //     the same round therefore validate in PARALLEL on the
+        //     blocking pool, instead of serialised on the consensus
+        //     task's await point.
         let banned_clone = banned.clone();
         let decided_clone = decided.clone();
         let hash_context = Arc::clone(&self.hash_context);
+        let share_sender = sender;
+        let recon_tx = self.recon_tx.clone();
 
-        let outcomes = tokio::task::spawn_blocking(move || {
-            verify_recon_shares_pure(
-                verify_inputs,
-                &decided_clone,
-                &banned_clone,
-                &hash_context,
-            )
-        })
-        .await
-        .unwrap_or_else(|e| {
-            log::error!(
-                "[PPT][LEVEL2] bulk share-verify blocking task join error round {} sender {}: {}",
-                round, sender, e
-            );
-            Vec::new()
+        tokio::spawn(async move {
+            let outcomes = tokio::task::spawn_blocking(move || {
+                verify_recon_shares_pure(
+                    verify_inputs,
+                    &decided_clone,
+                    &banned_clone,
+                    &hash_context,
+                )
+            })
+            .await
+            .unwrap_or_else(|e| {
+                log::error!(
+                    "[PPT][LEVEL2] bulk share-verify blocking task join error \
+                     round {} sender {}: {}",
+                    round, share_sender, e
+                );
+                Vec::new()
+            });
+
+            let _ = recon_tx.send(crate::node::context::ReconCompletion {
+                round,
+                share_sender,
+                // PR#5 reconstruction binds each share to its proven
+                // provider (any f+1 providers suffice), so the apply
+                // path uses the per-outcome provider, not share_sender.
+                // The flag is retained for the struct and always true.
+                use_for_batch: true,
+                outcomes,
+            });
         });
 
-        // (4) Apply outcomes back to state in a single short window.
+        self.add_benchmark(
+            String::from("process_batchreconstruct"),
+            now.elapsed().unwrap().as_nanos(),
+        );
+        // NB: maybe_recover_ready_coins is triggered in
+        // `finalize_recon_completion` once the detached
+        // task publishes its outcomes back to the main loop.
+    }
+
+    /// Apply one completed reconstruct-ingest validation (from
+    /// the detached task spawned in `process_batch_secret_shares`).
+    /// Called from the main loop's `tokio::select!` arm on
+    /// `recon_rx.recv()`. Runs on the consensus task's worker
+    /// thread, so every Context mutation (secret_shares,
+    /// banned_dealers) stays single-threaded.
+    pub async fn finalize_recon_completion(
+        &mut self,
+        completion: crate::node::context::ReconCompletion,
+    ) {
+        let crate::node::context::ReconCompletion {
+            round,
+            share_sender: _share_sender,
+            use_for_batch: _use_for_batch,
+            outcomes,
+        } = completion;
+
+        // Late-arrival guard: the round may have been cleared
+        // between spawn and finalize (e.g. all coins emitted +
+        // audit done). Drop silently.
+        let round_active = match self.round_state.get(&round) {
+            Some(s) => !s.cleared,
+            None => false,
+        };
+        if !round_active {
+            return;
+        }
+
         {
             let rbc_state = self.round_state.get_mut(&round).unwrap();
             for outcome in outcomes.into_iter() {
@@ -829,12 +900,11 @@ impl Context {
             }
         }
 
-        self.add_benchmark(
-            String::from("process_batchreconstruct"),
-            now.elapsed().unwrap().as_nanos(),
-        );
-
-        // (5) Trigger batch recovery exactly once for the whole batch.
+        // Trigger batch recovery exactly once per applied packet.
+        // Multiple in-flight finalize_recon_completion calls each
+        // trigger this; `maybe_recover_ready_coins` is idempotent
+        // and only does work when the n-f share-quorum threshold
+        // is crossed.
         self.maybe_recover_ready_coins(round).await;
     }
 
@@ -1405,6 +1475,26 @@ impl Context {
                 return;
             }
 
+            // Phase F1 -- guard against late-arriving MulticastRecoveredShares:
+            // once the audit task has fired (post_complaint_complete=true), any
+            // additional inbound multicast for this round is unused (the audit's
+            // n-f quorum already cleared, and audit_post_complaint_pure was
+            // already invoked with the snapshot at that time). Pre-Phase-F1 we
+            // would still `.insert(sender, recovered)` here, accumulating
+            // ~4.5 MB per late arrival in a map that nobody consumes -- a
+            // direct OOM contributor at batch=1000 / n=16 (~67 MB per round
+            // just from stale insertions).
+            if rbc_state.post_complaint_complete {
+                log::debug!(
+                    "[PPT][POST-COMPLAINT-SKIP] node {} round {} already completed; \
+                     dropping late multicast from sender {}",
+                    self.myid,
+                    round,
+                    sender
+                );
+                return;
+            }
+
             // Latest snapshot from this sender overwrites previous one.
             rbc_state.post_complaint_packets.insert(sender, recovered);
 
@@ -1415,15 +1505,6 @@ impl Context {
                 rbc_state.post_complaint_packets.len(),
                 threshold
             );
-
-            if rbc_state.post_complaint_complete {
-                log::info!(
-                    "[PPT][POST-COMPLAINT-SKIP] node {} round {} already completed",
-                    self.myid,
-                    round
-                );
-                return;
-            }
 
             // Asynchronous completion rule: n-f snapshots are enough to run the audit.
             if rbc_state.post_complaint_packets.len() < threshold {
@@ -1436,10 +1517,29 @@ impl Context {
 
             rbc_state.post_complaint_complete = true;
 
+            // Phase F1 -- MOVE (not clone) `comm_vectors` and
+            // `post_complaint_packets` into the detached audit task. The
+            // only consumer of either map for this round is
+            // `audit_post_complaint_pure` inside the detached task; cloning
+            // here used to double the in-flight memory footprint by ~67 MB
+            // per round at batch=1000 / n=16, and the original copies in
+            // `rbc_state` were never read again before
+            // `maybe_release_round` cleared them. Using `mem::take` drops
+            // the rbc_state copies the moment the audit task takes
+            // ownership.
+            //
+            // Late-arriving AVSS validations that fire after this point
+            // would call `store_avss_packet`, which writes into the
+            // (now-empty) `comm_vectors` map. That is harmless: audit has
+            // already used the pre-take snapshot, and the new entries are
+            // small (one Hash per coin per dealer) and get cleared by
+            // `maybe_release_round` at round end. Safety / correctness:
+            // verified that no other code path reads either of these maps
+            // for `round` after the audit fires.
             Some((
                 rbc_state.acs_decided_set.clone().unwrap_or_default(),
-                rbc_state.comm_vectors.clone(),
-                rbc_state.post_complaint_packets.clone(),
+                std::mem::take(&mut rbc_state.comm_vectors),
+                std::mem::take(&mut rbc_state.post_complaint_packets),
                 senders,
             ))
         };
@@ -1581,7 +1681,12 @@ impl Context {
         // coin 0 (deterministic + agreed across honest nodes).
         let seed_value = numbers.first().cloned().unwrap_or_default();
 
-        log::info!(
+        // Per-coin BEACON-OUT marker demoted to debug (Phase E): at
+        // batch=1000 the per-coin INFO logs cost ~500 ms of
+        // synchronous stderr work per round on the consensus main
+        // task. The round-level markers + syncer BeaconRecon are
+        // sufficient for production tracking.
+        log::debug!(
             "[PPT][STAGE][BEACON-OUT] node {} round {} coin {} ({} extracted outputs)",
             self.myid,
             round,
