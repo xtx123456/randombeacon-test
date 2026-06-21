@@ -8,6 +8,7 @@ mod tests {
 
 pub mod hash;
 pub mod aes_hash;
+pub mod gf2;
 
 mod crypto;
 pub use crypto::*;
