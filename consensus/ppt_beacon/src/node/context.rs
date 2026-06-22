@@ -643,11 +643,18 @@ impl Context {
     /// drop coins that some other consumer may still want for
     /// non-uniform purposes.
     pub fn coin_value_matches_uniform_range(&self, coin_bytes: &[u8]) -> bool {
-        Self::coin_value_matches_uniform_range_with(
-            coin_bytes,
-            &self.secret_domain,
-            self.num_nodes,
-        )
+        match self.gf2_profile {
+            None => Self::coin_value_matches_uniform_range_with(
+                coin_bytes,
+                &self.secret_domain,
+                self.num_nodes,
+            ),
+            Some(profile) => Self::coin_value_matches_uniform_range_with_gf2(
+                coin_bytes,
+                profile,
+                self.num_nodes,
+            ),
+        }
     }
 
     /// Fiat-Shamir degree-test challenge θ for a dealer's AVSS
@@ -765,6 +772,64 @@ impl Context {
         let v = BigUint::from_bytes_be(coin_bytes);
         let v_mod = &v % secret_domain;
         v_mod < cutoff
+    }
+
+    /// GF(2^w) analogue of `coin_value_matches_uniform_range_with`
+    /// (commit 6 of the migration). The PPT "first-match" rule
+    /// pg 30-32 asks whether a coin value `v` is uniformly usable
+    /// as a sample in `[0, num_nodes)`. In the binary-extension
+    /// profile, the relevant uniform domain is `GF(2^w_p)` (the
+    /// small field where `SuperInvExtractor` outputs live), so the
+    /// rejection-sampling cutoff is `num_nodes * floor(2^w_p /
+    /// num_nodes)`.
+    ///
+    /// `coin_bytes` is the 32-byte little-endian `Gf2Element` payload
+    /// produced by `Gf2SuperInvExtractor::extract`; we read its low
+    /// `small_byte_len()` bytes as a little-endian integer in
+    /// `[0, 2^w_p)` and apply the same `v < cutoff` test.
+    ///
+    /// When `w_p >= 64` the domain is at least `2^64`, which dwarfs
+    /// any realistic `num_nodes`, so the cutoff equals `2^w_p` (no
+    /// rejection); we short-circuit to `true` to avoid 128-bit
+    /// modular arithmetic.
+    pub(crate) fn coin_value_matches_uniform_range_with_gf2(
+        coin_bytes: &[u8],
+        profile: crypto::gf2::Gf2Profile,
+        num_nodes: usize,
+    ) -> bool {
+        if num_nodes == 0 {
+            return false;
+        }
+        let small_len = profile.small_byte_len();
+        if small_len == 0 {
+            return false;
+        }
+        // The coin output from Gf2SuperInvExtractor is a small-field
+        // element; only its low w_p bits are meaningful. For w_p >= 64
+        // the rejection probability is at most n / 2^64, negligible
+        // for any realistic n — every output is uniformly usable.
+        if profile.w_p >= 64 {
+            return true;
+        }
+        let n = num_nodes as u128;
+        let domain: u128 = 1u128 << profile.w_p;
+        if n > domain {
+            // Trivially not satisfiable: more nodes than small-field
+            // elements. The dealer constructor would have rejected
+            // this configuration already, but be defensive.
+            return false;
+        }
+        let cutoff: u128 = (domain / n) * n;
+        // Read the low `small_len` bytes as a little-endian integer.
+        let n_read = small_len.min(16);
+        let mut buf = [0u8; 16];
+        buf[..n_read].copy_from_slice(&coin_bytes[..n_read]);
+        let v_full = u128::from_le_bytes(buf);
+        // Mask to exactly w_p bits — the high `8*small_len - w_p`
+        // bits of the boundary byte must already be zero in a
+        // canonical Gf2Element, but be defensive.
+        let v = v_full & (domain - 1);
+        v < cutoff
     }
 
     /// Broadcast a message to all nodes.
@@ -1016,6 +1081,54 @@ mod tests {
         let theta_a = Context::theta_from_bytes(&beacon_a, &q);
         let theta_b = Context::theta_from_bytes(&beacon_b, &q);
         assert_ne!(theta_a, theta_b);
+    }
+
+    /// GF(2^w) sibling of `first_match_uniform_range_check`.
+    /// Domain = `2^w_p = 16` (w_p=4 — wait, w_p=4 not registered;
+    /// use w_p=8, domain=256). n=10 ⇒ cutoff = 10 * floor(256/10)
+    /// = 10 * 25 = 250; values in [0, 250) accept; [250, 256)
+    /// reject. coin_bytes is the LE GF(2^w_p) element encoding.
+    #[test]
+    fn first_match_uniform_range_check_gf2() {
+        use crypto::gf2::Gf2Profile;
+        let profile = Gf2Profile::new(8, 64).unwrap();
+        for v in 0u8..250 {
+            let mut bytes = [0u8; 32];
+            bytes[0] = v;
+            assert!(
+                Context::coin_value_matches_uniform_range_with_gf2(&bytes, profile, 10),
+                "GF2 v={} should match",
+                v
+            );
+        }
+        for v in 250u16..=255 {
+            let mut bytes = [0u8; 32];
+            bytes[0] = v as u8;
+            assert!(
+                !Context::coin_value_matches_uniform_range_with_gf2(&bytes, profile, 10),
+                "GF2 v={} should NOT match",
+                v
+            );
+        }
+    }
+
+    /// For w_p ≥ 64 the GF2 uniform-range check short-circuits to
+    /// `true` (the domain `2^w_p` is so much larger than any
+    /// realistic `num_nodes` that rejection probability is
+    /// negligible). Pin that behavior.
+    #[test]
+    fn uniform_range_check_gf2_short_circuits_for_wide_small_field() {
+        use crypto::gf2::Gf2Profile;
+        for &w_p in &[64usize, 128] {
+            let profile = Gf2Profile::new(w_p, w_p).unwrap();
+            // Even a max-value coin output is accepted.
+            let bytes = [0xffu8; 32];
+            assert!(
+                Context::coin_value_matches_uniform_range_with_gf2(&bytes, profile, 64),
+                "w_p={} should always accept",
+                w_p
+            );
+        }
     }
 
     #[test]

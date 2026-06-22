@@ -1183,16 +1183,35 @@ impl Context {
             // (>= f+1 >= 1). `coin_check` applies it per coin column to
             // extract `m - f` independent beacon values, tolerating the
             // <= f Byzantine dealers in the decided set.
+            //
+            // GF(2^w) migration (commit 6): when ctx.gf2_profile is set,
+            // construct a `Gf2SuperInvExtractor` instead. The two
+            // `Option`s in CTRBCState are mutually exclusive; coin_check
+            // dispatches on which is `Some`.
+            use crate::node::shamir::gf2_two_field::Gf2SuperInvExtractor;
             use crate::node::shamir::two_field::SuperInvExtractor;
             let m = decided_vec.len();
             let num_outputs = m.saturating_sub(self.num_faults).max(1);
             let alpha_points: Vec<usize> =
                 decided_vec.iter().map(|dealer| *dealer + 1).collect();
-            rbc_state.super_inv_extractor = Some(SuperInvExtractor::new(
-                alpha_points,
-                num_outputs,
-                rbc_state.secret_domain.clone(),
-            ));
+            match self.gf2_profile {
+                None => {
+                    rbc_state.super_inv_extractor = Some(SuperInvExtractor::new(
+                        alpha_points,
+                        num_outputs,
+                        rbc_state.secret_domain.clone(),
+                    ));
+                    rbc_state.gf2_super_inv_extractor = None;
+                }
+                Some(profile) => {
+                    rbc_state.super_inv_extractor = None;
+                    rbc_state.gf2_super_inv_extractor = Some(Gf2SuperInvExtractor::new(
+                        profile,
+                        alpha_points,
+                        num_outputs,
+                    ));
+                }
+            }
 
             log::error!(
                 "[PPT][ACS-RECON] node {} round {} immutable decided_set = {:?} (reconstruction: any f+1 validated providers/dealer; extraction: super-invertible {}->{} per coin)",

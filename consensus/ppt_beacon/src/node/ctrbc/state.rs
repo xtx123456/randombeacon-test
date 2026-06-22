@@ -28,6 +28,7 @@ use types::{
     Replica,
 };
 
+use crate::node::shamir::gf2_two_field::Gf2SuperInvExtractor;
 use crate::node::shamir::two_field::{BatchExtractor, SuperInvExtractor};
 
 /// Post-ACS accountability evidence: who is being blamed, in which
@@ -134,6 +135,11 @@ pub struct CTRBCState {
     /// `|decided| - f` independent beacon values per coin column,
     /// replacing the degenerate all-ones sum.
     pub super_inv_extractor: Option<SuperInvExtractor>,
+    /// GF(2^w) sibling of `super_inv_extractor`. Populated by
+    /// `finalize_acs_round` instead of the BigUint variant when the
+    /// Context carries `gf2_profile = Some(_)`. `coin_check`
+    /// dispatches on which of the two `Option`s is `Some`.
+    pub gf2_super_inv_extractor: Option<Gf2SuperInvExtractor>,
     /// Immutable ACS decision used as the reconstruction basis.
     pub acs_decided_set: Option<Vec<Replica>>,
     /// `BeaconConstruct` packets that arrived before ACS finalised;
@@ -215,6 +221,7 @@ impl CTRBCState {
 
             batch_extractor: None,
             super_inv_extractor: None,
+            gf2_super_inv_extractor: None,
             acs_decided_set: None,
             pre_acs_beacon_constructs: Vec::new(),
             pending_recon_shares: Vec::new(),
@@ -477,17 +484,91 @@ impl CTRBCState {
         }
 
         // Build the input column in the SAME order as the extractor's
-        // alpha points (sorted decided dealers).
+        // alpha points (sorted decided dealers). Two field paths
+        // (commit 6 of the GF(2^w) migration): the `super_inv_extractor`
+        // and `gf2_super_inv_extractor` `Option`s are mutually
+        // exclusive — populated by `finalize_acs_round` based on
+        // `Context::gf2_profile`. `coin_check` dispatches on which
+        // is `Some`.
         let mut decided_sorted = decided.clone();
         decided_sorted.sort_unstable();
-        let inputs: Vec<BigUint> = decided_sorted
-            .iter()
-            .map(|dealer| recon_map.get(dealer).unwrap().clone() % self.secret_domain.clone())
-            .collect();
 
-        let extractor = match self.super_inv_extractor.as_ref() {
-            Some(e) => e,
-            None => {
+        let outputs: Vec<Vec<u8>> = match (
+            self.super_inv_extractor.as_ref(),
+            self.gf2_super_inv_extractor.as_ref(),
+        ) {
+            (Some(extractor), None) => {
+                // BigUint path: inputs reduced mod p; outputs are
+                // BigUint converted to big-endian variable-length
+                // byte vecs.
+                let inputs: Vec<BigUint> = decided_sorted
+                    .iter()
+                    .map(|dealer| {
+                        recon_map.get(dealer).unwrap().clone() % self.secret_domain.clone()
+                    })
+                    .collect();
+                let extracted = extractor.extract(&inputs);
+                log::debug!(
+                    "[PPT][COIN-CHECK] round {} coin {} super-invertible extraction produced \
+                     {} beacon value(s) from {} decided dealers (BigUint)",
+                    round,
+                    coin_number,
+                    extracted.len(),
+                    decided_sorted.len()
+                );
+                extracted.iter().map(BigUint::to_bytes_be).collect()
+            }
+            (None, Some(extractor)) => {
+                // GF(2^w) path. Each stored BigUint is a typed
+                // envelope around 32 GF2 element bytes; reconstruct
+                // the element via `Context::pad_shares` (round-trip
+                // lossless for [u8;32]; see commit 5's
+                // `share_bytes_roundtrip_through_biguint_envelope`
+                // test). Outputs are returned as little-endian Gf2
+                // element bytes — same shape (`Vec<u8>`) as the
+                // BigUint path, semantically interpretable by
+                // anyone holding the matching `Gf2Profile`.
+                use crypto::gf2::Gf2Element;
+                let profile = extractor.profile;
+                let mut inputs: Vec<Gf2Element> = Vec::with_capacity(decided_sorted.len());
+                for dealer in decided_sorted.iter() {
+                    let big = recon_map.get(dealer).unwrap().clone();
+                    let bytes = crate::node::Context::pad_shares(big);
+                    match Gf2Element::from_bytes(profile, bytes) {
+                        Ok(elem) => inputs.push(elem),
+                        Err(_) => {
+                            log::error!(
+                                "[PPT][COIN-CHECK] round {} coin {} GF2 dealer {}'s recovered \
+                                 secret has dirty bits beyond w_q; aborting extraction \
+                                 (this should never happen post-Lagrange)",
+                                round, coin_number, dealer
+                            );
+                            return None;
+                        }
+                    }
+                }
+                let extracted = extractor.extract(&inputs);
+                log::debug!(
+                    "[PPT][COIN-CHECK] round {} coin {} super-invertible extraction produced \
+                     {} beacon value(s) from {} decided dealers (GF2 {})",
+                    round,
+                    coin_number,
+                    extracted.len(),
+                    decided_sorted.len(),
+                    profile
+                );
+                extracted.iter().map(|e| e.as_bytes().to_vec()).collect()
+            }
+            (Some(_), Some(_)) => {
+                log::error!(
+                    "[PPT][COIN-CHECK] round {} coin {} skipped: BOTH BigUint and GF2 \
+                     extractors set (programmer bug — finalize_acs_round must populate \
+                     exactly one based on the profile)",
+                    round, coin_number
+                );
+                return None;
+            }
+            (None, None) => {
                 log::error!(
                     "[PPT][COIN-CHECK] round {} coin {} skipped: super-invertible extractor not built",
                     round,
@@ -496,22 +577,6 @@ impl CTRBCState {
                 return None;
             }
         };
-
-        let extracted = extractor.extract(&inputs);
-
-        // Demoted to `debug` (Phase E): this fires once per coin
-        // (batch_size lines/round) and adds no operational value over
-        // the round-level [STAGE][BEACON-OUT] marker. Re-enable with
-        // `RUST_LOG=ppt_beacon=debug`.
-        log::debug!(
-            "[PPT][COIN-CHECK] round {} coin {} super-invertible extraction produced {} beacon value(s) from {} decided dealers",
-            round,
-            coin_number,
-            extracted.len(),
-            decided_sorted.len()
-        );
-
-        let outputs: Vec<Vec<u8>> = extracted.iter().map(BigUint::to_bytes_be).collect();
 
         // Mark and clean up this coin's transient recovery state.
         self.recon_secrets.insert(coin_number);
@@ -546,6 +611,7 @@ impl CTRBCState {
 
         self.batch_extractor = None;
         self.super_inv_extractor = None;
+        self.gf2_super_inv_extractor = None;
         self.acs_decided_set = None;
         self.pre_acs_beacon_constructs.clear();
         self.pending_recon_shares.clear();

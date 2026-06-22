@@ -401,6 +401,124 @@ pub fn lagrange_recover_at_zero(
     result
 }
 
+/// Super-invertible (hyper-invertible) randomness extractor for the
+/// GF(2^w_p) ⊂ GF(2^w_q) tower-field profile. **Sibling of
+/// `shamir::two_field::SuperInvExtractor` (BigUint)**, with byte-for-
+/// byte parallel API so the consumer site (`ctrbc::state::coin_check`)
+/// can dispatch on profile.
+///
+/// Construction
+/// ------------
+///
+/// Given `m` distinct input evaluation points `α_1..α_m` (the
+/// 1-based dealer ids in the ACS-decided set, after sorting) and
+/// `R` distinct output points `β_1..β_R` (chosen deterministically
+/// as `max(α)+1 .. max(α)+R` so all `m + R` points are distinct in
+/// the small field), the matrix `M[i][j] = L_j(β_i)` — with `L_j`
+/// the Lagrange basis polynomial pinned by the `α_k` points — is
+/// **hyper-invertible**: every square sub-matrix is invertible. All
+/// arithmetic happens in **`GF(2^w_p)` via the small-field image**;
+/// by subfield closure, products of small-field elements stay in
+/// the small field, so we can use the full `(w_p, w_q)` `Gf2Profile`
+/// arithmetic without ever leaving the image.
+///
+/// Char-2 specialisations
+/// ----------------------
+/// Same as `lagrange_recover_at_zero`:
+///   * `β − α_k`  ≡  `β + α_k`  (XOR)
+///   * `α_j − α_k` ≡ `α_j + α_k`  (XOR)
+/// — no underflow guards needed.
+///
+/// Security / extraction rate
+/// --------------------------
+/// At most `f` of the `m` decided dealers are Byzantine; their
+/// `x_j` were committed during AVSS (independently of the at-most-
+/// `f` honest, uniform, secret inputs). Hyper-invertibility
+/// guarantees that for any choice of which `f` columns are
+/// adversarial, the `R = m − f` outputs are a bijective image of the
+/// `m − f` honest inputs (the honest-column sub-matrix is square and
+/// invertible). The `R` outputs are therefore uniformly random and
+/// independent over `GF(2^w_p)` — uniform extraction tolerating `f`
+/// adversarial contributions.
+#[derive(Clone, Debug)]
+pub struct Gf2SuperInvExtractor {
+    pub profile: Gf2Profile,
+    pub num_inputs: usize,
+    pub num_outputs: usize,
+    /// `matrix[i][j] = L_j(β_i)` in `GF(2^w_p)` (small-field image).
+    matrix: Vec<Vec<Gf2Element>>,
+}
+
+impl Gf2SuperInvExtractor {
+    /// Build the extractor. `alpha_points` are 1-based integer node
+    /// ids (sorted decided dealers' ids + 1, matching the BigUint
+    /// path). `num_outputs` is the number of extracted beacon values
+    /// per coin column (`m − f`).
+    ///
+    /// Pre: `alpha_points` are pairwise distinct, each in
+    /// `1..=share_amount`. The dealer constructor's
+    /// `share_amount < 2^w_p` capacity guarantee carries over: all
+    /// `m + num_outputs` `small_field_point` values are distinct.
+    pub fn new(profile: Gf2Profile, alpha_points: Vec<usize>, num_outputs: usize) -> Self {
+        let m = alpha_points.len();
+        let alphas: Vec<Gf2Element> = alpha_points
+            .iter()
+            .map(|&a| small_field_point(profile, a))
+            .collect();
+
+        let max_alpha = alpha_points.iter().copied().max().unwrap_or(0);
+        let betas: Vec<Gf2Element> = (1..=num_outputs)
+            .map(|i| small_field_point(profile, max_alpha + i))
+            .collect();
+
+        let one = Gf2Element::one(profile);
+        let mut matrix = Vec::with_capacity(num_outputs);
+        for beta in betas.iter() {
+            let mut row = Vec::with_capacity(m);
+            for j in 0..m {
+                // L_j(β) = Π_{k ≠ j} (β + α_k) / (α_j + α_k)
+                let mut num = one;
+                let mut den = one;
+                for k in 0..m {
+                    if k != j {
+                        num = num.mul(&beta.add(&alphas[k]));
+                        den = den.mul(&alphas[j].add(&alphas[k]));
+                    }
+                }
+                let lj = num.mul(&den.inv());
+                row.push(lj);
+            }
+            matrix.push(row);
+        }
+        Self {
+            profile,
+            num_inputs: m,
+            num_outputs,
+            matrix,
+        }
+    }
+
+    /// Extract `num_outputs` values from one column of `m` secrets
+    /// (`inputs[j]` is the secret at evaluation point
+    /// `alpha_points[j]`, in the SAME order passed to `new`).
+    ///
+    /// Output element `i` equals `P(β_i)` where `P` is the unique
+    /// degree-`<m` polynomial interpolating `(α_j, inputs[j])`.
+    pub fn extract(&self, inputs: &[Gf2Element]) -> Vec<Gf2Element> {
+        let cols = self.num_inputs.min(inputs.len());
+        let zero = Gf2Element::zero(self.profile);
+        let mut out = Vec::with_capacity(self.num_outputs);
+        for i in 0..self.num_outputs {
+            let mut acc = zero;
+            for j in 0..cols {
+                acc = acc.add(&self.matrix[i][j].mul(&inputs[j]));
+            }
+            out.push(acc);
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -848,6 +966,160 @@ mod tests {
             "ACS coin XOR-sum across {} dealers does not match direct sum",
             num_dealers
         );
+    }
+
+    /// Gf2SuperInvExtractor produces `output_i = P(β_i)` where `P`
+    /// is the unique degree-`<m` polynomial interpolating
+    /// `(α_j, inputs[j])`. Verified by recomputing `P(β_i)` via an
+    /// independent Lagrange evaluation in the small-field-image.
+    /// Mirrors the BigUint `super_inv_matches_polynomial_evaluation`
+    /// test in `two_field.rs`.
+    #[test]
+    fn gf2_super_inv_matches_polynomial_evaluation() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x7777);
+        for &(w_p, w_q, m, f) in &[
+            (8usize, 64usize, 7usize, 2usize),
+            (16, 64, 7, 2),
+            (32, 128, 10, 3),
+            (8, 256, 10, 3),
+        ] {
+            let profile = Gf2Profile::new(w_p, w_q).unwrap();
+            let r = m - f;
+            let alpha: Vec<usize> = (1..=m).collect();
+
+            // Sample m small-field inputs.
+            let inputs: Vec<Gf2Element> = (0..m)
+                .map(|_| random_small_field(profile, &mut rng))
+                .collect();
+
+            let extractor = Gf2SuperInvExtractor::new(profile, alpha.clone(), r);
+            let outputs = extractor.extract(&inputs);
+            assert_eq!(outputs.len(), r);
+
+            // Independent reference: P(β_i) via direct Lagrange
+            // through (alpha_j, inputs[j]) using the same
+            // small_field_point encoding.
+            let max_alpha = *alpha.iter().max().unwrap();
+            let alphas: Vec<Gf2Element> = alpha
+                .iter()
+                .map(|&a| small_field_point(profile, a))
+                .collect();
+            for i in 0..r {
+                let beta = small_field_point(profile, max_alpha + 1 + i);
+                let mut expected = Gf2Element::zero(profile);
+                for j in 0..m {
+                    // L_j(β) via the same char-2 formula.
+                    let mut num = Gf2Element::one(profile);
+                    let mut den = Gf2Element::one(profile);
+                    for k in 0..m {
+                        if k != j {
+                            num = num.mul(&beta.add(&alphas[k]));
+                            den = den.mul(&alphas[j].add(&alphas[k]));
+                        }
+                    }
+                    let lj = num.mul(&den.inv());
+                    expected = expected.add(&lj.mul(&inputs[j]));
+                }
+                assert_eq!(
+                    outputs[i], expected,
+                    "output {} must equal P(β_{}) at ({}, {})",
+                    i, i, w_p, w_q
+                );
+            }
+        }
+    }
+
+    /// Hyper-invertibility: flipping any single input must change
+    /// EVERY output. This is what makes one honest uniform input
+    /// randomise the entire output vector, which a single summed
+    /// output cannot do for more than one output.
+    /// Mirrors `super_inv_every_output_depends_on_each_input`.
+    #[test]
+    fn gf2_super_inv_every_output_depends_on_each_input() {
+        let profile = Gf2Profile::new(16, 64).unwrap();
+        let m = 6usize;
+        let f = 1usize;
+        let r = m - f;
+        let alpha: Vec<usize> = (1..=m).collect();
+        let extractor = Gf2SuperInvExtractor::new(profile, alpha, r);
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xC0FE);
+        let base: Vec<Gf2Element> = (0..m)
+            .map(|_| random_small_field(profile, &mut rng))
+            .collect();
+        let base_out = extractor.extract(&base);
+
+        for flip in 0..m {
+            let mut alt = base.clone();
+            // Add a nonzero delta to input `flip`. In char 2, "add"
+            // is XOR; flipping a single bit makes the new value
+            // strictly different.
+            let mut delta_bytes = [0u8; 32];
+            delta_bytes[0] = 1u8;
+            let delta = Gf2Element::from_random_bytes(profile, delta_bytes);
+            alt[flip] = alt[flip].add(&delta);
+            assert_ne!(alt[flip], base[flip]);
+
+            let alt_out = extractor.extract(&alt);
+            for i in 0..r {
+                assert_ne!(
+                    base_out[i], alt_out[i],
+                    "output {} did not change when input {} changed",
+                    i, flip
+                );
+            }
+        }
+    }
+
+    /// Symmetric to the BigUint integration: dealer→shares→Lagrange
+    /// recovers each `f_d(0)`, then SuperInvExtractor produces `R`
+    /// uniform outputs. Smoke-test that the chain runs end-to-end on
+    /// a representative GF2 profile with no panic.
+    #[test]
+    fn gf2_extract_end_to_end_after_lagrange() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xBEEF42);
+        let profile = Gf2Profile::new(32, 128).unwrap();
+        let n = 9usize;
+        let f = 2usize;
+        let t = f + 1;
+        let dealer = Gf2TwoFieldDealer::new(profile, t, n).unwrap();
+
+        // 7 decided dealers each share a small-field secret; we
+        // recover each one then run SuperInvExtractor on the 7-vector.
+        let m = 7usize;
+        let r = m - f;
+        let mut per_dealer_secret = Vec::with_capacity(m);
+        let mut per_dealer_recovered = Vec::with_capacity(m);
+        for _ in 0..m {
+            let small_len = profile.small_byte_len();
+            let mut secret_bytes = vec![0u8; small_len];
+            rng.fill(&mut secret_bytes[..]);
+            let secret = Gf2Element::lift_small(profile, &secret_bytes);
+            per_dealer_secret.push(secret);
+
+            let theta = random_large_field(profile, &mut rng);
+            let shares = dealer.share_secret(secret, &theta);
+            // Lagrange-recover from t shares.
+            let points: Vec<(usize, Gf2Element)> =
+                shares.secret_shares.iter().take(t).copied().collect();
+            let recovered = lagrange_recover_at_zero(profile, &points);
+            assert_eq!(recovered, secret);
+            per_dealer_recovered.push(recovered);
+        }
+
+        let alpha: Vec<usize> = (1..=m).collect();
+        let extractor = Gf2SuperInvExtractor::new(profile, alpha, r);
+        let outputs = extractor.extract(&per_dealer_recovered);
+        assert_eq!(outputs.len(), r);
+        // Outputs are in the small-field image (since inputs +
+        // matrix entries both are).
+        for (i, out) in outputs.iter().enumerate() {
+            assert!(
+                out.is_in_small_field(),
+                "extracted output {} escaped small-field image",
+                i
+            );
+        }
     }
 
     /// Wire-format roundtrip via the existing `Gf2Element` byte API:
