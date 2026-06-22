@@ -685,6 +685,171 @@ mod tests {
         assert_eq!(max_share_amount_for_w_p(128), usize::MAX);
     }
 
+    /// Commit 5 reconstruct-path invariant: shares stored as
+    /// `BigUint::from_bytes_be(Gf2Element::as_bytes())` survive the
+    /// `Context::pad_shares` → `Gf2Element::from_bytes` round-trip
+    /// that the production GF2 Lagrange branch performs inside the
+    /// `spawn_blocking` closure.
+    ///
+    /// This pins down the byte-preservation contract that lets us
+    /// keep the `reconstructed_secrets: HashMap<.., BigUint>`
+    /// storage type during the intermediate state between commits 5
+    /// and 6 (BigUint envelope around GF2 element bytes; no real
+    /// BigUint arithmetic happens on these values until commit 6
+    /// completes the SuperInvExtractor migration).
+    #[test]
+    fn share_bytes_roundtrip_through_biguint_envelope() {
+        use num_bigint::BigUint;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x2026);
+        for &(w_p, w_q) in &[
+            (8usize, 8usize),
+            (8, 64),
+            (16, 64),
+            (32, 128),
+            (32, 256),
+            (64, 256),
+            (128, 256),
+        ] {
+            let profile = Gf2Profile::new(w_p, w_q).unwrap();
+            for _ in 0..16 {
+                let mut bytes = [0u8; 32];
+                rng.fill(&mut bytes[..]);
+                let original = Gf2Element::from_random_bytes(profile, bytes);
+                // Production flow: as_bytes() → BigUint::from_bytes_be
+                // (in `add_secret_share`) → pad_shares (in the
+                // spawn_blocking closure) → from_bytes.
+                let big = BigUint::from_bytes_be(original.as_bytes());
+                let mut padded = [0u8; 32];
+                let be = big.to_bytes_be();
+                assert!(be.len() <= 32, "BigUint can't exceed 32 bytes");
+                let pad_len = 32 - be.len();
+                padded[pad_len..].copy_from_slice(&be);
+                let recovered = Gf2Element::from_bytes(profile, padded).expect("canonical");
+                assert_eq!(
+                    recovered, original,
+                    "byte roundtrip via BigUint envelope failed at ({}, {})",
+                    w_p, w_q
+                );
+            }
+        }
+    }
+
+    /// End-to-end Lagrange test mirroring the production
+    /// `secret_reconstruct.rs` GF2 path: build a `Gf2TwoFieldDealer`,
+    /// generate shares, store each share's bytes in a `BigUint`
+    /// envelope (= what `CTRBCState::add_secret_share` would do for an
+    /// inbound GF2 packet), then run the EXACT same conversion-chain
+    /// the production `spawn_blocking` closure performs to recover
+    /// `f(0)` and check it matches the original secret bytes.
+    #[test]
+    fn biguint_enveloped_shares_recover_original_secret() {
+        use num_bigint::BigUint;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xCAFEBABE);
+        for &(w_p, w_q, t, n) in &[
+            (8usize, 64usize, 2usize, 4usize),
+            (16, 64, 5, 16),
+            (32, 128, 5, 16),
+            (32, 256, 5, 16),
+            (64, 256, 5, 16),
+            (8, 256, 11, 32),
+        ] {
+            let profile = Gf2Profile::new(w_p, w_q).unwrap();
+            let dealer = Gf2TwoFieldDealer::new(profile, t, n).unwrap();
+            let secret_bytes = {
+                let small_len = profile.small_byte_len();
+                let mut buf = vec![0u8; small_len];
+                rng.fill(&mut buf[..]);
+                buf
+            };
+            let secret = Gf2Element::lift_small(profile, &secret_bytes);
+            let theta = random_large_field(profile, &mut rng);
+            let shares = dealer.share_secret(secret, &theta);
+
+            // Simulate the production flow: each Gf2 share gets stored
+            // as `BigUint::from_bytes_be(elem.as_bytes())` (the same
+            // call that `add_secret_share` makes after parsing the
+            // inbound `Val`).
+            let stored_biguints: Vec<BigUint> = shares
+                .secret_shares
+                .iter()
+                .take(t)
+                .map(|(_, elem)| BigUint::from_bytes_be(elem.as_bytes()))
+                .collect();
+            let eval_points: Vec<usize> =
+                shares.secret_shares.iter().take(t).map(|(i, _)| *i).collect();
+
+            // Production recovery flow inside the spawn_blocking
+            // closure (see secret_reconstruct.rs).
+            let mut points: Vec<(usize, Gf2Element)> = Vec::with_capacity(t);
+            for (idx, big) in stored_biguints.iter().enumerate() {
+                let be = big.to_bytes_be();
+                let mut padded = [0u8; 32];
+                let pad_len = 32 - be.len();
+                padded[pad_len..].copy_from_slice(&be);
+                let elem = Gf2Element::from_bytes(profile, padded).unwrap();
+                points.push((eval_points[idx], elem));
+            }
+            let recovered = lagrange_recover_at_zero(profile, &points);
+            assert_eq!(
+                recovered, secret,
+                "BigUint-enveloped reconstruction failed at ({},{},t={},n={})",
+                w_p, w_q, t, n
+            );
+        }
+    }
+
+    /// ACS coin-secret combine path (`acs/coin.rs::ingest_coin_reveal_shares`):
+    /// per-dealer `c_d = lagrange(...)`, then `acc = acc + c_d` over
+    /// GF(2^w_q) (XOR). The final XOR-sum must equal what we'd get by
+    /// summing the dealers' secret constants (`f_d(0)`) directly — i.e.
+    /// the homomorphism `lagrange(shares_of(f_d(0))) = f_d(0)`
+    /// composed with char-2 sum commutes with the per-dealer
+    /// reconstruction order.
+    #[test]
+    fn coin_secret_xor_sum_matches_direct_sum() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x4242);
+        let profile = Gf2Profile::new(32, 128).unwrap();
+        let t = 3usize;
+        let n = 9usize;
+        let dealer = Gf2TwoFieldDealer::new(profile, t, n).unwrap();
+
+        // 5 dealers each contribute a coin-secret. The "common coin"
+        // C = XOR of all 5 secrets.
+        let num_dealers = 5;
+        let mut secrets = Vec::with_capacity(num_dealers);
+        let mut all_shares = Vec::with_capacity(num_dealers);
+        for _ in 0..num_dealers {
+            let small_len = profile.small_byte_len();
+            let mut secret_bytes = vec![0u8; small_len];
+            rng.fill(&mut secret_bytes[..]);
+            let secret = Gf2Element::lift_small(profile, &secret_bytes);
+            secrets.push(secret);
+            let theta = random_large_field(profile, &mut rng);
+            all_shares.push(dealer.share_secret(secret, &theta));
+        }
+
+        // Expected: XOR of all per-dealer secrets.
+        let mut expected = Gf2Element::zero(profile);
+        for s in &secrets {
+            expected = expected.add(s);
+        }
+
+        // Production path: for each dealer reconstruct c_d from t
+        // shares; accumulate via XOR.
+        let mut acc = Gf2Element::zero(profile);
+        for shares in &all_shares {
+            let points: Vec<(usize, Gf2Element)> =
+                shares.secret_shares.iter().take(t).copied().collect();
+            let c_d = lagrange_recover_at_zero(profile, &points);
+            acc = acc.add(&c_d);
+        }
+        assert_eq!(
+            acc, expected,
+            "ACS coin XOR-sum across {} dealers does not match direct sum",
+            num_dealers
+        );
+    }
+
     /// Wire-format roundtrip via the existing `Gf2Element` byte API:
     /// every share survives a `as_bytes` → `from_bytes` cycle, which
     /// is what later commits' wire path will do.

@@ -1229,24 +1229,86 @@ impl Context {
 
         // Heavy Lagrange interpolation runs on tokio's blocking pool.
         // Each (coin, dealer) is reconstructed from its own f+1
-        // lowest-indexed validated providers; extractors are cached
-        // by the provider-set so the common case (the same f+1
-        // providers respond for every dealer) builds the Lagrange
-        // coefficients only once.
+        // lowest-indexed validated providers; in BigUint mode the
+        // per-provider-set extractors are cached so the common case
+        // (the same f+1 providers respond for every dealer) builds
+        // the Lagrange coefficients only once.
+        //
+        // GF(2^w) mode (commit 5 of the migration) takes a parallel
+        // branch: per-task it reinterprets the stored `BigUint`
+        // bytes as `Gf2Element`s (the bytes round-trip exactly through
+        // `Context::pad_shares` because `add_secret_share` ingested
+        // them as `BigUint::from_bytes_be(&Val)` with `Val` always
+        // 32 bytes) and runs the char-2-specialised
+        // `lagrange_recover_at_zero` from `shamir::gf2_two_field`. The
+        // recovered `Gf2Element`'s native LE bytes are then folded back
+        // into a `BigUint::from_bytes_be(...)` slot so the downstream
+        // storage type (`reconstructed_secrets: HashMap<.., BigUint>`)
+        // is unchanged. The `BigUint` integer value in the slot is
+        // arithmetically meaningless under GF(2^w) — it's a typed
+        // envelope for the 32 GF2 element bytes — and the subsequent
+        // `SuperInvExtractor` step in `coin_check` will be migrated to
+        // its own GF(2^w) sibling in commit 6.
         let secret_domain = self.secret_domain.clone();
+        let gf2_profile = self.gf2_profile;
         let recovered: Vec<(usize, Replica, BigUint)> = tokio::task::spawn_blocking(move || {
-            let mut cache: HashMap<Vec<usize>, BatchExtractor> = HashMap::new();
-            let mut out = Vec::with_capacity(tasks.len());
-            for task in tasks.into_iter() {
-                let extractor = cache
-                    .entry(task.eval_points.clone())
-                    .or_insert_with(|| {
-                        BatchExtractor::new(task.eval_points.clone(), secret_domain.clone())
-                    });
-                let secret = extractor.recover_one(&task.shares);
-                out.push((task.coin, task.dealer, secret));
+            match gf2_profile {
+                None => {
+                    let mut cache: HashMap<Vec<usize>, BatchExtractor> = HashMap::new();
+                    let mut out = Vec::with_capacity(tasks.len());
+                    for task in tasks.into_iter() {
+                        let extractor = cache.entry(task.eval_points.clone()).or_insert_with(|| {
+                            BatchExtractor::new(task.eval_points.clone(), secret_domain.clone())
+                        });
+                        let secret = extractor.recover_one(&task.shares);
+                        out.push((task.coin, task.dealer, secret));
+                    }
+                    out
+                }
+                Some(profile) => {
+                    use crate::node::shamir::gf2_two_field::lagrange_recover_at_zero;
+                    use crypto::gf2::Gf2Element;
+
+                    let mut out = Vec::with_capacity(tasks.len());
+                    for task in tasks.into_iter() {
+                        // `task.eval_points` contains 1-based node ids
+                        // (provider + 1); the parallel `task.shares` are
+                        // BigUint-wrapped GF2 element bytes.
+                        let mut points: Vec<(usize, Gf2Element)> =
+                            Vec::with_capacity(task.shares.len());
+                        let mut ok = true;
+                        for (idx, share_big) in task.shares.iter().enumerate() {
+                            let bytes = Context::pad_shares(share_big.clone());
+                            match Gf2Element::from_bytes(profile, bytes) {
+                                Ok(elem) => points.push((task.eval_points[idx], elem)),
+                                Err(_) => {
+                                    log::error!(
+                                        "[PPT][GF2-RECOVER] coin {} dealer {} provider \
+                                         (1-based) {} share has dirty bits beyond w_q; \
+                                         skipping (this should never happen on a packet \
+                                         that already passed AVSS validation)",
+                                        task.coin, task.dealer, task.eval_points[idx]
+                                    );
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if !ok {
+                            continue;
+                        }
+                        let secret_elem = lagrange_recover_at_zero(profile, &points);
+                        // Wrap the GF2 element bytes inside a BigUint so
+                        // the existing reconstructed_secrets storage
+                        // shape is preserved. Commit 6 will replace this
+                        // intermediate type with the native GF2
+                        // SuperInvExtractor path.
+                        let secret = BigUint::from_bytes_be(secret_elem.as_bytes());
+                        out.push((task.coin, task.dealer, secret));
+                    }
+                    out
+                }
             }
-            out
         })
         .await
         .unwrap_or_else(|e| {

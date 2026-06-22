@@ -386,28 +386,92 @@ impl Context {
         }
 
         // Reconstruct each decided dealer's coin secret from f+1
-        // validated providers; sum mod p. Returns early if any dealer
-        // is short of f+1 providers.
+        // validated providers; combine across dealers to obtain the
+        // common coin C = Σ_d c_{d,aba_round}. Returns early if any
+        // dealer is short of f+1 providers.
+        //
+        // Two field paths (commit 5 of the GF(2^w) migration):
+        //   * BigUint (legacy default, gf2_profile == None) — per
+        //     dealer: BatchExtractor + recover_one; accumulate
+        //     `(sum + c_d) % secret_domain`.
+        //   * GF(2^w) — per dealer: char-2 Lagrange via
+        //     `gf2_two_field::lagrange_recover_at_zero`; accumulate
+        //     by XOR (char-2 addition). The final XOR sum is wrapped
+        //     into a BigUint via `from_bytes_be` so the storage type
+        //     (`coin_reconstructed: HashMap<(.., ..), BigUint>`)
+        //     stays unchanged. The integer value is arithmetically
+        //     meaningless under GF(2^w); only its bytes (= the GF2
+        //     element's canonical encoding) are. `coin_bit_from_secret`
+        //     downstream consumes the bytes (`to_bytes_be` → hash →
+        //     LSB) and is therefore field-agnostic at the byte
+        //     level, so honest nodes derive identical coin bits.
+        let gf2_profile = self.gf2_profile;
         let shares_map = match self.coin_shares.get(&(acs_round, aba_round)) {
             Some(m) => m,
             None => return false,
         };
-        let mut sum = BigUint::from(0u32);
-        for d in decided.iter() {
-            let pmap = match shares_map.get(d) {
-                Some(p) if p.len() >= threshold => p,
-                _ => return false,
-            };
-            let mut providers: Vec<usize> = pmap.keys().copied().collect();
-            providers.sort_unstable();
-            providers.truncate(threshold);
-            let eval_points: Vec<usize> = providers.iter().map(|p| p + 1).collect();
-            let shares: Vec<BigUint> =
-                providers.iter().map(|p| pmap.get(p).unwrap().clone()).collect();
-            let extractor = BatchExtractor::new(eval_points, secret_domain.clone());
-            let c_d = extractor.recover_one(&shares);
-            sum = (sum + c_d) % &secret_domain;
-        }
+        let sum: BigUint = match gf2_profile {
+            None => {
+                let mut sum = BigUint::from(0u32);
+                for d in decided.iter() {
+                    let pmap = match shares_map.get(d) {
+                        Some(p) if p.len() >= threshold => p,
+                        _ => return false,
+                    };
+                    let mut providers: Vec<usize> = pmap.keys().copied().collect();
+                    providers.sort_unstable();
+                    providers.truncate(threshold);
+                    let eval_points: Vec<usize> = providers.iter().map(|p| p + 1).collect();
+                    let shares: Vec<BigUint> =
+                        providers.iter().map(|p| pmap.get(p).unwrap().clone()).collect();
+                    let extractor = BatchExtractor::new(eval_points, secret_domain.clone());
+                    let c_d = extractor.recover_one(&shares);
+                    sum = (sum + c_d) % &secret_domain;
+                }
+                sum
+            }
+            Some(profile) => {
+                use crate::node::shamir::gf2_two_field::lagrange_recover_at_zero;
+                use crypto::gf2::Gf2Element;
+                let mut acc = Gf2Element::zero(profile);
+                for d in decided.iter() {
+                    let pmap = match shares_map.get(d) {
+                        Some(p) if p.len() >= threshold => p,
+                        _ => return false,
+                    };
+                    let mut providers: Vec<usize> = pmap.keys().copied().collect();
+                    providers.sort_unstable();
+                    providers.truncate(threshold);
+                    let mut points: Vec<(usize, Gf2Element)> = Vec::with_capacity(threshold);
+                    let mut ok = true;
+                    for p in providers.iter() {
+                        let share_big = pmap.get(p).unwrap().clone();
+                        let bytes = Context::pad_shares(share_big);
+                        match Gf2Element::from_bytes(profile, bytes) {
+                            Ok(elem) => points.push((p + 1, elem)),
+                            Err(_) => {
+                                log::error!(
+                                    "[PPT][GF2-COIN] coin-share from dealer {} provider {} \
+                                     has dirty bits beyond w_q in acs_round {} aba_round {}; \
+                                     skipping reveal (this should never happen for a packet \
+                                     that already passed `validate_batch` + commit-leaf binding)",
+                                    d, p, acs_round, aba_round
+                                );
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !ok {
+                        return false;
+                    }
+                    let c_d = lagrange_recover_at_zero(profile, &points);
+                    // Char-2 sum: XOR each coordinate.
+                    acc = acc.add(&c_d);
+                }
+                BigUint::from_bytes_be(acc.as_bytes())
+            }
+        };
 
         self.coin_reconstructed.insert((acs_round, aba_round), sum);
         log::debug!(
