@@ -128,16 +128,21 @@ impl Gf2Element {
         self.profile
     }
 
-    /// Sample a uniformly random element of `GF(2^w_q)`.
+    /// Construct an element from CSPRNG-filled bytes, **silently
+    /// masking** any bits beyond position `w_q − 1` to zero. The
+    /// caller fills `[u8; 32]` however they like (any RNG, any
+    /// version of the `rand` crate, raw `getrandom`, etc.); this
+    /// routine never touches `rand` itself, sidestepping
+    /// `rand 0.6` / `rand 0.8` version mismatches between
+    /// `crypto` and the various consumer crates.
     ///
-    /// Cryptographic-strength randomness is the caller's
-    /// responsibility — pass an appropriately seeded `Rng` such as
-    /// `OsRng`. The function masks the result to the canonical low
-    /// `w_q` bits.
-    pub fn random<R: Rng>(profile: Gf2Profile, rng: &mut R) -> Self {
-        let mut bytes = [0u8; 32];
-        rng.fill(&mut bytes[..]);
-        // Mask off bits beyond w_q.
+    /// Use this rather than `from_bytes` whenever the input is
+    /// known to be CSPRNG output: `from_bytes` rejects any non-
+    /// canonical buffer, but a uniformly random `[u8; 32]` will
+    /// have set bits beyond `w_q` with probability `1 − 2^{−(256
+    /// − w_q)}`. Truncation here is the only correct
+    /// canonicalisation step.
+    pub fn from_random_bytes(profile: Gf2Profile, mut bytes: [u8; 32]) -> Self {
         let used = profile.large_byte_len();
         for b in &mut bytes[used..] {
             *b = 0;
@@ -148,6 +153,21 @@ impl Gf2Element {
             bytes[used - 1] &= mask;
         }
         Self { bytes, profile }
+    }
+
+    /// Convenience wrapper around `from_random_bytes` that pulls
+    /// bytes from a `rand` (v0.8) `Rng`. Consumers stuck on older
+    /// `rand` versions should call `from_random_bytes` directly
+    /// with their own buffer.
+    ///
+    /// Cryptographic-strength randomness is the caller's
+    /// responsibility — pass an appropriately seeded `Rng` such as
+    /// `OsRng`. The function canonicalises the result to the low
+    /// `w_q` bits.
+    pub fn random<R: Rng>(profile: Gf2Profile, rng: &mut R) -> Self {
+        let mut bytes = [0u8; 32];
+        rng.fill(&mut bytes[..]);
+        Self::from_random_bytes(profile, bytes)
     }
 
     /// Lift a small-field value `s ∈ GF(2^w_p)` (low `w_p` bits of
