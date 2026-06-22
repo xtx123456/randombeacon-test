@@ -670,6 +670,27 @@ impl Context {
         root_vec: &[Hash],
         large_field: &BigUint,
     ) -> BigUint {
+        Self::theta_from_bytes(
+            Self::theta_seed_bytes(round, dealer, root_vec).as_slice(),
+            large_field,
+        )
+    }
+
+    /// Assemble the deterministic Fiat-Shamir transcript bytes
+    /// `(domain‖round‖dealer‖root_vec.len()‖root_vec)` from which
+    /// θ is derived. Identical hash input for both the BigUint
+    /// and GF(2^w) paths, so a dealer / verifier pair on
+    /// **matching profiles** computes byte-equal challenges
+    /// regardless of which field they interpret the result in.
+    ///
+    /// Pulled out as a separate helper so
+    /// `theta_from_commitment_gf2` can reuse it without re-
+    /// expressing the binding rule.
+    pub(crate) fn theta_seed_bytes(
+        round: Round,
+        dealer: Replica,
+        root_vec: &[Hash],
+    ) -> Vec<u8> {
         let mut buf: Vec<u8> = b"PPT_BEACON_FS_THETA_v1::".to_vec();
         buf.extend_from_slice(&round.to_be_bytes());
         buf.extend_from_slice(&(dealer as u64).to_be_bytes());
@@ -677,7 +698,41 @@ impl Context {
         for r in root_vec {
             buf.extend_from_slice(r);
         }
-        Self::theta_from_bytes(buf.as_slice(), large_field)
+        buf
+    }
+
+    /// GF(2^w) analogue of `theta_from_commitment`. Derives the
+    /// same wide-reduction byte stream (`H(seed) || H("v1::" ||
+    /// H(seed))` = 64 bytes), takes the FIRST 32 bytes, and
+    /// canonicalises them into a `Gf2Element` of `profile` via
+    /// `from_random_bytes` (which masks bits beyond `w_q`).
+    ///
+    /// Soundness: `Gf2Element::from_random_bytes` is uniform on
+    /// `GF(2^w_q)` when fed uniform bytes (it just masks the high
+    /// `256 - w_q` bits to zero). The Fiat-Shamir cheating
+    /// probability is therefore `2^{-w_q}` — same scale as the
+    /// BigUint path's `1/q ≈ 2^{-256}` when `w_q == 256`.
+    ///
+    /// Honest dealers and honest verifiers both call this helper
+    /// with the same `(round, dealer, root_vec, profile)`, so the
+    /// derived θ is identical byte-for-byte on both ends.
+    pub(crate) fn theta_from_commitment_gf2(
+        round: Round,
+        dealer: Replica,
+        root_vec: &[Hash],
+        profile: crypto::gf2::Gf2Profile,
+    ) -> crypto::gf2::Gf2Element {
+        let seed = Self::theta_seed_bytes(round, dealer, root_vec);
+        let h1 = crypto::hash::do_hash(seed.as_slice());
+        // Take the first 32 bytes of the wide-hash output as the
+        // raw θ bit-pattern. We don't need the second hash for the
+        // GF(2^w) path — the masking inside `from_random_bytes`
+        // already projects to canonical form, and the field's
+        // size is `2^w_q ≤ 2^256` so 32 bytes of entropy is
+        // statistically sufficient.
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&h1[..32]);
+        crypto::gf2::Gf2Element::from_random_bytes(profile, bytes)
     }
 
     pub(crate) fn theta_from_bytes(seed: &[u8], large_field: &BigUint) -> BigUint {

@@ -1,15 +1,233 @@
 use std::time::SystemTime;
 
 use async_recursion::async_recursion;
+use crypto::gf2::{Gf2Element, Gf2Profile};
 use crypto::{aes_hash::MerkleTree, hash::Hash};
 use num_bigint::{BigUint, RandBigInt};
+use rand::Rng;
 use types::{
     beacon::{BatchWSSMsg, BeaconMsg, CoinMsg, Round, Val, WrapperMsg},
     Replica,
 };
 
+use crate::node::shamir::gf2_two_field::Gf2TwoFieldDealer;
 use crate::node::shamir::two_field::TwoFieldDealer;
 use crate::node::{CTRBCState, Context, ShamirSecretSharing};
+
+// ============================================================================
+// AVSS dealer field-adapter (commit 4 of the GF(2^w) migration)
+//
+// `ppt_try_start_round_exact` originally hardcoded a `TwoFieldDealer`
+// (BigUint). This adapter lets the same round-bootstrap routine run
+// against either the legacy BigUint dealer or the new
+// `Gf2TwoFieldDealer` (parametrised by `Context::gf2_profile`),
+// without duplicating the ~250-line wire-assembly + broadcast block.
+//
+// The contract is "bytes in, bytes out": all per-recipient share
+// material is exposed as `Val = [u8; 32]`, and the Fiat-Shamir θ is
+// derived as 32 bytes. The wire format (Val slots) is therefore
+// unchanged; only the **interpretation** of those bytes differs by
+// field. A receiver on the *matching* profile decodes them with
+// `Gf2Element::from_bytes(profile, ..)`; a receiver on the wrong
+// profile would parse garbage. Cluster-wide configuration agreement
+// is the user's responsibility (the same assumption as
+// `--transport`).
+// ============================================================================
+
+/// Field-agnostic AVSS dealer adapter for `ppt_try_start_round_exact`.
+enum DealerAdapter {
+    BigUint {
+        dealer: TwoFieldDealer,
+        secret_domain: BigUint,
+        nonce_domain: BigUint,
+    },
+    Gf2 {
+        dealer: Gf2TwoFieldDealer,
+        profile: Gf2Profile,
+        nonce_domain: BigUint,
+    },
+}
+
+/// Per-coin polynomial state retained between `sample_coin` and
+/// `compute_h_bytes`. The dealer commits to f and g (via the Merkle
+/// trees built over per-recipient share material) *before* θ is
+/// derived (Fiat-Shamir); this enum keeps the field-native f / g
+/// polynomials around for the post-θ `h(x) = g(x) + θ·f(x)` step.
+enum CoinPolyBlob {
+    BigUint {
+        f_poly: Vec<BigUint>,
+        g_poly: Vec<BigUint>,
+    },
+    Gf2 {
+        profile: Gf2Profile,
+        f_poly: Vec<Gf2Element>,
+        g_poly: Vec<Gf2Element>,
+    },
+}
+
+impl DealerAdapter {
+    /// Build the appropriate adapter for the current `Context`
+    /// configuration. Falls back to the BigUint dealer when no
+    /// GF(2^w) profile is configured (the historical default).
+    fn build(ctx: &Context, threshold: usize, share_amount: usize) -> Self {
+        match ctx.gf2_profile {
+            Some(profile) => DealerAdapter::Gf2 {
+                dealer: Gf2TwoFieldDealer::new(profile, threshold, share_amount).expect(
+                    "Gf2Profile + share_amount validated at CLI parse time / Context construction",
+                ),
+                profile,
+                nonce_domain: ctx.nonce_domain.clone(),
+            },
+            None => DealerAdapter::BigUint {
+                dealer: TwoFieldDealer::new(
+                    ctx.secret_domain.clone(),
+                    ctx.nonce_domain.clone(),
+                    threshold,
+                    share_amount,
+                ),
+                secret_domain: ctx.secret_domain.clone(),
+                nonce_domain: ctx.nonce_domain.clone(),
+            },
+        }
+    }
+
+    /// Large-field domain. Used by the per-coin nonce sampler
+    /// (BigUint commitment salt, unchanged in both modes).
+    fn nonce_domain(&self) -> &BigUint {
+        match self {
+            Self::BigUint { nonce_domain, .. } | Self::Gf2 { nonce_domain, .. } => nonce_domain,
+        }
+    }
+
+    /// Sample one coin's f-polynomial + g-polynomial and per-
+    /// recipient shares. Returns the per-recipient share Vals
+    /// (recipient i corresponds to node id i+1) plus a polynomial
+    /// blob retained for the post-θ degree-test computation.
+    fn sample_coin(&self) -> (Vec<Val>, Vec<Val>, Vec<Val>, CoinPolyBlob) {
+        match self {
+            Self::BigUint {
+                dealer,
+                secret_domain,
+                ..
+            } => {
+                let low = BigUint::from(0u32);
+                let secret = rand::thread_rng().gen_biguint_range(&low, secret_domain);
+                let sampled = dealer.sample_shares(secret);
+                let secrets = sampled
+                    .secret_shares
+                    .iter()
+                    .map(|(_, v)| Context::pad_shares(v.clone()))
+                    .collect();
+                let f_larges = sampled
+                    .f_large_shares
+                    .iter()
+                    .map(|(_, v)| Context::pad_shares(v.clone()))
+                    .collect();
+                let masks = sampled
+                    .mask_shares
+                    .iter()
+                    .map(|(_, v)| Context::pad_shares(v.clone()))
+                    .collect();
+                (
+                    secrets,
+                    f_larges,
+                    masks,
+                    CoinPolyBlob::BigUint {
+                        f_poly: sampled.f_poly,
+                        g_poly: sampled.g_poly,
+                    },
+                )
+            }
+            Self::Gf2 { dealer, profile, .. } => {
+                // Uniform small-field secret in GF(2^w_p): sample
+                // `small_byte_len` random bytes and lift into the
+                // tower envelope. `lift_small` masks any bits beyond
+                // `w_p` to zero.
+                let small_len = profile.small_byte_len();
+                let mut small_bytes = vec![0u8; small_len];
+                rand::thread_rng().fill(&mut small_bytes[..]);
+                let secret = Gf2Element::lift_small(*profile, &small_bytes);
+                let sampled = dealer.sample_shares(secret);
+                let secrets = sampled
+                    .secret_shares
+                    .iter()
+                    .map(|(_, v)| *v.as_bytes())
+                    .collect();
+                let f_larges = sampled
+                    .f_large_shares
+                    .iter()
+                    .map(|(_, v)| *v.as_bytes())
+                    .collect();
+                let masks = sampled
+                    .mask_shares
+                    .iter()
+                    .map(|(_, v)| *v.as_bytes())
+                    .collect();
+                (
+                    secrets,
+                    f_larges,
+                    masks,
+                    CoinPolyBlob::Gf2 {
+                        profile: *profile,
+                        f_poly: sampled.f_poly,
+                        g_poly: sampled.g_poly,
+                    },
+                )
+            }
+        }
+    }
+
+    /// Derive the Fiat-Shamir degree-test challenge θ as 32 bytes.
+    /// Both modes share the same `theta_seed_bytes` transcript so
+    /// honest verifiers on the matching profile recompute the
+    /// identical value.
+    fn derive_theta_bytes(&self, round: Round, dealer_id: Replica, roots: &[Hash]) -> [u8; 32] {
+        match self {
+            Self::BigUint { nonce_domain, .. } => {
+                let theta = Context::theta_from_commitment(round, dealer_id, roots, nonce_domain);
+                Context::pad_shares(theta)
+            }
+            Self::Gf2 { profile, .. } => {
+                let theta = Context::theta_from_commitment_gf2(round, dealer_id, roots, *profile);
+                *theta.as_bytes()
+            }
+        }
+    }
+}
+
+impl CoinPolyBlob {
+    /// Compute the degree-test polynomial `h(x) = g(x) ± θ · f(x)`
+    /// for this coin and return its coefficients as on-wire Vals.
+    /// (The sign drops in char 2: `+` and `−` are XOR.)
+    fn compute_h_bytes(&self, theta_bytes: &[u8; 32], dealer: &DealerAdapter) -> Vec<Val> {
+        match (self, dealer) {
+            (
+                Self::BigUint { f_poly, g_poly },
+                DealerAdapter::BigUint { dealer, .. },
+            ) => {
+                let theta = BigUint::from_bytes_be(theta_bytes);
+                let h = dealer.compute_degree_test_poly_pub(f_poly, g_poly, &theta);
+                h.into_iter().map(Context::pad_shares).collect()
+            }
+            (
+                Self::Gf2 {
+                    profile,
+                    f_poly,
+                    g_poly,
+                },
+                DealerAdapter::Gf2 { dealer, .. },
+            ) => {
+                let theta = Gf2Element::from_bytes(*profile, *theta_bytes)
+                    .expect("theta_bytes always canonical via from_random_bytes");
+                let h = dealer.compute_degree_test_poly(f_poly, g_poly, &theta);
+                h.iter().map(|c| *c.as_bytes()).collect()
+            }
+            _ => unreachable!(
+                "DealerAdapter and CoinPolyBlob variants must match (programmer bug)"
+            ),
+        }
+    }
+}
 
 /**
  * Phase B:
@@ -159,15 +377,16 @@ impl Context {
         // coins but live at coin indices [batch_size, total_coins).
         let total_coins = batch_size + crate::node::context::PPT_COIN_RESERVE;
         let low_r = BigUint::from(0u32);
-        let prime = self.secret_domain.clone();
-        let nonce_prime = self.nonce_domain.clone();
 
-        let two_field_dealer = TwoFieldDealer::new(
-            prime.clone(),
-            nonce_prime.clone(),
-            faults + 1,      // threshold t = f+1
-            3 * faults + 1,  // share_amount n = 3f+1
-        );
+        // Field-agnostic AVSS dealer adapter (see DealerAdapter at the
+        // top of this file). Dispatches to either the BigUint
+        // `TwoFieldDealer` (default, ctx.gf2_profile == None) or the
+        // GF(2^w) `Gf2TwoFieldDealer` based on the runtime profile
+        // selector. All per-recipient share material below flows as
+        // 32-byte `Val` slots regardless of the underlying field —
+        // wire format is unchanged.
+        let dealer = DealerAdapter::build(self, faults + 1, 3 * faults + 1);
+        let nonce_prime = dealer.nonce_domain().clone();
 
         let n = self.num_nodes;
 
@@ -181,9 +400,10 @@ impl Context {
         // (3) Derive θ = H(round‖dealer‖root_vec) from the commitment
         //     (Fiat-Shamir) — the dealer cannot pick g to cancel a
         //     high-degree f after seeing θ.
-        // (4) Compute h(x) = g(x) − θ·f(x) for every coin.
-        let mut f_polys: Vec<Vec<BigUint>> = Vec::with_capacity(total_coins);
-        let mut g_polys: Vec<Vec<BigUint>> = Vec::with_capacity(total_coins);
+        // (4) Compute h(x) = g(x) − θ·f(x) for every coin. (In char 2,
+        //     i.e. the GF(2^w) profile, this is g(x) + θ·f(x); both
+        //     forms are byte-equivalent.)
+        let mut coin_blobs: Vec<CoinPolyBlob> = Vec::with_capacity(total_coins);
         let mut mask_shares_per_node: Vec<Vec<Val>> = vec![Vec::with_capacity(total_coins); n];
         let mut f_large_per_node: Vec<Vec<Val>> = vec![Vec::with_capacity(total_coins); n];
         let mut secret_per_node: Vec<Vec<Val>> = vec![Vec::with_capacity(total_coins); n];
@@ -192,11 +412,11 @@ impl Context {
         let mut hashes_vec: Vec<Vec<Hash>> = Vec::with_capacity(total_coins);
 
         for _ in 0..total_coins {
-            let secret = rand::thread_rng().gen_biguint_range(&low_r, &prime);
-            let sampled = two_field_dealer.sample_shares(secret);
-            f_polys.push(sampled.f_poly.clone());
-            g_polys.push(sampled.g_poly.clone());
+            let (secret_shares, f_large_shares, mask_shares, blob) = dealer.sample_coin();
 
+            // Per-coin nonce: BigUint Shamir salt in BOTH modes
+            // (nonces are commit-binding only, don't participate in
+            // field arithmetic, no need to migrate them).
             let nonce_ss = ShamirSecretSharing {
                 threshold: faults + 1,
                 share_amount: 3 * faults + 1,
@@ -207,9 +427,9 @@ impl Context {
 
             let mut coin_leaves: Vec<Hash> = Vec::with_capacity(n);
             for i in 0..n {
-                let f_share = Self::pad_shares(sampled.secret_shares[i].1.clone());
-                let g_share = Self::pad_shares(sampled.mask_shares[i].1.clone());
-                let f_large = Self::pad_shares(sampled.f_large_shares[i].1.clone());
+                let f_share = secret_shares[i];
+                let g_share = mask_shares[i];
+                let f_large = f_large_shares[i];
                 let nonce_share = Self::pad_shares(nonce_shares[i].1.clone());
                 let leaf = types::beacon::avss_commit_leaf(
                     &f_share, &g_share, &f_large, &nonce_share,
@@ -221,23 +441,21 @@ impl Context {
                 f_large_per_node[i].push(f_large);
             }
             hashes_vec.push(coin_leaves);
+            coin_blobs.push(blob);
         }
 
         let mt_vec = MerkleTree::build_trees(hashes_vec, &self.hash_context);
         let roots_vec: Vec<Hash> = mt_vec.iter().map(|mt| mt.root()).collect();
 
         // (3) Fiat-Shamir challenge from the dealer's own commitment.
-        let theta = Self::theta_from_commitment(new_round, self.myid, &roots_vec, &nonce_prime);
+        //     Returned as 32 raw bytes; each field interprets them via
+        //     its own canonicalisation inside `compute_h_bytes`.
+        let theta_bytes = dealer.derive_theta_bytes(new_round, self.myid, &roots_vec);
 
         // (4) Degree-test polynomial h per coin, under the bound θ.
         let mut degree_test_batch: Vec<Vec<Val>> = Vec::with_capacity(total_coins);
-        for coin in 0..total_coins {
-            let h = two_field_dealer.compute_degree_test_poly_pub(
-                &f_polys[coin],
-                &g_polys[coin],
-                &theta,
-            );
-            degree_test_batch.push(h.iter().map(|c| Self::pad_shares(c.clone())).collect());
+        for blob in &coin_blobs {
+            degree_test_batch.push(blob.compute_h_bytes(&theta_bytes, &dealer));
         }
 
         // Assemble per-recipient BatchWSSMsg (f-share, nonce, proof).
