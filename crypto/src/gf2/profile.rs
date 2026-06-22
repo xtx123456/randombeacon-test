@@ -40,6 +40,9 @@
 //! Tests at the bottom validate every registry entry's irreducibility
 //! and the `Tr(α) = 1` condition at startup-equivalent rigor.
 
+use std::fmt;
+use std::str::FromStr;
+
 use super::poly;
 
 /// Runtime two-field profile selector for PPT.
@@ -105,6 +108,75 @@ impl Gf2Profile {
     /// single quadratic extension, etc.
     pub fn tower_depth(&self) -> usize {
         (self.w_q / self.w_p).trailing_zeros() as usize
+    }
+}
+
+/// Canonical `Display` form: `"GF2(w_p,w_q)"`. The inverse of
+/// `FromStr`, so a round-trip is identity:
+///
+/// ```text
+///     "GF2(64,256)".parse::<Gf2Profile>().unwrap().to_string()
+///         == "GF2(64,256)"
+/// ```
+impl fmt::Display for Gf2Profile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "GF2({},{})", self.w_p, self.w_q)
+    }
+}
+
+/// Parse a `Gf2Profile` from the CLI string form
+/// `"GF2(w_p,w_q)"`.
+///
+/// The leading tag is case-insensitive (`gf2`, `Gf2`, `GF2` all
+/// work) and may be omitted entirely (`"(64,256)"` and even
+/// `"64,256"` parse successfully). Whitespace inside the parens is
+/// tolerated. Numeric parsing failures, malformed parentheses, or
+/// validation failures from `Gf2Profile::new` all bubble up as a
+/// descriptive `String` error.
+impl FromStr for Gf2Profile {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return Err("empty Gf2Profile spec".into());
+        }
+        // Optional "gf2" tag.
+        let body = match trimmed
+            .strip_prefix("GF2")
+            .or_else(|| trimmed.strip_prefix("gf2"))
+            .or_else(|| trimmed.strip_prefix("Gf2"))
+        {
+            Some(rest) => rest.trim_start(),
+            None => trimmed,
+        };
+        // Strip optional outer parens.
+        let inner = if let Some(stripped) = body.strip_prefix('(') {
+            stripped
+                .strip_suffix(')')
+                .ok_or_else(|| format!("missing closing ')' in '{}'", s))?
+        } else {
+            body
+        };
+        let mut parts = inner.split(',');
+        let w_p_str = parts
+            .next()
+            .ok_or_else(|| format!("missing w_p in '{}'", s))?
+            .trim();
+        let w_q_str = parts
+            .next()
+            .ok_or_else(|| format!("missing w_q in '{}'", s))?
+            .trim();
+        if parts.next().is_some() {
+            return Err(format!("expected exactly two integers in '{}'", s));
+        }
+        let w_p: usize = w_p_str
+            .parse()
+            .map_err(|e| format!("invalid w_p '{}': {}", w_p_str, e))?;
+        let w_q: usize = w_q_str
+            .parse()
+            .map_err(|e| format!("invalid w_q '{}': {}", w_q_str, e))?;
+        Gf2Profile::new(w_p, w_q).map_err(|e| format!("invalid Gf2Profile({}, {}): {}", w_p, w_q, e))
     }
 }
 
@@ -294,6 +366,64 @@ mod tests {
         assert!(Gf2Profile::new(1, 1).is_ok());
         assert!(Gf2Profile::new(1, 2).is_ok());
         assert!(Gf2Profile::new(1, 256).is_ok()); // depth 8: 1→2→4→8→16→32→64→128→256
+    }
+
+    #[test]
+    fn fromstr_accepts_canonical_form() {
+        let p: Gf2Profile = "GF2(64,256)".parse().unwrap();
+        assert_eq!(p, Gf2Profile::new(64, 256).unwrap());
+        assert_eq!(p.to_string(), "GF2(64,256)");
+    }
+
+    #[test]
+    fn fromstr_accepts_variant_forms() {
+        let target = Gf2Profile::new(32, 128).unwrap();
+        for s in &[
+            "GF2(32,128)",
+            "gf2(32,128)",
+            "Gf2(32,128)",
+            "GF2( 32 , 128 )",
+            "  gf2(32, 128) ",
+            "(32,128)",
+            "32,128",
+            "32, 128",
+        ] {
+            let parsed: Gf2Profile = s.parse().unwrap_or_else(|e| panic!("'{}' → {}", s, e));
+            assert_eq!(parsed, target, "form '{}' parsed differently", s);
+        }
+    }
+
+    #[test]
+    fn fromstr_rejects_malformed() {
+        // Each of these should fail; we only check that .is_err() is true
+        // (the exact message is informational).
+        for s in &[
+            "",
+            "GF2",
+            "GF2()",
+            "GF2(64)",
+            "GF2(64,128,256)",
+            "GF2(abc,def)",
+            "GF2(64,128",
+            "GF2 64,128)",
+        ] {
+            assert!(s.parse::<Gf2Profile>().is_err(), "form '{}' should fail", s);
+        }
+    }
+
+    #[test]
+    fn fromstr_surfaces_validation_errors() {
+        // (64, 96) is well-formed numerically but fails the
+        // w_p|w_q + power-of-2 constraint inside Gf2Profile::new.
+        let err = "GF2(64,96)".parse::<Gf2Profile>().unwrap_err();
+        assert!(
+            err.contains("invalid Gf2Profile(64, 96)"),
+            "expected validation error context, got: {}",
+            err
+        );
+        // (7, 64) — w_p=7 is unregistered.
+        let err2 = "GF2(7,64)".parse::<Gf2Profile>().unwrap_err();
+        assert!(err2.contains("invalid Gf2Profile(7, 64)"), "got: {}", err2);
     }
 
     #[test]

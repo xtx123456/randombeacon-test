@@ -44,6 +44,11 @@ async fn main() -> Result<()> {
     let avss_transport = m.value_of("transport")
         .map(|s| s.to_ascii_lowercase())
         .unwrap_or_else(|| "lite".to_string());
+    // Two-field profile selector for vsstype=ppt. Optional; absence
+    // keeps the legacy BigUint prime-field path. Parsed and validated
+    // here so any malformed spec aborts node startup (rather than
+    // first-message-time as a panic deep in the dealer).
+    let gf2_field_spec = m.value_of("field").map(|s| s.to_string());
     let conf_file = std::path::Path::new(conf_str.clone());
     let str = String::from(conf_str.clone());
     let mut config = match conf_file
@@ -95,8 +100,23 @@ async fn main() -> Result<()> {
                 "[PPT][BOOT] starting ppt_beacon with AVSS transport = {:?}",
                 transport
             );
+            // Validate `--field "GF2(w_p,w_q)"` up front so any typo
+            // aborts startup before any TCP listener is bound.
+            let gf2_profile = match gf2_field_spec.as_deref() {
+                None => None,
+                Some(spec) => match ppt_beacon::node::context::parse_field_spec(spec) {
+                    Ok(p) => {
+                        log::info!(
+                            "[PPT][BOOT] enabling GF(2^w) two-field profile {} (CLI override)",
+                            p
+                        );
+                        Some(p)
+                    }
+                    Err(e) => panic!("Invalid --field value '{}': {}", spec, e),
+                },
+            };
             exit_tx = ppt_beacon::node::Context::spawn(
-                config, sleep, batch, frequency, transport,
+                config, sleep, batch, frequency, transport, gf2_profile,
             )
             .unwrap();
         },

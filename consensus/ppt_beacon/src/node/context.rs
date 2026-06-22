@@ -8,6 +8,7 @@ use std::{
 use anyhow::{anyhow, Result};
 use config::Node;
 use crypto::aes_hash::HashState;
+use crypto::gf2::Gf2Profile;
 use crypto::hash::Hash;
 use fnv::FnvHashMap;
 use fnv::FnvHashMap as HashMap;
@@ -43,6 +44,34 @@ use super::{CTRBCState, Handler, SyncHandler};
 /// challenge θ. Every node uses this, so dealers and verifiers agree
 /// without a previous beacon being available.
 pub const PPT_GENESIS_THETA_SEED: &[u8] = b"PPT_BEACON_GENESIS_THETA_v1";
+
+/// Re-export `Gf2Profile` so that crates which depend on
+/// `ppt_beacon` (e.g. `node`) do not need a direct `crypto`
+/// dependency just to refer to the profile type.
+pub use crypto::gf2::Gf2Profile as ExportedGf2Profile;
+
+/// CLI-side parser for `--field "GF2(w_p,w_q)"`.
+///
+/// Thin wrapper around `Gf2Profile::from_str`, intentionally
+/// returning an owned `String` error so callers can propagate it
+/// directly to clap / panic / log without pulling in
+/// `crypto::gf2::profile`'s error type. The helper lives here (and
+/// not in `crypto::gf2`) so that the `node` binary stays
+/// `crypto`-independent: it talks only to `ppt_beacon`.
+///
+/// Examples
+/// --------
+///
+/// ```text
+///     parse_field_spec("GF2(64,256)")  // Ok
+///     parse_field_spec("(32, 128)")    // Ok
+///     parse_field_spec("64,128")       // Ok
+///     parse_field_spec("GF2(7,64)")    // Err — unregistered w_p
+///     parse_field_spec("GF2(64,96)")   // Err — w_p ∤ w_q
+/// ```
+pub fn parse_field_spec(s: &str) -> Result<ExportedGf2Profile, String> {
+    s.parse::<ExportedGf2Profile>()
+}
 
 /// Number of extra "coin secrets" each dealer seals per round, on top
 /// of the `batch_size` beacon coins, to drive the next round's ACS
@@ -142,6 +171,19 @@ pub struct Context {
     pub hash_context: Arc<HashState>,
     pub secret_domain: BigUint,
     pub nonce_domain: BigUint,
+
+    /// Optional `GF(2^w_p) ⊂ GF(2^w_q)` two-field profile selected by
+    /// the `--field "GF2(w_p,w_q)"` CLI flag. `None` (the default)
+    /// leaves the entire AVSS / degree-test stack on the legacy
+    /// `BigUint` prime-field path driven by `secret_domain` /
+    /// `nonce_domain` above; `Some(profile)` is wired through to
+    /// downstream consumers (`batch_wssinit`, `secret_reconstruct`,
+    /// `process::avss_local_packet_valid_pure`, …) in subsequent
+    /// commits as each call site is migrated.
+    ///
+    /// This commit only carries the value; no behaviour change is
+    /// observable when the flag is set.
+    pub gf2_profile: Option<Gf2Profile>,
 
     // ---- Round bookkeeping ----
     pub curr_round: u32,
@@ -388,6 +430,7 @@ impl Context {
         batch: usize,
         frequency: Round,
         transport: AvssTransport,
+        gf2_profile: Option<Gf2Profile>,
     ) -> anyhow::Result<oneshot::Sender<()>> {
         let prot_payload = &config.prot_payload;
         let v: Vec<&str> = prot_payload.split(',').collect();
@@ -478,6 +521,7 @@ impl Context {
                 hash_context: Arc::new(hashstate),
                 secret_domain: prime.clone(),
                 nonce_domain: nonce_prime.clone(),
+                gf2_profile,
 
                 curr_round: 0,
                 max_rounds: 20000,
@@ -519,6 +563,19 @@ impl Context {
 
             log::error!("[PPT] ppt_beacon context started on node {}", c.myid);
             log::error!("[PPT][ACS] quorum ACS engine loaded on node {}", c.myid);
+            match c.gf2_profile {
+                Some(p) => log::error!(
+                    "[PPT][FIELD] node {} two-field profile = {} (BigUint path remains active; \
+                     migration commits will switch consumers progressively)",
+                    c.myid,
+                    p
+                ),
+                None => log::error!(
+                    "[PPT][FIELD] node {} two-field profile = BigUint (default; pass \
+                     --field 'GF2(w_p,w_q)' to enable the binary-extension-field profile)",
+                    c.myid
+                ),
+            }
 
             if let Err(e) = c.run().await {
                 log::error!("[PPT] Consensus error: {}", e);

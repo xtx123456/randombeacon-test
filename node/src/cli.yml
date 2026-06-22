@@ -83,3 +83,22 @@ args:
                                     benchmarks.
             Ignored when vsstype != 'ppt'.
         takes_value: true
+    - field:
+        long: field
+        help: |
+            Two-field profile selector for vsstype=ppt. One of:
+              (omit)             -- default BigUint prime-field path
+                                    (secret_domain ~50 bits,
+                                    nonce_domain ~256 bits). Behaviour
+                                    unchanged from previous releases.
+              'GF2(w_p,w_q)'     -- enable the GF(2^w_p) ⊂ GF(2^w_q)
+                                    binary-extension tower profile.
+                                    Constraints: w_p in {1,2,4,8,16,32,
+                                    64,128}, w_p divides w_q, w_q/w_p is
+                                    a power of two, w_q <= 256.
+                                    Example: 'GF2(64,256)', 'GF2(32,128)'.
+            This commit plumbs the profile through Context only; the
+            AVSS / degree-test consumers still use BigUint regardless of
+            this flag. Later commits migrate consumers one at a time.
+            Ignored when vsstype != 'ppt'.
+        takes_value: true
