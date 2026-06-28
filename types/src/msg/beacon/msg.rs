@@ -29,6 +29,50 @@ pub fn avss_commit_leaf(f_share: &Val, g_share: &Val, f_large: &Val, nonce: &Val
     do_hash(buf.as_slice())
 }
 
+/// GF(2^w) variant of `avss_commit_leaf` for the binary-extension
+/// two-field profile.
+///
+/// In GF(2^w), the small-field share `f(i) ∈ GF(2^w_p)` lifts into
+/// the large field `GF(2^w_q)` as the canonical "low coordinate"
+/// inclusion — i.e. `f_large = f_share` byte-for-byte after the
+/// subfield embedding. Hashing `f_large` separately is therefore
+/// redundant: it would bind the same 32 bytes twice. This 3-field
+/// variant drops `f_large` and binds only `(f_share, g_share,
+/// nonce)`, saving 32 bytes of hash input per leaf AND 32 bytes per
+/// (recipient, coin) on the wire (since `f_large` no longer needs
+/// to be shipped at all in GF(2^w) mode).
+///
+/// Wire-side: BeaconMsg / AvssRecipientPayload / BatchWSSReconMsg
+/// carry `f_large_shares: Option<Vec<Val>>`. `Some(_)` selects the
+/// legacy 4-field leaf (`avss_commit_leaf`); `None` selects this
+/// 3-field leaf. Dealers and verifiers must agree on the profile
+/// (single-deployment configuration — same cross-mode safety story
+/// as `--transport`).
+pub fn avss_commit_leaf_gf2(f_share: &Val, g_share: &Val, nonce: &Val) -> Hash {
+    let mut buf = Vec::with_capacity(3 * HASH_SIZE);
+    buf.extend_from_slice(f_share);
+    buf.extend_from_slice(g_share);
+    buf.extend_from_slice(nonce);
+    do_hash(buf.as_slice())
+}
+
+/// Dispatch helper that selects the right leaf variant based on
+/// whether `f_large` is `Some` (legacy BigUint / 4-field) or `None`
+/// (GF(2^w) / 3-field). Used at every site that previously called
+/// `avss_commit_leaf` directly.
+#[inline]
+pub fn avss_commit_leaf_auto(
+    f_share: &Val,
+    g_share: &Val,
+    f_large: Option<&Val>,
+    nonce: &Val,
+) -> Hash {
+    match f_large {
+        Some(fl) => avss_commit_leaf(f_share, g_share, fl, nonce),
+        None => avss_commit_leaf_gf2(f_share, g_share, nonce),
+    }
+}
+
 #[derive(Debug,Serialize,Deserialize,Clone)]
 pub struct BeaconMsg{
     pub origin: Replica,
@@ -63,6 +107,13 @@ impl BeaconMsg {
     }
 
     /// Phase 4B (Two-Field): Create a BeaconMsg with full two-field data.
+    ///
+    /// `f_large_shares` is `Some(...)` in the BigUint two-field path
+    /// (legacy default) and `None` in the GF(2^w) two-field path
+    /// (commit 7 of the migration): under the subfield embedding
+    /// `f_large == secrets` byte-for-byte, so the redundant channel
+    /// is dropped on the wire and reconstructed locally by the
+    /// receiver.
     pub fn new_two_field(
         origin:Replica,
         round:Round,
@@ -71,7 +122,7 @@ impl BeaconMsg {
         appx_con: Vec<(Round,Vec<(Replica,Val)>)>,
         degree_test_coeffs: Vec<Vec<Val>>,
         mask_shares: Vec<Val>,
-        f_large_shares: Vec<Val>,
+        f_large_shares: Option<Vec<Val>>,
     )->BeaconMsg{
         BeaconMsg {
             origin,
@@ -81,7 +132,7 @@ impl BeaconMsg {
             appx_con: Some(appx_con),
             degree_test_coeffs: Some(degree_test_coeffs),
             mask_shares: Some(mask_shares),
-            f_large_shares: Some(f_large_shares),
+            f_large_shares,
         }
     }
 
@@ -136,30 +187,42 @@ impl BeaconMsg {
                 log::error!("Merkle proof verification failed for wssmsg sent by {}",wssmsg.origin);
                 return false;
             }
-            // Two leaf formats share this function:
-            //   * PPT two-field path (`mask_shares` + `f_large_shares`
-            //     present): the committed leaf binds f_share, g_share
-            //     (mask), f_large AND nonce (`avss_commit_leaf`) — this
-            //     is what makes the Fiat-Shamir degree test sound.
-            //   * Legacy / non-two-field beacons (no mask/f_large):
-            //     the leaf is `hash(secret, nonce)`, as before.
+            // Three leaf formats share this function:
+            //   * PPT two-field BigUint path (`mask_shares` AND
+            //     `f_large_shares` both present): the committed leaf
+            //     binds (f_share, g_share, f_large, nonce) via the
+            //     4-field `avss_commit_leaf`. This is the historical
+            //     default.
+            //   * PPT two-field GF(2^w) path (`mask_shares` present,
+            //     `f_large_shares == None`): commit 7 of the GF(2^w)
+            //     migration. Subfield closure makes `f_large = f_share`
+            //     byte-for-byte, so the dealer skips the redundant
+            //     channel; the leaf is 3-field `avss_commit_leaf_gf2`.
+            //   * Legacy / non-two-field beacons (no mask): leaf is
+            //     `hash(secret, nonce)`, as before.
             // Branching on the presence of the two-field fields keeps
-            // both protocols (e.g. `bea` and `ppt`) working off the
-            // same shared `BeaconMsg`.
+            // all three protocol modes working off the same shared
+            // `BeaconMsg`.
             match (self.mask_shares.as_ref(), self.f_large_shares.as_ref()) {
-                (Some(mask), Some(f_large)) => {
+                (Some(mask), maybe_f_large) => {
                     if mask.len() != wssmsg.secrets.len()
-                        || f_large.len() != wssmsg.secrets.len()
                         || wssmsg.nonces.len() != wssmsg.secrets.len()
                     {
                         log::error!("mismatched per-coin lengths for commitment leaf (wss from {})", wssmsg.origin);
                         return false;
                     }
+                    if let Some(fl) = maybe_f_large {
+                        if fl.len() != wssmsg.secrets.len() {
+                            log::error!("mismatched f_large length for commitment leaf (wss from {})", wssmsg.origin);
+                            return false;
+                        }
+                    }
                     for (coin, pf) in wssmsg.mps.iter().enumerate() {
-                        let leaf = avss_commit_leaf(
+                        let f_large_ref = maybe_f_large.map(|fl| &fl[coin]);
+                        let leaf = avss_commit_leaf_auto(
                             &wssmsg.secrets[coin],
                             &mask[coin],
-                            &f_large[coin],
+                            f_large_ref,
                             &wssmsg.nonces[coin],
                         );
                         if pf.item() != leaf {
@@ -430,7 +493,12 @@ pub struct AvssRecipientPayload {
     pub secrets: Vec<Val>,
     pub nonces: Vec<Val>,
     pub mask_shares: Vec<Val>,
-    pub f_large_shares: Vec<Val>,
+    /// `None` in GF(2^w) mode (commit 7): subfield closure makes
+    /// `f_large_shares[i] == secrets[i]` byte-for-byte, so the
+    /// redundant channel is dropped on the wire and the receiver
+    /// derives `f_large` locally from `secrets`. `Some(_)` in
+    /// BigUint mode (legacy default).
+    pub f_large_shares: Option<Vec<Val>>,
     pub mps: Vec<Proof>,
 }
 
@@ -439,7 +507,7 @@ impl AvssRecipientPayload {
         secrets: Vec<Val>,
         nonces: Vec<Val>,
         mask_shares: Vec<Val>,
-        f_large_shares: Vec<Val>,
+        f_large_shares: Option<Vec<Val>>,
         mps: Vec<Proof>,
     ) -> Self {
         Self {
@@ -500,9 +568,12 @@ pub struct BatchWSSReconMsg{
     /// g(i) shares aligned with `origins`
     #[serde(default)]
     pub mask_shares: Vec<Val>,
-    /// f(i) evaluated in the large field, aligned with `origins`
+    /// f(i) evaluated in the large field, aligned with `origins`.
+    /// `None` in GF(2^w) mode (commit 7) — subfield closure makes
+    /// `f_large_shares[i] == secrets[i]`. `Some(_)` in BigUint
+    /// mode.
     #[serde(default)]
-    pub f_large_shares: Vec<Val>,
+    pub f_large_shares: Option<Vec<Val>>,
     pub empty: bool
 }
 
@@ -514,7 +585,7 @@ impl BatchWSSReconMsg {
         origin_replicas:Vec<Replica>,
         mps:Vec<Proof>,
         mask_shares:Vec<Val>,
-        f_large_shares:Vec<Val>,
+        f_large_shares:Option<Vec<Val>>,
     )->Self{
         BatchWSSReconMsg{
             secrets,

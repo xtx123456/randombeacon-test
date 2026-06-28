@@ -31,11 +31,15 @@ use types::SyncState;
 
 fn packet_lengths_ok(packet: &BatchWSSReconMsg) -> bool {
     let l = packet.origins.len();
+    let f_large_ok = match packet.f_large_shares.as_ref() {
+        Some(fl) => fl.len() == l,
+        None => true, // GF2 mode (commit 7): f_large derived locally
+    };
     packet.secrets.len() == l
         && packet.nonces.len() == l
         && packet.mps.len() == l
         && packet.mask_shares.len() == l
-        && packet.f_large_shares.len() == l
+        && f_large_ok
 }
 
 /// One coin-packet's pre-verified inputs, ready to be moved into
@@ -166,15 +170,26 @@ pub(crate) fn audit_post_complaint_pure(
                 let proof = &packet.mps[idx];
 
                 // Recompute the committed leaf binding f_share, g_share
-                // (mask), f_large and nonce (see `avss_commit_leaf`).
-                if idx >= packet.mask_shares.len() || idx >= packet.f_large_shares.len() {
+                // (mask), f_large (BigUint only) and nonce. GF(2^w)
+                // mode (commit 7): f_large channel dropped — the
+                // 3-field `avss_commit_leaf_gf2` matches what the
+                // dealer hashed.
+                if idx >= packet.mask_shares.len() {
                     complete = false;
                     break;
                 }
-                let item = types::beacon::avss_commit_leaf(
+                let f_large_ref = match packet.f_large_shares.as_ref() {
+                    Some(fl) if idx < fl.len() => Some(&fl[idx]),
+                    Some(_) => {
+                        complete = false;
+                        break;
+                    }
+                    None => None,
+                };
+                let item = types::beacon::avss_commit_leaf_auto(
                     &share,
                     &packet.mask_shares[idx],
-                    &packet.f_large_shares[idx],
+                    f_large_ref,
                     &nonce,
                 );
 
@@ -276,15 +291,21 @@ pub fn verify_recon_shares_pure(
             if !decided_set.contains(dealer) || banned.contains(dealer) {
                 continue;
             }
-            // All per-coin vectors must be aligned with origins.
+            // All per-coin vectors must be aligned with origins. The
+            // f_large_shares channel is optional (None in GF(2^w)
+            // mode, commit 7); when Some, it must match length.
             if idx >= packet.secrets.len()
                 || idx >= packet.nonces.len()
                 || idx >= packet.mps.len()
                 || idx >= packet.mask_shares.len()
-                || idx >= packet.f_large_shares.len()
             {
                 continue;
             }
+            let f_large_ref = match packet.f_large_shares.as_ref() {
+                Some(fl) if idx < fl.len() => Some(&fl[idx]),
+                Some(_) => continue, // length mismatch is malformed
+                None => None,
+            };
             let share = &packet.secrets[idx];
             let nonce = &packet.nonces[idx];
             let mp = &packet.mps[idx];
@@ -305,11 +326,12 @@ pub fn verify_recon_shares_pure(
             if mp.root() != expected_root {
                 continue;
             }
-            // Bind (f_share, g_share, f_large, nonce) to the committed leaf.
-            let item = types::beacon::avss_commit_leaf(
+            // Bind (f_share, g_share, [f_large,] nonce) to the
+            // committed leaf — 4-arg in BigUint mode, 3-arg in GF(2^w).
+            let item = types::beacon::avss_commit_leaf_auto(
                 share,
                 &packet.mask_shares[idx],
-                &packet.f_large_shares[idx],
+                f_large_ref,
                 nonce,
             );
             if item != mp.item() {
@@ -342,7 +364,11 @@ fn filter_packet_to_decided(
     filtered.nonces.clear();
     filtered.mps.clear();
     filtered.mask_shares.clear();
-    filtered.f_large_shares.clear();
+    // f_large_shares is Option<Vec<Val>>: in GF(2^w) mode (commit 7)
+    // the dealer ships None; preserve the variant when filtering. We
+    // re-allocate the Some branch as an empty Vec ready for push.
+    let mut filtered_f_large_vec: Option<Vec<types::beacon::Val>> =
+        packet.f_large_shares.as_ref().map(|_| Vec::new());
 
     for idx in 0..packet.origins.len() {
         let dealer = packet.origins[idx];
@@ -352,11 +378,16 @@ fn filter_packet_to_decided(
             filtered.nonces.push(packet.nonces[idx].clone());
             filtered.mps.push(packet.mps[idx].clone());
             filtered.mask_shares.push(packet.mask_shares[idx].clone());
-            filtered
-                .f_large_shares
-                .push(packet.f_large_shares[idx].clone());
+            if let (Some(src), Some(dst)) =
+                (packet.f_large_shares.as_ref(), filtered_f_large_vec.as_mut())
+            {
+                if idx < src.len() {
+                    dst.push(src[idx].clone());
+                }
+            }
         }
     }
+    filtered.f_large_shares = filtered_f_large_vec;
 
     filtered
 }
@@ -1951,7 +1982,8 @@ mod recon_fix_tests {
             origins: vec![dealer],
             mps: vec![s.proofs[provider].clone()],
             mask_shares: vec![s.masks[provider]],
-            f_large_shares: vec![s.f_larges[provider]],
+            // BigUint test fixture — Some channel.
+            f_large_shares: Some(vec![s.f_larges[provider]]),
             empty: false,
         }
     }

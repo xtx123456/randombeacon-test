@@ -372,7 +372,16 @@ impl CTRBCState {
         let mut nonces = Vec::new();
         let mut merkle_proofs = Vec::new();
         let mut mask_shares = Vec::new();
-        let mut f_large_shares = Vec::new();
+        // GF(2^w) wire-format compaction (commit 7): `f_large_shares`
+        // is `None` in GF(2^w) mode — `store_avss_packet` never
+        // populates `self.f_large_shares` for a GF2 dealer (the
+        // incoming BeaconMsg's `f_large_shares` is `None`), so the
+        // map lookup below would always miss in GF2 mode. We detect
+        // the mode via `self.gf2_super_inv_extractor.is_some()` (set
+        // by `finalize_acs_round` based on `ctx.gf2_profile`) and
+        // emit `None` rather than a partial Vec.
+        let in_gf2_mode = self.gf2_super_inv_extractor.is_some();
+        let mut f_large_shares_vec: Vec<types::beacon::Val> = Vec::new();
 
         let decided = self.acs_decided_set.clone().unwrap_or_default();
         for rep in decided.into_iter() {
@@ -396,20 +405,23 @@ impl CTRBCState {
                 Some(mask) => mask,
                 None => continue,
             };
-            let f_large = match self
-                .f_large_shares
-                .get(&rep)
-                .and_then(|v| v.get(coin_number))
-            {
-                Some(f_large) => f_large,
-                None => continue,
+            // BigUint mode requires f_large; GF2 mode skips the lookup.
+            let f_large_opt = if in_gf2_mode {
+                None
+            } else {
+                match self.f_large_shares.get(&rep).and_then(|v| v.get(coin_number)) {
+                    Some(fl) => Some(*fl),
+                    None => continue,
+                }
             };
 
             shares_vector.push(*secret);
             nonces.push(*nonce);
             merkle_proofs.push(merkle_proof.clone());
             mask_shares.push(*mask);
-            f_large_shares.push(*f_large);
+            if let Some(fl) = f_large_opt {
+                f_large_shares_vec.push(fl);
+            }
             replicas.push(rep);
         }
         BatchWSSReconMsg {
@@ -419,7 +431,7 @@ impl CTRBCState {
             origins: replicas,
             mps: merkle_proofs,
             mask_shares,
-            f_large_shares,
+            f_large_shares: if in_gf2_mode { None } else { Some(f_large_shares_vec) },
             empty: false,
         }
     }

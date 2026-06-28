@@ -121,14 +121,38 @@ pub(crate) fn avss_local_packet_valid_pure(
         Some(mask_shares) => mask_shares,
         None => return Err("missing mask shares"),
     };
-    let f_large_shares = match beacon_msg.f_large_shares.as_ref() {
+    // GF(2^w) wire-format compaction (commit 7): the f_large channel
+    // is dropped in GF2 mode (subfield closure means f_large equals
+    // the small share byte-for-byte). The verifier requires
+    // `f_large_shares` to be `Some` ONLY in BigUint mode; in GF2
+    // mode it must be `None` and we derive `f_large` from
+    // `wssmsg.secrets[coin]` locally below.
+    if gf2_profile.is_some() {
+        if beacon_msg.f_large_shares.is_some() {
+            return Err("f_large_shares present in GF2 mode (redundant; dealer should ship None)");
+        }
+    } else if beacon_msg.f_large_shares.is_none() {
+        return Err("missing f_large shares (required in BigUint mode)");
+    }
+    // For the BigUint code path below we still need a borrow to the
+    // Vec when it's Some; for GF2 we'll synthesize per-coin values
+    // from `wssmsg.secrets`. `empty_vec` is the placeholder lent to
+    // the GF2 branch — kept here (rather than inside the match arm)
+    // so its lifetime spans the per-coin loop below.
+    let empty_vec: Vec<types::beacon::Val> = Vec::new();
+    let f_large_shares: &Vec<types::beacon::Val> = match beacon_msg.f_large_shares.as_ref() {
         Some(f_large_shares) => f_large_shares,
-        None => return Err("missing f_large shares"),
+        None => &empty_vec, // GF2 mode — we derive per-coin from secrets below
     };
 
+    // In BigUint mode `f_large_shares.len() == batch_size`; in GF2
+    // mode `f_large_shares` is the placeholder empty Vec — we
+    // derive `f_large` from `wssmsg.secrets[coin]` directly in the
+    // per-coin loop below.
+    let expect_f_large_len = if gf2_profile.is_some() { 0 } else { batch_size };
     if degree_test_coeffs.len() != batch_size
         || mask_shares.len() != batch_size
-        || f_large_shares.len() != batch_size
+        || f_large_shares.len() != expect_f_large_len
     {
         log::warn!(
             "[PPT][AVSS] malformed two-field batch lengths from dealer {} round {}",
@@ -276,9 +300,16 @@ pub(crate) fn avss_local_packet_valid_pure(
                     })
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|_| "GF2 degree-test coeff has dirty high bits")?;
+                // GF(2^w) commit 7 wire compaction: f_large is not
+                // shipped — we derive it locally from the on-wire
+                // small share, since `f_large = lift_small(share)`
+                // and in the canonical 32-byte encoding `lift_small`
+                // is the identity (the bytes are the same). This
+                // also makes the cross-binding check below
+                // tautological, so we skip it.
                 let f_large =
-                    crypto::gf2::Gf2Element::from_bytes(profile, f_large_shares[coin_num])
-                        .map_err(|_| "GF2 f_large_share has dirty high bits")?;
+                    crypto::gf2::Gf2Element::from_bytes(profile, wssmsg.secrets[coin_num])
+                        .map_err(|_| "GF2 small share has dirty high bits")?;
                 let g_share = crypto::gf2::Gf2Element::from_bytes(profile, mask_shares[coin_num])
                     .map_err(|_| "GF2 mask_share has dirty high bits")?;
 
@@ -300,74 +331,34 @@ pub(crate) fn avss_local_packet_valid_pure(
 
         // Two-field cross-binding: the small-field `share[coin]`
         // (used in Lagrange reconstruction) MUST equal `f_large[coin]
-        // mod secret_domain` (BigUint) or, in GF(2^w), the
-        // low-`w_p`-bit projection of `f_large[coin]`.
+        // mod secret_domain` so a Byzantine dealer cannot decouple
+        // an honest-looking `(f_large, g, h)` triple from a garbage
+        // `share` that interpolates to a dealer-chosen beacon value.
         //
-        // An honest dealer satisfies this trivially because `share`
-        // and `f_large` come from a SINGLE polynomial `f_poly`:
-        //   * BigUint: `f_poly(i) mod p == (f_poly(i) mod q) mod p`
-        //     since all coeffs of f_poly are < p < q.
-        //   * GF(2^w): the subfield embedding `GF(2^w_p) ↪ GF(2^w_q)`
-        //     is a ring homomorphism, so `f_poly(i)` evaluated in the
-        //     large field on small-field-image coefficients lies in
-        //     the small-field image — the two views are byte-equal.
+        // BigUint mode: the check is `share == f_large mod p`. An
+        // honest dealer satisfies it trivially because `share` and
+        // `f_large` come from a SINGLE polynomial `f_poly` whose
+        // coefficients are all in [0, p) < q, so
+        // `f_poly(i) mod p == (f_poly(i) mod q) mod p`.
         //
-        // Without this binding, a Byzantine dealer can decouple the
-        // two channels: ship an honest degree-t `(f_large, g_share,
-        // h)` triple that passes the degree-test at every recipient,
-        // and INDEPENDENTLY ship `(share_1, ..., share_n)` that
-        // interpolate (on the ACS-decided evaluation point subset)
-        // to any dealer-chosen target. The reconstruction layer
-        // computes the round's beacon contribution by Lagrange-
-        // interpolating exactly those `share` values, so the dealer
-        // can pick its contribution at will -- and the audit layer
-        // does not catch this (it only compares `proof.root() !=
-        // expected_root`, which the dealer satisfied above by
-        // committing to the garbage shares' own Merkle root).
-        //
-        // Cost: one BigUint construction + one mod + one equality
-        // check per (coin, node) — or, in GF(2^w), a byte-prefix
-        // comparison (cheaper still). The spawn_blocking wrapper
-        // that already hosts this function absorbs either.
-        match gf2_profile {
-            None => {
-                let f_large =
-                    BigUint::from_bytes_be(f_large_shares[coin_num].as_slice());
-                let share = BigUint::from_bytes_be(wssmsg.secrets[coin_num].as_slice());
-                if share != (&f_large % secret_domain) {
-                    log::warn!(
-                        "[PPT][AVSS] share != f_large mod p for dealer {} round {} coin {} at \
-                         node {} (dealer decoupled small-field share from large-field \
-                         degree-test polynomial)",
-                        dealer, round, coin_num, myid
-                    );
-                    return Err("share mod p does not match f_large mod p");
-                }
-            }
-            Some(profile) => {
-                // GF(2^w): small-field projection is the low
-                // `small_byte_len()` bytes (with the boundary byte
-                // masked to `w_p % 8` bits). `Gf2Element::lift_small`
-                // does exactly this canonicalisation; we reuse it
-                // for the projection of `f_large`'s bytes and then
-                // compare to the on-wire small-field share bytes.
-                let small_len = profile.small_byte_len();
-                let f_large_proj = crypto::gf2::Gf2Element::lift_small(
-                    profile,
-                    &f_large_shares[coin_num][..small_len],
+        // GF(2^w) mode (commit 7): the f_large channel is no longer
+        // shipped at all — the verifier derived `f_large` from the
+        // small share directly above (`Gf2Element::from_bytes(profile,
+        // wssmsg.secrets[coin_num])`). There is therefore no second
+        // channel to decouple, and this cross-binding check would be
+        // tautological — skip it.
+        if gf2_profile.is_none() {
+            let f_large =
+                BigUint::from_bytes_be(f_large_shares[coin_num].as_slice());
+            let share = BigUint::from_bytes_be(wssmsg.secrets[coin_num].as_slice());
+            if share != (&f_large % secret_domain) {
+                log::warn!(
+                    "[PPT][AVSS] share != f_large mod p for dealer {} round {} coin {} at \
+                     node {} (dealer decoupled small-field share from large-field \
+                     degree-test polynomial)",
+                    dealer, round, coin_num, myid
                 );
-                let share = crypto::gf2::Gf2Element::lift_small(
-                    profile,
-                    &wssmsg.secrets[coin_num][..small_len],
-                );
-                if share != f_large_proj {
-                    log::warn!(
-                        "[PPT][AVSS] share != f_large (small-field projection) for dealer {} \
-                         round {} coin {} at node {} (GF(2^w) cross-binding broken)",
-                        dealer, round, coin_num, myid
-                    );
-                    return Err("share mod p does not match f_large mod p");
-                }
+                return Err("share mod p does not match f_large mod p");
             }
         }
     }
@@ -1400,7 +1391,7 @@ mod avss_binding_tests {
             Vec::new(),
             degree_test_coeffs,
             mask_per_node[myid].clone(),
-            f_large_per_node[myid].clone(),
+            Some(f_large_per_node[myid].clone()),
         );
         let transcript = crypto::hash::do_hash(beacon.serialize_ctrbc().as_slice());
         (beacon, transcript, p, q, theta, hc)
@@ -1567,8 +1558,10 @@ mod avss_binding_tests {
                 let f_share = *sampled.secret_shares[i].1.as_bytes();
                 let g_share = *sampled.mask_shares[i].1.as_bytes();
                 let f_large = *sampled.f_large_shares[i].1.as_bytes();
-                let leaf = types::beacon::avss_commit_leaf(
-                    &f_share, &g_share, &f_large, &nonce_bytes,
+                // GF(2^w) mode (commit 7): production dealer uses the
+                // 3-arg leaf since f_large == f_share byte-for-byte.
+                let leaf = types::beacon::avss_commit_leaf_gf2(
+                    &f_share, &g_share, &nonce_bytes,
                 );
                 coin_leaves.push(leaf);
                 secret_per_node[i].push(f_share);
@@ -1578,6 +1571,9 @@ mod avss_binding_tests {
             }
             hashes_vec.push(coin_leaves);
         }
+        // f_large_per_node retained above for symmetry but NOT
+        // shipped in the BeaconMsg below (None in GF2 mode).
+        let _ = &f_large_per_node;
 
         let mt_vec = MerkleTree::build_trees(hashes_vec, &hc);
         let roots_vec: Vec<Hash> = mt_vec.iter().map(|mt| mt.root()).collect();
@@ -1625,7 +1621,8 @@ mod avss_binding_tests {
             Vec::new(),
             degree_test_coeffs,
             mask_per_node[myid].clone(),
-            f_large_per_node[myid].clone(),
+            // GF(2^w) mode (commit 7): f_large channel dropped.
+            None,
         );
         let transcript = crypto::hash::do_hash(beacon.serialize_ctrbc().as_slice());
         (beacon, transcript, q, hc)
@@ -1732,23 +1729,26 @@ mod avss_binding_tests {
         );
     }
 
+    /// Commit 7 wire-format change pin: in GF(2^w) mode the dealer
+    /// MUST ship `f_large_shares = None` (the channel is dropped
+    /// because subfield closure makes f_large == share byte-for-byte
+    /// and the verifier derives it locally). A Byzantine dealer that
+    /// tries to RE-INTRODUCE the f_large channel with a tampered or
+    /// even an honest-looking value must be rejected so that the
+    /// schema invariant cannot be eroded.
     #[test]
-    fn rejects_gf2_tampered_f_large_share() {
+    fn rejects_gf2_packet_with_spurious_f_large_shares() {
         let (n, f, batch_size) = n_f();
         let profile = gf2_test_profile();
         let (mut beacon, _transcript, q, hc) =
             build_honest_packet_gf2(profile, 0, 1, 42, batch_size, n, f, false);
-        // Tamper with f_large_share for coin 0. The Merkle proof
-        // would actually catch this first (since avss_commit_leaf
-        // includes f_large), but if a Byzantine dealer also forged
-        // a matching leaf hash, the degree test would still reject.
-        {
-            let f_large = beacon
-                .f_large_shares
-                .as_mut()
-                .expect("honest GF2 packet has f_large_shares");
-            f_large[0][0] ^= 0x01;
-        }
+        // Re-introduce an f_large_shares Vec where the honest GF2
+        // dealer would have left None.
+        assert!(
+            beacon.f_large_shares.is_none(),
+            "honest GF2 dealer must ship None for f_large_shares (commit 7 schema)"
+        );
+        beacon.f_large_shares = Some(vec![[0u8; 32]; batch_size]);
         let transcript = crypto::hash::do_hash(beacon.serialize_ctrbc().as_slice());
         let p = small_prime();
         let res = avss_local_packet_valid_pure(
@@ -1768,7 +1768,50 @@ mod avss_binding_tests {
         );
         assert!(
             res.is_err(),
-            "GF2 tampered f_large share must be rejected (Merkle or degree test)"
+            "GF2 packet with spurious f_large_shares must be rejected (schema violation)"
+        );
+    }
+
+    /// Commit 7 wire-format compaction: the GF(2^w) AvssRecipientPayload
+    /// MUST be strictly smaller than the BigUint variant of the same
+    /// batch size, because (a) `f_large_shares` is `None` (1 byte tag
+    /// vs `8 + 32*batch_size` bytes) and (b) the dealer drops the
+    /// 32-byte-per-leaf redundancy in the Merkle commit hash input.
+    /// This pin makes sure no future refactor silently re-introduces
+    /// the dropped channel.
+    #[test]
+    fn gf2_avss_recipient_payload_is_smaller_on_wire_than_biguint() {
+        use types::beacon::AvssRecipientPayload;
+        let batch_size = 32usize;
+        // BigUint mode: all four payload channels are Some/full.
+        let biguint = AvssRecipientPayload::new(
+            vec![[7u8; 32]; batch_size],
+            vec![[3u8; 32]; batch_size],
+            vec![[5u8; 32]; batch_size],
+            Some(vec![[9u8; 32]; batch_size]),
+            Vec::new(),
+        );
+        // GF(2^w) mode: f_large_shares is None.
+        let gf2 = AvssRecipientPayload::new(
+            vec![[7u8; 32]; batch_size],
+            vec![[3u8; 32]; batch_size],
+            vec![[5u8; 32]; batch_size],
+            None,
+            Vec::new(),
+        );
+        let big_len = biguint.serialize_bytes().len();
+        let gf2_len = gf2.serialize_bytes().len();
+        let saved = big_len - gf2_len;
+        // Expect ~32 bytes per coin saved (the f_large_shares Vec
+        // bytes) plus the 8-byte Vec length prefix.
+        assert!(
+            saved >= 32 * batch_size,
+            "GF2 wire payload must save at least 32*batch_size = {} bytes vs BigUint; \
+             observed saving = {} bytes (big={}, gf2={})",
+            32 * batch_size,
+            saved,
+            big_len,
+            gf2_len
         );
     }
 

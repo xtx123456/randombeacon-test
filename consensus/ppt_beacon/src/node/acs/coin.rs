@@ -250,19 +250,22 @@ impl Context {
     ) -> Option<BatchWSSReconMsg> {
         let material = self.coin_material.get(&prev_round)?;
         let rr = aba_round as usize;
+        let in_gf2_mode = self.gf2_profile.is_some();
         let mut origins = Vec::new();
         let mut secrets = Vec::new();
         let mut nonces = Vec::new();
         let mut mps = Vec::new();
         let mut mask_shares = Vec::new();
-        let mut f_large_shares = Vec::new();
+        let mut f_large_shares_vec: Vec<types::beacon::Val> = Vec::new();
         for &d in material.decided.iter() {
             if let Some(v) = material.my_shares.get(&d) {
                 if let Some((share, g_share, f_large, nonce, proof)) = v.get(rr) {
                     origins.push(d);
                     secrets.push(*share);
                     mask_shares.push(*g_share);
-                    f_large_shares.push(*f_large);
+                    if !in_gf2_mode {
+                        f_large_shares_vec.push(*f_large);
+                    }
                     nonces.push(*nonce);
                     mps.push(proof.clone());
                 }
@@ -278,7 +281,14 @@ impl Context {
             origins,
             mps,
             mask_shares,
-            f_large_shares,
+            // GF(2^w) wire-format compaction (commit 7): drop the
+            // redundant f_large channel; the receiver derives
+            // f_large := share locally via subfield identity.
+            f_large_shares: if in_gf2_mode {
+                None
+            } else {
+                Some(f_large_shares_vec)
+            },
             empty: false,
         })
     }
@@ -347,10 +357,14 @@ impl Context {
                     || idx >= packet.nonces.len()
                     || idx >= packet.mps.len()
                     || idx >= packet.mask_shares.len()
-                    || idx >= packet.f_large_shares.len()
                 {
                     continue;
                 }
+                let f_large_ref = match packet.f_large_shares.as_ref() {
+                    Some(fl) if idx < fl.len() => Some(&fl[idx]),
+                    Some(_) => continue, // length mismatch is malformed
+                    None => None,        // GF(2^w) mode — leaf is 3-field
+                };
                 let share = &packet.secrets[idx];
                 let nonce = &packet.nonces[idx];
                 let mp = &packet.mps[idx];
@@ -364,11 +378,12 @@ impl Context {
                 if mp.root() != root {
                     continue;
                 }
-                // Combined leaf binds f_share, g_share, f_large, nonce.
-                let item = types::beacon::avss_commit_leaf(
+                // Combined leaf binds (f_share, g_share, [f_large,] nonce).
+                // GF(2^w) mode (commit 7) uses the 3-field variant.
+                let item = types::beacon::avss_commit_leaf_auto(
                     share,
                     &packet.mask_shares[idx],
-                    &packet.f_large_shares[idx],
+                    f_large_ref,
                     nonce,
                 );
                 if item != mp.item() {

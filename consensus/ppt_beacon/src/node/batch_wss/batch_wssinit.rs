@@ -426,14 +426,26 @@ impl Context {
             let nonce_shares = nonce_ss.split(nonce);
 
             let mut coin_leaves: Vec<Hash> = Vec::with_capacity(n);
+            // GF(2^w) mode (commit 7): f_large == f_share byte-for-byte
+            // (subfield closure), so the leaf hash binds only
+            // (f_share, g_share, nonce) — saves 32 bytes of input per
+            // leaf. Producer-side `f_large_per_node` is still
+            // populated for storage symmetry but is NOT shipped on
+            // the wire (see Step 2 below where `f_large_shares`
+            // becomes `None` in GF2 mode).
+            let in_gf2_mode = self.gf2_profile.is_some();
             for i in 0..n {
                 let f_share = secret_shares[i];
                 let g_share = mask_shares[i];
                 let f_large = f_large_shares[i];
                 let nonce_share = Self::pad_shares(nonce_shares[i].1.clone());
-                let leaf = types::beacon::avss_commit_leaf(
-                    &f_share, &g_share, &f_large, &nonce_share,
-                );
+                let leaf = if in_gf2_mode {
+                    types::beacon::avss_commit_leaf_gf2(&f_share, &g_share, &nonce_share)
+                } else {
+                    types::beacon::avss_commit_leaf(
+                        &f_share, &g_share, &f_large, &nonce_share,
+                    )
+                };
                 coin_leaves.push(leaf);
                 secret_per_node[i].push(f_share);
                 nonce_per_node[i].push(nonce_share);
@@ -547,13 +559,27 @@ impl Context {
         // The ordering matches the SecMsgDst recipient_idx convention
         // (recipient j in [0, n) -> payload[j]) so both transports
         // reuse the same per-recipient byte vector.
+        //
+        // GF(2^w) wire-format compaction (commit 7): the f_large
+        // channel is dropped in GF2 mode since `f_large == secrets`
+        // byte-for-byte under the subfield embedding. The dealer
+        // ships `f_large_shares = None`; the receiver derives
+        // `f_large := secrets` locally before running the degree
+        // test. Saves 32 bytes per (recipient, coin) on the wire
+        // AND 32 bytes per leaf in the Merkle hash input.
+        let dealer_in_gf2_mode = self.gf2_profile.is_some();
         let mut recipient_payload_bytes: Vec<Vec<u8>> = Vec::with_capacity(self.num_nodes);
         for (idx, (_rep, batchwss)) in vec_msgs_to_be_sent.into_iter().enumerate() {
+            let f_large_opt = if dealer_in_gf2_mode {
+                None
+            } else {
+                Some(f_large_per_node[idx].clone())
+            };
             let payload = types::beacon::AvssRecipientPayload::new(
                 batchwss.secrets,
                 batchwss.nonces,
                 mask_shares_per_node[idx].clone(),
-                f_large_per_node[idx].clone(),
+                f_large_opt,
                 batchwss.mps,
             );
             recipient_payload_bytes.push(payload.serialize_bytes());
