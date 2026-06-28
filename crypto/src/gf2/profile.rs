@@ -286,10 +286,14 @@ fn trace(w: usize, m_low: u128, a: u128) -> u128 {
 }
 
 fn alpha_cache() -> &'static [(usize, u128)] {
-    use std::sync::OnceLock;
-    static CACHE: OnceLock<Vec<(usize, u128)>> = OnceLock::new();
-    CACHE
-        .get_or_init(|| {
+    // NOTE: we use `lazy_static` (already a `crypto` crate
+    // dependency) rather than `std::sync::OnceLock` because the
+    // latter only stabilised in Rust 1.70. The `lazy_static`
+    // path lets `crypto` keep building on pre-1.70 toolchains
+    // (the only requirement is whatever rustc the workspace's
+    // other crates need; see workspace MSRV).
+    lazy_static::lazy_static! {
+        static ref ALPHA_CACHE: Vec<(usize, u128)> = {
             let mut v = Vec::new();
             for &w in &[2usize, 4, 8, 16, 32, 64, 128] {
                 let m_low = base_irreducible(w).expect("registered base");
@@ -298,8 +302,9 @@ fn alpha_cache() -> &'static [(usize, u128)] {
                 v.push((w, alpha));
             }
             v
-        })
-        .as_slice()
+        };
+    }
+    &ALPHA_CACHE
 }
 
 #[cfg(test)]
