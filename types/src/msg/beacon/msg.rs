@@ -7,6 +7,72 @@ use super::{Replica};
 
 pub type Val = [u8; HASH_SIZE];
 
+/// AVSS Merkle-commitment leaf for one (coin, recipient) slot.
+///
+/// Binds ALL of the recipient's confidential per-coin material —
+/// the small-field secret share `f(i) mod p`, the mask share
+/// `g(i) mod q`, the large-field share `f(i) mod q`, and the
+/// per-share nonce — into a single committed leaf. Previously only
+/// `(f_share, nonce)` was committed, leaving the mask `g` free; a
+/// Byzantine dealer could then pick `g(i)` AFTER learning the
+/// degree-test challenge and pass the test with an arbitrary-degree
+/// `f`. Committing `g` (and `f_large`) here is what makes the
+/// Fiat-Shamir degree-test challenge `θ = H(round‖dealer‖root_vec)`
+/// sound: the dealer must commit `f` and `g` before `θ` is
+/// determined.
+pub fn avss_commit_leaf(f_share: &Val, g_share: &Val, f_large: &Val, nonce: &Val) -> Hash {
+    let mut buf = Vec::with_capacity(4 * HASH_SIZE);
+    buf.extend_from_slice(f_share);
+    buf.extend_from_slice(g_share);
+    buf.extend_from_slice(f_large);
+    buf.extend_from_slice(nonce);
+    do_hash(buf.as_slice())
+}
+
+/// GF(2^w) variant of `avss_commit_leaf` for the binary-extension
+/// two-field profile.
+///
+/// In GF(2^w), the small-field share `f(i) ∈ GF(2^w_p)` lifts into
+/// the large field `GF(2^w_q)` as the canonical "low coordinate"
+/// inclusion — i.e. `f_large = f_share` byte-for-byte after the
+/// subfield embedding. Hashing `f_large` separately is therefore
+/// redundant: it would bind the same 32 bytes twice. This 3-field
+/// variant drops `f_large` and binds only `(f_share, g_share,
+/// nonce)`, saving 32 bytes of hash input per leaf AND 32 bytes per
+/// (recipient, coin) on the wire (since `f_large` no longer needs
+/// to be shipped at all in GF(2^w) mode).
+///
+/// Wire-side: BeaconMsg / AvssRecipientPayload / BatchWSSReconMsg
+/// carry `f_large_shares: Option<Vec<Val>>`. `Some(_)` selects the
+/// legacy 4-field leaf (`avss_commit_leaf`); `None` selects this
+/// 3-field leaf. Dealers and verifiers must agree on the profile
+/// (single-deployment configuration — same cross-mode safety story
+/// as `--transport`).
+pub fn avss_commit_leaf_gf2(f_share: &Val, g_share: &Val, nonce: &Val) -> Hash {
+    let mut buf = Vec::with_capacity(3 * HASH_SIZE);
+    buf.extend_from_slice(f_share);
+    buf.extend_from_slice(g_share);
+    buf.extend_from_slice(nonce);
+    do_hash(buf.as_slice())
+}
+
+/// Dispatch helper that selects the right leaf variant based on
+/// whether `f_large` is `Some` (legacy BigUint / 4-field) or `None`
+/// (GF(2^w) / 3-field). Used at every site that previously called
+/// `avss_commit_leaf` directly.
+#[inline]
+pub fn avss_commit_leaf_auto(
+    f_share: &Val,
+    g_share: &Val,
+    f_large: Option<&Val>,
+    nonce: &Val,
+) -> Hash {
+    match f_large {
+        Some(fl) => avss_commit_leaf(f_share, g_share, fl, nonce),
+        None => avss_commit_leaf_gf2(f_share, g_share, nonce),
+    }
+}
+
 #[derive(Debug,Serialize,Deserialize,Clone)]
 pub struct BeaconMsg{
     pub origin: Replica,
@@ -41,6 +107,13 @@ impl BeaconMsg {
     }
 
     /// Phase 4B (Two-Field): Create a BeaconMsg with full two-field data.
+    ///
+    /// `f_large_shares` is `Some(...)` in the BigUint two-field path
+    /// (legacy default) and `None` in the GF(2^w) two-field path
+    /// (commit 7 of the migration): under the subfield embedding
+    /// `f_large == secrets` byte-for-byte, so the redundant channel
+    /// is dropped on the wire and reconstructed locally by the
+    /// receiver.
     pub fn new_two_field(
         origin:Replica,
         round:Round,
@@ -49,7 +122,7 @@ impl BeaconMsg {
         appx_con: Vec<(Round,Vec<(Replica,Val)>)>,
         degree_test_coeffs: Vec<Vec<Val>>,
         mask_shares: Vec<Val>,
-        f_large_shares: Vec<Val>,
+        f_large_shares: Option<Vec<Val>>,
     )->BeaconMsg{
         BeaconMsg {
             origin,
@@ -59,7 +132,7 @@ impl BeaconMsg {
             appx_con: Some(appx_con),
             degree_test_coeffs: Some(degree_test_coeffs),
             mask_shares: Some(mask_shares),
-            f_large_shares: Some(f_large_shares),
+            f_large_shares,
         }
     }
 
@@ -114,13 +187,59 @@ impl BeaconMsg {
                 log::error!("Merkle proof verification failed for wssmsg sent by {}",wssmsg.origin);
                 return false;
             }
-            let secrets = wssmsg.secrets.clone();
-            let nonces = wssmsg.nonces.clone();
-            let commitments = hf.hash_batch(secrets, nonces);
-            for (pf,comm) in wssmsg.mps.iter().zip(commitments.into_iter()){
-                if pf.item() != comm{
-                    log::error!("Commitment does not match element in proof for wssmsg sent by {}",wssmsg.origin);
-                    return false;
+            // Three leaf formats share this function:
+            //   * PPT two-field BigUint path (`mask_shares` AND
+            //     `f_large_shares` both present): the committed leaf
+            //     binds (f_share, g_share, f_large, nonce) via the
+            //     4-field `avss_commit_leaf`. This is the historical
+            //     default.
+            //   * PPT two-field GF(2^w) path (`mask_shares` present,
+            //     `f_large_shares == None`): commit 7 of the GF(2^w)
+            //     migration. Subfield closure makes `f_large = f_share`
+            //     byte-for-byte, so the dealer skips the redundant
+            //     channel; the leaf is 3-field `avss_commit_leaf_gf2`.
+            //   * Legacy / non-two-field beacons (no mask): leaf is
+            //     `hash(secret, nonce)`, as before.
+            // Branching on the presence of the two-field fields keeps
+            // all three protocol modes working off the same shared
+            // `BeaconMsg`.
+            match (self.mask_shares.as_ref(), self.f_large_shares.as_ref()) {
+                (Some(mask), maybe_f_large) => {
+                    if mask.len() != wssmsg.secrets.len()
+                        || wssmsg.nonces.len() != wssmsg.secrets.len()
+                    {
+                        log::error!("mismatched per-coin lengths for commitment leaf (wss from {})", wssmsg.origin);
+                        return false;
+                    }
+                    if let Some(fl) = maybe_f_large {
+                        if fl.len() != wssmsg.secrets.len() {
+                            log::error!("mismatched f_large length for commitment leaf (wss from {})", wssmsg.origin);
+                            return false;
+                        }
+                    }
+                    for (coin, pf) in wssmsg.mps.iter().enumerate() {
+                        let f_large_ref = maybe_f_large.map(|fl| &fl[coin]);
+                        let leaf = avss_commit_leaf_auto(
+                            &wssmsg.secrets[coin],
+                            &mask[coin],
+                            f_large_ref,
+                            &wssmsg.nonces[coin],
+                        );
+                        if pf.item() != leaf {
+                            log::error!("Commitment does not match element in proof for wssmsg sent by {}",wssmsg.origin);
+                            return false;
+                        }
+                    }
+                }
+                _ => {
+                    // Legacy leaf = hash(secret, nonce).
+                    let commitments = hf.hash_batch(wssmsg.secrets.clone(), wssmsg.nonces.clone());
+                    for (pf, comm) in wssmsg.mps.iter().zip(commitments.into_iter()) {
+                        if pf.item() != comm {
+                            log::error!("Commitment does not match element in proof for wssmsg sent by {}",wssmsg.origin);
+                            return false;
+                        }
+                    }
                 }
             }
         }
@@ -256,6 +375,37 @@ pub enum CoinMsg{
     AVSSSecMsgCipherDispersal(Round, Replica, Vec<u8>),
     AVSSSecMsgCipherEcho(Round, Replica, Vec<u8>),
     AVSSSecMsgCipherVote(Round, Replica, Hash),
+
+    /// ACS common-coin reveal (PPT problem-1 fix: unpredictable
+    /// hash-based async common coin).
+    ///
+    /// `ACSCoinReveal(acs_round, aba_round, packet)`: the wire sender
+    /// reveals its Shamir shares of the sealed coin-secrets for
+    /// `aba_round`, one per dealer in the previous round's
+    /// ACS-decided set. The coin value `C = Σ_d reconstruct(
+    /// c_{d,aba_round})` stays hidden until f+1 honest reveals land —
+    /// and honest nodes only reveal AFTER fixing their `aba_round`
+    /// AUX — so the adversary cannot predict the coin before honest
+    /// AUX are committed, which is what MMR ABA termination requires.
+    ACSCoinReveal(Round, u64, BatchWSSReconMsg),
+
+    /// Lite AVSS transport (PPT pluggable-transport mode `lite`,
+    /// default). Carries the dealer-to-recipient confidential
+    /// `AvssRecipientPayload` (bincode `Vec<u8>`) as a single direct
+    /// unicast per recipient, paired with a broadcast
+    /// `AVSSSecMsgPublicCommit` for the shared public Merkle roots +
+    /// degree-test coefficients.
+    ///
+    /// `AVSSPrivatePayload(round, dealer, payload_bytes)`: the
+    /// wrapper-level `WrapperMsg.sender` MUST equal `dealer` (sender
+    /// binding, enforced receiver-side). This is the performance-
+    /// oriented alternative to the SS-AVSS Sec 4.3 `AVSSSecMsg*`
+    /// transport: PPT does not need Sec 4.3 application-layer
+    /// encryption (shares are unicast point-to-point and revealed at
+    /// reconstruction anyway), so the lite transport reduces the AVSS
+    /// phase from O(n^2) to O(n) wire messages per dealer per round.
+    /// PQ-safety unchanged (no new primitives).
+    AVSSPrivatePayload(Round, Replica, Vec<u8>),
 }
 
 /// Public AVSS commitment broadcast once per (round, dealer).
@@ -343,7 +493,12 @@ pub struct AvssRecipientPayload {
     pub secrets: Vec<Val>,
     pub nonces: Vec<Val>,
     pub mask_shares: Vec<Val>,
-    pub f_large_shares: Vec<Val>,
+    /// `None` in GF(2^w) mode (commit 7): subfield closure makes
+    /// `f_large_shares[i] == secrets[i]` byte-for-byte, so the
+    /// redundant channel is dropped on the wire and the receiver
+    /// derives `f_large` locally from `secrets`. `Some(_)` in
+    /// BigUint mode (legacy default).
+    pub f_large_shares: Option<Vec<Val>>,
     pub mps: Vec<Proof>,
 }
 
@@ -352,7 +507,7 @@ impl AvssRecipientPayload {
         secrets: Vec<Val>,
         nonces: Vec<Val>,
         mask_shares: Vec<Val>,
-        f_large_shares: Vec<Val>,
+        f_large_shares: Option<Vec<Val>>,
         mps: Vec<Proof>,
     ) -> Self {
         Self {
@@ -413,9 +568,12 @@ pub struct BatchWSSReconMsg{
     /// g(i) shares aligned with `origins`
     #[serde(default)]
     pub mask_shares: Vec<Val>,
-    /// f(i) evaluated in the large field, aligned with `origins`
+    /// f(i) evaluated in the large field, aligned with `origins`.
+    /// `None` in GF(2^w) mode (commit 7) — subfield closure makes
+    /// `f_large_shares[i] == secrets[i]`. `Some(_)` in BigUint
+    /// mode.
     #[serde(default)]
-    pub f_large_shares: Vec<Val>,
+    pub f_large_shares: Option<Vec<Val>>,
     pub empty: bool
 }
 
@@ -427,7 +585,7 @@ impl BatchWSSReconMsg {
         origin_replicas:Vec<Replica>,
         mps:Vec<Proof>,
         mask_shares:Vec<Val>,
-        f_large_shares:Vec<Val>,
+        f_large_shares:Option<Vec<Val>>,
     )->Self{
         BatchWSSReconMsg{
             secrets,
@@ -625,6 +783,11 @@ mod shoup_smart_avss_wire_tests {
             CoinMsg::AVSSSecMsgCipherDispersal(7, 2, vec![6u8, 7u8]),
             CoinMsg::AVSSSecMsgCipherEcho(7, 2, vec![8u8]),
             CoinMsg::AVSSSecMsgCipherVote(7, 2, sample_root(0xAD)),
+            CoinMsg::AVSSPrivatePayload(
+                7,
+                2,
+                vec![9u8, 10u8, 11u8, 12u8, 13u8],
+            ),
         ];
         for c in cases {
             let bytes = bincode::serialize(&c).expect("ser");
@@ -635,5 +798,33 @@ mod shoup_smart_avss_wire_tests {
             let bytes2 = bincode::serialize(&parsed).expect("re-ser");
             assert_eq!(bytes, bytes2);
         }
+    }
+
+    #[test]
+    fn private_payload_carries_recipient_bytes_unchanged() {
+        // The lite transport ships AvssRecipientPayload's bincode-
+        // serialized bytes verbatim inside AVSSPrivatePayload.
+        // Round-trip a real-shaped payload to confirm the wire
+        // format does not corrupt it.
+        let payload = AvssRecipientPayload::new(
+            vec![sample_val(0x11), sample_val(0x12)],
+            vec![sample_val(0x21), sample_val(0x22)],
+            vec![sample_val(0x31), sample_val(0x32)],
+            vec![sample_val(0x41), sample_val(0x42)],
+            Vec::new(),
+        );
+        let bytes = payload.serialize_bytes();
+        let wire = CoinMsg::AVSSPrivatePayload(11, 5, bytes.clone());
+        let ser = bincode::serialize(&wire).expect("ser");
+        let parsed: CoinMsg = bincode::deserialize(&ser).expect("de");
+        let extracted_bytes = match parsed {
+            CoinMsg::AVSSPrivatePayload(11, 5, b) => b,
+            other => panic!("wrong variant after deserialize: {:?}",
+                std::mem::discriminant(&other)),
+        };
+        assert_eq!(extracted_bytes, bytes);
+        let recovered = AvssRecipientPayload::deserialize_bytes(&extracted_bytes)
+            .expect("recovered payload deserializes");
+        assert_eq!(recovered, payload);
     }
 }

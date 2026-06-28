@@ -24,6 +24,11 @@ LOGDIR="${LOGDIR:-$ROOT/logs}"
 BIN="${BIN:-$ROOT/target/release/node}"
 TRI="${TRI:-32862}"
 IP_FILE="${IP_FILE:-$ROOT/ip_file}"
+# GF(2^w) two-field profile selector (commit 2+ of the migration).
+# Empty / unset = default BigUint prime-field path (unchanged behaviour).
+# Examples: FIELD='GF2(64,256)' / FIELD='GF2(32,128)' / FIELD='GF2(64,64)'.
+# Only honoured when protocol == "ppt"; ignored for "bea".
+FIELD="${FIELD:-}"
 
 # PPT's amortised throughput per coin is (round_overhead / batch_size).
 # Empirically the per-round overhead at n=16 is ~3.5 s irrespective of
@@ -87,6 +92,7 @@ echo "DURATION=$DURATION"
 echo "FREQ=$FREQ"
 echo "BATCHES=${BATCHES[*]}"
 echo "RUNS=$RUNS"
+echo "FIELD=${FIELD:-<unset; using default BigUint two-field path>}"
 
 cleanup() {
     pkill -f "$ROOT/target/release/node" 2>/dev/null || true
@@ -144,6 +150,16 @@ run_one_case() {
 
     sleep 2
 
+    # Build the per-node arg list. The GF(2^w) `--field` flag is
+    # appended only when (a) the user requested a profile via the
+    # `FIELD=` env var AND (b) the protocol is `ppt` (the `bea` /
+    # `glow` paths ignore the flag, but we keep them clean).
+    local FIELD_ARGS=()
+    if [ "$protocol" == "ppt" ] && [ -n "$FIELD" ]; then
+        FIELD_ARGS=(--field "$FIELD")
+        echo "[run_benchmark] enabling GF(2^w) profile: $FIELD"
+    fi
+
     local NODE_PIDS=()
     for ((i=0; i<NODE_COUNT; i++)); do
         "$BIN" \
@@ -158,6 +174,7 @@ run_one_case() {
             --syncer "$TESTDIR/syncer" \
             --batch "$BATCH" \
             --frequency "$FREQ" \
+            "${FIELD_ARGS[@]}" \
             > "$LOGDIR/${i}.log" 2>&1 &
         NODE_PIDS+=($!)
     done

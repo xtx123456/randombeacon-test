@@ -366,7 +366,7 @@ impl CTRBCState{
                 replicas.push(batch_wss.origin);
             }
         }
-        BatchWSSReconMsg { origin: 0, secrets: shares_vector, nonces: nonces, origins: replicas, mps: merkle_proofs, mask_shares: Vec::new(), f_large_shares: Vec::new(), empty: false }
+        BatchWSSReconMsg { origin: 0, secrets: shares_vector, nonces: nonces, origins: replicas, mps: merkle_proofs, mask_shares: Vec::new(), f_large_shares: None, empty: false }
     }
 
     fn verify_reconstructed_root(&mut self, sec_origin: Replica, num_nodes: usize,num_faults:usize,_batch_size:usize, shard_map: HashMap<usize,Vec<u8>>,hf:&HashState)-> Option<(Hash,Vec<Hash>)>{

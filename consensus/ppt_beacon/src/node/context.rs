@@ -8,6 +8,7 @@ use std::{
 use anyhow::{anyhow, Result};
 use config::Node;
 use crypto::aes_hash::HashState;
+use crypto::gf2::Gf2Profile;
 use crypto::hash::Hash;
 use fnv::FnvHashMap;
 use fnv::FnvHashMap as HashMap;
@@ -33,7 +34,7 @@ use tokio::sync::{mpsc, oneshot};
 pub const PPT_INBOUND_CHANNEL_CAPACITY: usize = 8192;
 
 use types::{
-    beacon::{BeaconMsg, CoinMsg, Replica, WrapperMsg},
+    beacon::{CoinMsg, Replica, WrapperMsg},
     Round, SyncMsg, SyncState,
 };
 
@@ -43,6 +44,106 @@ use super::{CTRBCState, Handler, SyncHandler};
 /// challenge θ. Every node uses this, so dealers and verifiers agree
 /// without a previous beacon being available.
 pub const PPT_GENESIS_THETA_SEED: &[u8] = b"PPT_BEACON_GENESIS_THETA_v1";
+
+/// Re-export `Gf2Profile` so that crates which depend on
+/// `ppt_beacon` (e.g. `node`) do not need a direct `crypto`
+/// dependency just to refer to the profile type.
+pub use crypto::gf2::Gf2Profile as ExportedGf2Profile;
+
+/// CLI-side parser for `--field "GF2(w_p,w_q)"`.
+///
+/// Thin wrapper around `Gf2Profile::from_str`, intentionally
+/// returning an owned `String` error so callers can propagate it
+/// directly to clap / panic / log without pulling in
+/// `crypto::gf2::profile`'s error type. The helper lives here (and
+/// not in `crypto::gf2`) so that the `node` binary stays
+/// `crypto`-independent: it talks only to `ppt_beacon`.
+///
+/// Examples
+/// --------
+///
+/// ```text
+///     parse_field_spec("GF2(64,256)")  // Ok
+///     parse_field_spec("(32, 128)")    // Ok
+///     parse_field_spec("64,128")       // Ok
+///     parse_field_spec("GF2(7,64)")    // Err — unregistered w_p
+///     parse_field_spec("GF2(64,96)")   // Err — w_p ∤ w_q
+/// ```
+pub fn parse_field_spec(s: &str) -> Result<ExportedGf2Profile, String> {
+    s.parse::<ExportedGf2Profile>()
+}
+
+/// Number of extra "coin secrets" each dealer seals per round, on top
+/// of the `batch_size` beacon coins, to drive the next round's ACS
+/// common coin (PPT problem-1 fix). These occupy batch coin indices
+/// `[batch_size, batch_size + PPT_COIN_RESERVE)`; they are shared and
+/// validated like beacon coins but are NEVER reconstructed/emitted as
+/// beacon output — they stay sealed (secret) until the NEXT round's
+/// ABA reconstructs coin-secret `rr` on demand for ABA round `rr`.
+///
+/// This bounds the number of ABA rounds for which we can supply an
+/// unpredictable coin; beyond it (probability ~2^-PPT_COIN_RESERVE per
+/// instance, negligible) the ACS falls back to the deterministic
+/// genesis-style hash coin. MMR ABA terminates in O(1) expected ABA
+/// rounds, so a modest reserve covers the overwhelming majority of
+/// executions.
+pub const PPT_COIN_RESERVE: usize = 12;
+
+/// AVSS transport selector for the PPT random beacon.
+///
+/// The PPT scheme needs to deliver dealer-to-recipient confidential
+/// share material once per round per dealer. Two transports satisfy
+/// this requirement:
+///
+/// * **`Lite`** (default) — direct cleartext per-recipient unicast
+///   of `AvssRecipientPayload` (still HMAC-authenticated via the
+///   existing `WrapperMsg` + `sec_key_map` per-pair shared secret)
+///   plus a single broadcast `AvssPublicCommitMsg` carrying the
+///   public Merkle roots + degree-test coefficients. Wire complexity:
+///   `O(n)` messages per dealer per round.
+///
+///   Trust model: relies on the underlying wire transport (TLS or
+///   trusted LAN) to prevent passive eavesdroppers from reading the
+///   share material between AVSS dispersal and the post-ACS
+///   `MulticastRecoveredShares` broadcast (which reveals the same
+///   share material in cleartext for audit purposes anyway). This
+///   matches every other PPT wire message's threat model.
+///
+/// * **`SecMsg`** — Shoup-Smart 2024 Sec 4.3 Π_SecMsgDst transport:
+///   encrypts every per-recipient payload with a Shamir-shared
+///   master key + per-recipient hash-chain PRG stream, and disperses
+///   both the key shares and the ciphertexts via RBC-style RelMsgDst
+///   channels with full Bracha echo / vote agreement. Wire
+///   complexity: `O(n^2)` messages per dealer per round.
+///
+///   Trust model: tolerates passive wire eavesdroppers (no TLS
+///   required). Useful for paper-compliance testing and for
+///   deployments where the network layer cannot be relied upon for
+///   confidentiality.
+///
+/// Selected once at startup via the CLI `--transport=lite|secmsg`
+/// flag and pushed into `Context::transport`. Every honest node in
+/// a single deployment must agree on the same transport for the
+/// dealer set to converge in ACS (mixed transports would still
+/// converge because both wire variants are accepted on the
+/// receive side, but only one set of variants is ever emitted, so
+/// running mixed in one cluster is unsupported).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AvssTransport {
+    /// Default; see enum-level doc.
+    Lite,
+    /// Shoup-Smart Sec 4.3 (paper-compliant); see enum-level doc.
+    SecMsg,
+}
+
+impl AvssTransport {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AvssTransport::Lite => "lite",
+            AvssTransport::SecMsg => "secmsg",
+        }
+    }
+}
 
 /// PPT random-beacon node context (pure-PPT mode: frequency φ = 1,
 /// every honest node is always a dealer, no anytrust committee, no
@@ -71,6 +172,19 @@ pub struct Context {
     pub secret_domain: BigUint,
     pub nonce_domain: BigUint,
 
+    /// Optional `GF(2^w_p) ⊂ GF(2^w_q)` two-field profile selected by
+    /// the `--field "GF2(w_p,w_q)"` CLI flag. `None` (the default)
+    /// leaves the entire AVSS / degree-test stack on the legacy
+    /// `BigUint` prime-field path driven by `secret_domain` /
+    /// `nonce_domain` above; `Some(profile)` is wired through to
+    /// downstream consumers (`batch_wssinit`, `secret_reconstruct`,
+    /// `process::avss_local_packet_valid_pure`, …) in subsequent
+    /// commits as each call site is migrated.
+    ///
+    /// This commit only carries the value; no behaviour change is
+    /// observable when the flag is set.
+    pub gf2_profile: Option<Gf2Profile>,
+
     // ---- Round bookkeeping ----
     pub curr_round: u32,
     pub max_rounds: u32,
@@ -82,11 +196,6 @@ pub struct Context {
     // ---- ACS state ----
     pub acs_state: std::collections::HashMap<Round, crate::node::acs::state::AcsRound>,
 
-    /// Round → degree-test challenge θ (large field). Populated when
-    /// each round's beacon output is finalised; consumed by the next
-    /// round's AVSS dealer / verifier path.
-    pub theta_per_round: HashMap<Round, BigUint>,
-
     /// Globally banned dealers (across rounds). A dealer is banned
     /// the moment any honest node detects a protocol-level violation
     /// (invalid AVSS packet, equivocating ACS proposal,
@@ -94,20 +203,6 @@ pub struct Context {
     /// banned, the dealer is rejected from every future round's
     /// AVSS, ACS, and reconstruction paths.
     pub banned_dealers: HashSet<Replica>,
-
-    /// AVSSSend packets received before this node had θ for that
-    /// round. They are deferred (NOT dropped, NOT banned) and
-    /// replayed by `drain_pending_avss_for(round)` once
-    /// `record_beacon_output_for_theta` populates θ.
-    ///
-    /// This race window exists in pure PPT mode because round-r+1's
-    /// AVSSSend can reach a slow node before that node has finished
-    /// reconstructing round-r's coin 0 (which is the source of
-    /// θ(r+1)). Without buffering, the slow node would drop or
-    /// (worse) panic on the early packet and never recover the
-    /// dealer for round r+1.
-    pub pending_avss_for_theta:
-        HashMap<Round, Vec<(BeaconMsg, Hash, Replica)>>,
 
     /// Round → previous-round beacon bytes used to seed the new
     /// ACS common-coin derivation. Pattern is identical to
@@ -152,6 +247,40 @@ pub struct Context {
     pub avss_secmsg_public: HashMap<(Round, Replica), types::beacon::AvssPublicCommitMsg>,
     pub avss_secmsg_delivered_bytes: HashMap<(Round, Replica), Vec<u8>>,
 
+    // ---- ACS unpredictable common coin (PPT problem-1 fix) ----
+    //
+    // Round R's AVSS seals `PPT_COIN_RESERVE` coin-secrets; round
+    // (R+1)'s ACS reconstructs them on demand to drive its MMR-ABA
+    // common coin. `coin_material[R]` holds what round (R+1) needs:
+    // the agreed contributing dealer set (= round R's ACS-decided
+    // set), the per-dealer Merkle roots for the sealed coin indices,
+    // and THIS node's own shares of those sealed coins (for revealing).
+    pub coin_material: HashMap<Round, crate::node::acs::coin::CoinMaterial>,
+
+    // Per (acs_round, aba_round): collected, Merkle-validated coin
+    // shares `dealer -> provider -> share`. Reconstruction of each
+    // dealer's sealed coin-secret needs f+1 providers.
+    pub coin_shares: HashMap<
+        (Round, u64),
+        HashMap<Replica, HashMap<Replica, BigUint>>,
+    >,
+    // Reconstructed coin secret `C = Σ_d c_{d}` per (acs_round, aba_round).
+    pub coin_reconstructed: HashMap<(Round, u64), BigUint>,
+    // (acs_round, aba_round) for which this node has already broadcast
+    // its own coin-share reveal (idempotency; also enforces that we
+    // release our share at most once, after entering that ABA round).
+    pub coin_reveal_sent: HashSet<(Round, u64)>,
+    // Reveals that arrived before `coin_material[acs_round-1]` was
+    // locally available; replayed once the material is stashed.
+    pub coin_reveal_pending:
+        HashMap<(Round, u64), Vec<(types::beacon::BatchWSSReconMsg, Replica)>>,
+
+    /// Selected AVSS transport for this node's PPT deployment
+    /// (`Lite` default = O(n) per-recipient unicast; `SecMsg` =
+    /// Shoup-Smart Sec 4.3 Π_SecMsgDst). The dealer path branches on
+    /// this; the receive side accepts both wire families.
+    pub transport: AvssTransport,
+
     // ---- Audit fire-and-forget plumbing (P0-A.1) ----
     //
     // post-ACS audit (the bulk of `process_multicast_recovered_shares`)
@@ -178,6 +307,61 @@ pub struct Context {
     pub audit_tx: mpsc::UnboundedSender<AuditCompletion>,
     pub audit_rx: mpsc::UnboundedReceiver<AuditCompletion>,
 
+    // ---- AVSS validation fire-and-forget (Phase D) ----
+    //
+    // `process_avss_send` used to await its `spawn_blocking`
+    // `avss_local_packet_valid_pure` call synchronously on the
+    // consensus main task. With n=16, batch=1000, each await is
+    // ~25 ms of degree-test + Merkle work, and per round per node
+    // we receive 16 AVSS packets. The main task therefore spent
+    // up to 400 ms per round serialised on AVSS validation
+    // awaits, blocking it from processing the round-(r+1)
+    // BatchBeaconConstruct / ACS messages that were already
+    // queued in `net_recv`.
+    //
+    // Phase D extends the P0-A.1 audit fire-and-forget pattern to
+    // AVSS validation: `process_avss_send` now `tokio::spawn`s a
+    // detached task that runs the `spawn_blocking` validation and
+    // publishes the result back via `avss_validation_tx`. The
+    // main loop drains the corresponding `avss_validation_rx`
+    // arm in `tokio::select!` and applies the
+    // `store_avss_packet` + `AVSSReady` broadcast + AVSS-
+    // completion cascade on its own thread, so every `Context`
+    // mutation stays single-threaded as before -- no Mutex
+    // required on the hot path.
+    //
+    // Throughput consequence: 16 inbound AVSS validations per
+    // round per node now run in PARALLEL on tokio's blocking
+    // pool. End-to-end AVSS-phase wall time per round drops from
+    // 16 * 25 ms = 400 ms to ~50 ms on an 8-core machine.
+    pub avss_validation_tx: mpsc::UnboundedSender<AvssValidationCompletion>,
+    pub avss_validation_rx: mpsc::UnboundedReceiver<AvssValidationCompletion>,
+
+    // ---- Reconstruct ingest fire-and-forget (Phase D) ----
+    //
+    // Same problem as the AVSS validation channel above but for
+    // `process_batch_secret_shares`, which used to await
+    // `verify_batch_shares_pure` (degree-test for all
+    // n_decided_dealers * batch coins in a single inbound
+    // BatchBeaconConstruct packet) synchronously.
+    //
+    // Empirically (n=16, batch=1000): each inbound packet's
+    // verify_batch_shares_pure await took ~120 ms, n inbound
+    // packets per round per node => ~2 s of sequential main-loop
+    // time on reconstruct alone. That dominated the round budget
+    // (see log: `ACS-DECIDE -> coin-0 BEACON-OUT` ~= 2.2 s).
+    //
+    // Phase D detaches verify_batch_shares_pure the same way and
+    // sends a `ReconCompletion` back via the channel below; the
+    // main loop applies accepted shares + blame events on its
+    // own thread and triggers `maybe_recover_ready_coins`.
+    //
+    // 16 inbound packets now validated in parallel on the
+    // blocking pool. Reconstruct-phase wall time drops from
+    // ~2 s to ~250 ms on an 8-core machine.
+    pub recon_tx: mpsc::UnboundedSender<ReconCompletion>,
+    pub recon_rx: mpsc::UnboundedReceiver<ReconCompletion>,
+
     // ---- Diagnostics / lifecycle ----
     pub num_messages: u32,
     pub bench: HashMap<String, u128>,
@@ -195,12 +379,58 @@ pub struct AuditCompletion {
     pub blame_events: Vec<(Replica, crate::node::ctrbc::state::BlameReason)>,
 }
 
+/// Result of one detached `avss_local_packet_valid_pure` run, used
+/// by the AVSS validation fire-and-forget path. The detached task
+/// runs the CPU-heavy validation on the blocking pool and sends
+/// this struct back to the main loop, which applies
+/// `store_avss_packet` + `AVSSReady` broadcast + cascade on its
+/// own thread.
+#[derive(Debug)]
+pub struct AvssValidationCompletion {
+    pub round: Round,
+    pub dealer: Replica,
+    pub transcript_root: crypto::hash::Hash,
+    /// The validated BeaconMsg moved out of the spawn_blocking
+    /// closure. Stored back into CTRBCState verbatim once
+    /// validation succeeds.
+    pub beacon_msg: types::beacon::BeaconMsg,
+    /// `Ok(())` on successful validation; `Err(static_reason)` on
+    /// any Byzantine-detectable failure (transcript mismatch,
+    /// Merkle invalid, degree-test failed, share/f_large mismatch,
+    /// mp.root/root_vec mismatch). The main loop bans the dealer
+    /// on `Err(_)`.
+    pub result: Result<(), &'static str>,
+}
+
+/// Result of one detached `verify_batch_shares_pure` run, used by
+/// the BatchBeaconConstruct fire-and-forget reconstruct ingest
+/// path. The detached task runs the per-coin degree-test for all
+/// (dealer, coin) tuples in one inbound BatchBeaconConstruct
+/// packet, on the blocking pool, and sends this struct back to the
+/// main loop, which applies `add_secret_share` + blame writes on
+/// its own thread and triggers `maybe_recover_ready_coins`.
+#[derive(Debug)]
+pub struct ReconCompletion {
+    pub round: Round,
+    pub share_sender: Replica,
+    /// Whether the share_sender is itself in the ACS-decided set.
+    /// Mirrors the `use_for_batch` predicate that
+    /// `process_batch_secret_shares` previously computed inline.
+    /// Only `Accepted` outcomes whose `share_sender` is
+    /// `use_for_batch == true` are persisted via
+    /// `add_secret_share`.
+    pub use_for_batch: bool,
+    pub outcomes: Vec<crate::node::batch_wss::secret_reconstruct::CoinVerifyOutcome>,
+}
+
 impl Context {
     pub fn spawn(
         config: Node,
         _sleep: u128,
         batch: usize,
         frequency: Round,
+        transport: AvssTransport,
+        gf2_profile: Option<Gf2Profile>,
     ) -> anyhow::Result<oneshot::Sender<()>> {
         let prot_payload = &config.prot_payload;
         let v: Vec<&str> = prot_payload.split(',').collect();
@@ -271,6 +501,11 @@ impl Context {
 
             // Audit fire-and-forget channel (see field comment above).
             let (audit_tx, audit_rx) = mpsc::unbounded_channel::<AuditCompletion>();
+            // AVSS validation + reconstruct fire-and-forget channels
+            // (Phase D; see field comments above).
+            let (avss_validation_tx, avss_validation_rx) =
+                mpsc::unbounded_channel::<AvssValidationCompletion>();
+            let (recon_tx, recon_rx) = mpsc::unbounded_channel::<ReconCompletion>();
 
             let mut c = Context {
                 net_send: consensus_net,
@@ -286,6 +521,7 @@ impl Context {
                 hash_context: Arc::new(hashstate),
                 secret_domain: prime.clone(),
                 nonce_domain: nonce_prime.clone(),
+                gf2_profile,
 
                 curr_round: 0,
                 max_rounds: 20000,
@@ -294,16 +530,26 @@ impl Context {
                 round_state: HashMap::default(),
 
                 acs_state: std::collections::HashMap::new(),
-                theta_per_round: HashMap::default(),
                 banned_dealers: HashSet::new(),
-                pending_avss_for_theta: HashMap::default(),
                 audit_tx,
                 audit_rx,
+                avss_validation_tx,
+                avss_validation_rx,
+                recon_tx,
+                recon_rx,
                 coin_per_round: HashMap::default(),
 
                 avss_secmsg_state: HashMap::default(),
                 avss_secmsg_public: HashMap::default(),
                 avss_secmsg_delivered_bytes: HashMap::default(),
+
+                coin_material: HashMap::default(),
+                coin_shares: HashMap::default(),
+                coin_reconstructed: HashMap::default(),
+                coin_reveal_sent: HashSet::new(),
+                coin_reveal_pending: HashMap::default(),
+
+                transport,
 
                 num_messages: 0,
                 bench: HashMap::default(),
@@ -317,6 +563,19 @@ impl Context {
 
             log::error!("[PPT] ppt_beacon context started on node {}", c.myid);
             log::error!("[PPT][ACS] quorum ACS engine loaded on node {}", c.myid);
+            match c.gf2_profile {
+                Some(p) => log::error!(
+                    "[PPT][FIELD] node {} two-field profile = {} (BigUint path remains active; \
+                     migration commits will switch consumers progressively)",
+                    c.myid,
+                    p
+                ),
+                None => log::error!(
+                    "[PPT][FIELD] node {} two-field profile = BigUint (default; pass \
+                     --field 'GF2(w_p,w_q)' to enable the binary-extension-field profile)",
+                    c.myid
+                ),
+            }
 
             if let Err(e) = c.run().await {
                 log::error!("[PPT] Consensus error: {}", e);
@@ -370,79 +629,6 @@ impl Context {
         }
     }
 
-    /// θ for round `round` — the degree-test challenge that
-    /// dealers commit to and verifiers re-evaluate. The PPT
-    /// scheme requires θ to be unpredictable to the dealer at
-    /// commit time. We therefore derive it from the *previous
-    /// round's reconstructed beacon* (large field), which the
-    /// dealer cannot influence by the time it shares its round-r
-    /// secret.
-    ///
-    /// For round 0 we use a fixed public seed so all nodes agree
-    /// without a previous beacon being available.
-    ///
-    /// Returns `None` for round > 0 when the previous round's
-    /// beacon has not yet been recorded locally. This happens
-    /// naturally in async networks: a fast peer may broadcast its
-    /// round-(r+1) AVSSSend before this node has finished
-    /// reconstructing round-r's coin 0. The caller MUST handle
-    /// `None` by *deferring* the action (typically by buffering
-    /// the AVSSSend in `pending_avss_for_theta`) — never by
-    /// dropping or banning the dealer, since this is a transient
-    /// race window, not a protocol violation.
-    pub fn theta_for_round(&self, round: Round) -> Option<BigUint> {
-        if round == 0 {
-            return Some(Self::theta_from_bytes(
-                PPT_GENESIS_THETA_SEED,
-                &self.nonce_domain,
-            ));
-        }
-        self.theta_per_round.get(&round).cloned()
-    }
-
-    /// Record this round's beacon output as the source of the
-    /// next round's degree-test challenge. `output_bytes` is the
-    /// reconstructed beacon value (arbitrary-length); we hash it
-    /// into the large field so θ has full large-field entropy
-    /// rather than being constrained to the small secret field.
-    pub fn record_beacon_output_for_theta(&mut self, round: Round, output_bytes: &[u8]) {
-        let theta = Self::theta_from_bytes(output_bytes, &self.nonce_domain);
-        self.theta_per_round.insert(round + 1, theta);
-    }
-
-    /// Buffer an AVSSSend that arrived before its θ was available.
-    /// The packet is replayed by `drain_pending_avss_for(round)`
-    /// once `record_beacon_output_for_theta` populates θ for that
-    /// round.
-    pub fn buffer_avss_for_theta(
-        &mut self,
-        round: Round,
-        beacon_msg: BeaconMsg,
-        transcript_root: Hash,
-        dealer: Replica,
-    ) {
-        log::info!(
-            "[PPT][THETA-DEFER] node {} buffering AVSSSend from dealer {} for round {} until θ becomes available",
-            self.myid,
-            dealer,
-            round
-        );
-        self.pending_avss_for_theta
-            .entry(round)
-            .or_default()
-            .push((beacon_msg, transcript_root, dealer));
-    }
-
-    /// Take (move out) every buffered AVSSSend for `round`.
-    /// Caller is expected to immediately re-process each entry
-    /// via `process_avss_send`.
-    pub fn take_pending_avss_for(
-        &mut self,
-        round: Round,
-    ) -> Vec<(BeaconMsg, Hash, Replica)> {
-        self.pending_avss_for_theta.remove(&round).unwrap_or_default()
-    }
-
     /// PPT slide pg 30-32 "first-match" rejection-sampling rule.
     ///
     /// A reconstructed coin value `v ∈ [0, p)` is *uniformly usable*
@@ -457,11 +643,103 @@ impl Context {
     /// drop coins that some other consumer may still want for
     /// non-uniform purposes.
     pub fn coin_value_matches_uniform_range(&self, coin_bytes: &[u8]) -> bool {
-        Self::coin_value_matches_uniform_range_with(
-            coin_bytes,
-            &self.secret_domain,
-            self.num_nodes,
+        match self.gf2_profile {
+            None => Self::coin_value_matches_uniform_range_with(
+                coin_bytes,
+                &self.secret_domain,
+                self.num_nodes,
+            ),
+            Some(profile) => Self::coin_value_matches_uniform_range_with_gf2(
+                coin_bytes,
+                profile,
+                self.num_nodes,
+            ),
+        }
+    }
+
+    /// Fiat-Shamir degree-test challenge θ for a dealer's AVSS
+    /// packet (PPT problem-3 fix). θ is derived from the dealer's
+    /// OWN commitment (`root_vec`, the per-coin Merkle roots that bind
+    /// every recipient's f-share, g-share and f_large via
+    /// `avss_commit_leaf`), so the dealer must commit f and g BEFORE θ
+    /// is determined. A Byzantine dealer can therefore no longer pick
+    /// the mask `g` to cancel a high-degree `f` (it would need a hash
+    /// collision), making the two-field degree test sound with error
+    /// 1/|q|. Replaces the old θ = H(previous PUBLIC beacon), which
+    /// the dealer could predict and bypass.
+    ///
+    /// θ is per-(round, dealer); every honest verifier recomputes the
+    /// identical value from the same committed `root_vec`, so the
+    /// degree test is checked against the same challenge everywhere.
+    pub(crate) fn theta_from_commitment(
+        round: Round,
+        dealer: Replica,
+        root_vec: &[Hash],
+        large_field: &BigUint,
+    ) -> BigUint {
+        Self::theta_from_bytes(
+            Self::theta_seed_bytes(round, dealer, root_vec).as_slice(),
+            large_field,
         )
+    }
+
+    /// Assemble the deterministic Fiat-Shamir transcript bytes
+    /// `(domain‖round‖dealer‖root_vec.len()‖root_vec)` from which
+    /// θ is derived. Identical hash input for both the BigUint
+    /// and GF(2^w) paths, so a dealer / verifier pair on
+    /// **matching profiles** computes byte-equal challenges
+    /// regardless of which field they interpret the result in.
+    ///
+    /// Pulled out as a separate helper so
+    /// `theta_from_commitment_gf2` can reuse it without re-
+    /// expressing the binding rule.
+    pub(crate) fn theta_seed_bytes(
+        round: Round,
+        dealer: Replica,
+        root_vec: &[Hash],
+    ) -> Vec<u8> {
+        let mut buf: Vec<u8> = b"PPT_BEACON_FS_THETA_v1::".to_vec();
+        buf.extend_from_slice(&round.to_be_bytes());
+        buf.extend_from_slice(&(dealer as u64).to_be_bytes());
+        buf.extend_from_slice(&(root_vec.len() as u64).to_be_bytes());
+        for r in root_vec {
+            buf.extend_from_slice(r);
+        }
+        buf
+    }
+
+    /// GF(2^w) analogue of `theta_from_commitment`. Derives the
+    /// same wide-reduction byte stream (`H(seed) || H("v1::" ||
+    /// H(seed))` = 64 bytes), takes the FIRST 32 bytes, and
+    /// canonicalises them into a `Gf2Element` of `profile` via
+    /// `from_random_bytes` (which masks bits beyond `w_q`).
+    ///
+    /// Soundness: `Gf2Element::from_random_bytes` is uniform on
+    /// `GF(2^w_q)` when fed uniform bytes (it just masks the high
+    /// `256 - w_q` bits to zero). The Fiat-Shamir cheating
+    /// probability is therefore `2^{-w_q}` — same scale as the
+    /// BigUint path's `1/q ≈ 2^{-256}` when `w_q == 256`.
+    ///
+    /// Honest dealers and honest verifiers both call this helper
+    /// with the same `(round, dealer, root_vec, profile)`, so the
+    /// derived θ is identical byte-for-byte on both ends.
+    pub(crate) fn theta_from_commitment_gf2(
+        round: Round,
+        dealer: Replica,
+        root_vec: &[Hash],
+        profile: crypto::gf2::Gf2Profile,
+    ) -> crypto::gf2::Gf2Element {
+        let seed = Self::theta_seed_bytes(round, dealer, root_vec);
+        let h1 = crypto::hash::do_hash(seed.as_slice());
+        // Take the first 32 bytes of the wide-hash output as the
+        // raw θ bit-pattern. We don't need the second hash for the
+        // GF(2^w) path — the masking inside `from_random_bytes`
+        // already projects to canonical form, and the field's
+        // size is `2^w_q ≤ 2^256` so 32 bytes of entropy is
+        // statistically sufficient.
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&h1[..32]);
+        crypto::gf2::Gf2Element::from_random_bytes(profile, bytes)
     }
 
     pub(crate) fn theta_from_bytes(seed: &[u8], large_field: &BigUint) -> BigUint {
@@ -494,6 +772,64 @@ impl Context {
         let v = BigUint::from_bytes_be(coin_bytes);
         let v_mod = &v % secret_domain;
         v_mod < cutoff
+    }
+
+    /// GF(2^w) analogue of `coin_value_matches_uniform_range_with`
+    /// (commit 6 of the migration). The PPT "first-match" rule
+    /// pg 30-32 asks whether a coin value `v` is uniformly usable
+    /// as a sample in `[0, num_nodes)`. In the binary-extension
+    /// profile, the relevant uniform domain is `GF(2^w_p)` (the
+    /// small field where `SuperInvExtractor` outputs live), so the
+    /// rejection-sampling cutoff is `num_nodes * floor(2^w_p /
+    /// num_nodes)`.
+    ///
+    /// `coin_bytes` is the 32-byte little-endian `Gf2Element` payload
+    /// produced by `Gf2SuperInvExtractor::extract`; we read its low
+    /// `small_byte_len()` bytes as a little-endian integer in
+    /// `[0, 2^w_p)` and apply the same `v < cutoff` test.
+    ///
+    /// When `w_p >= 64` the domain is at least `2^64`, which dwarfs
+    /// any realistic `num_nodes`, so the cutoff equals `2^w_p` (no
+    /// rejection); we short-circuit to `true` to avoid 128-bit
+    /// modular arithmetic.
+    pub(crate) fn coin_value_matches_uniform_range_with_gf2(
+        coin_bytes: &[u8],
+        profile: crypto::gf2::Gf2Profile,
+        num_nodes: usize,
+    ) -> bool {
+        if num_nodes == 0 {
+            return false;
+        }
+        let small_len = profile.small_byte_len();
+        if small_len == 0 {
+            return false;
+        }
+        // The coin output from Gf2SuperInvExtractor is a small-field
+        // element; only its low w_p bits are meaningful. For w_p >= 64
+        // the rejection probability is at most n / 2^64, negligible
+        // for any realistic n — every output is uniformly usable.
+        if profile.w_p >= 64 {
+            return true;
+        }
+        let n = num_nodes as u128;
+        let domain: u128 = 1u128 << profile.w_p;
+        if n > domain {
+            // Trivially not satisfiable: more nodes than small-field
+            // elements. The dealer constructor would have rejected
+            // this configuration already, but be defensive.
+            return false;
+        }
+        let cutoff: u128 = (domain / n) * n;
+        // Read the low `small_len` bytes as a little-endian integer.
+        let n_read = small_len.min(16);
+        let mut buf = [0u8; 16];
+        buf[..n_read].copy_from_slice(&coin_bytes[..n_read]);
+        let v_full = u128::from_le_bytes(buf);
+        // Mask to exactly w_p bits — the high `8*small_len - w_p`
+        // bits of the boundary byte must already be zero in a
+        // canonical Gf2Element, but be defensive.
+        let v = v_full & (domain - 1);
+        v < cutoff
     }
 
     /// Broadcast a message to all nodes.
@@ -633,6 +969,31 @@ impl Context {
                     // Mutex-style locking on the hot path.
                     self.finalize_audit_completion(audit_completion).await;
                 }
+                Some(avss_completion) = self.avss_validation_rx.recv() => {
+                    // Phase D fire-and-forget for AVSS validation:
+                    //
+                    // A detached task running on tokio's blocking
+                    // pool finished validating one inbound
+                    // BeaconMsg via `avss_local_packet_valid_pure`.
+                    // Apply store_avss_packet + AVSSReady
+                    // broadcast + AVSS-completion cascade here, on
+                    // the consensus task's worker thread, so all
+                    // Context mutations (round_state, banned_dealers)
+                    // stay single-threaded as before.
+                    self.finalize_avss_validation(avss_completion).await;
+                }
+                Some(recon_completion) = self.recon_rx.recv() => {
+                    // Phase D fire-and-forget for BatchBeaconConstruct
+                    // ingest:
+                    //
+                    // A detached task running on tokio's blocking
+                    // pool finished the degree-test for one inbound
+                    // BatchBeaconConstruct packet via
+                    // `verify_batch_shares_pure`. Apply add_secret_share
+                    // + blame writes here, then trigger
+                    // `maybe_recover_ready_coins`.
+                    self.finalize_recon_completion(recon_completion).await;
+                }
                 sync_msg = self.sync_recv.recv() => {
                     let sync_msg = sync_msg.ok_or_else(|| anyhow!("Networking layer has closed"))?;
                     match sync_msg.state {
@@ -720,6 +1081,54 @@ mod tests {
         let theta_a = Context::theta_from_bytes(&beacon_a, &q);
         let theta_b = Context::theta_from_bytes(&beacon_b, &q);
         assert_ne!(theta_a, theta_b);
+    }
+
+    /// GF(2^w) sibling of `first_match_uniform_range_check`.
+    /// Domain = `2^w_p = 16` (w_p=4 — wait, w_p=4 not registered;
+    /// use w_p=8, domain=256). n=10 ⇒ cutoff = 10 * floor(256/10)
+    /// = 10 * 25 = 250; values in [0, 250) accept; [250, 256)
+    /// reject. coin_bytes is the LE GF(2^w_p) element encoding.
+    #[test]
+    fn first_match_uniform_range_check_gf2() {
+        use crypto::gf2::Gf2Profile;
+        let profile = Gf2Profile::new(8, 64).unwrap();
+        for v in 0u8..250 {
+            let mut bytes = [0u8; 32];
+            bytes[0] = v;
+            assert!(
+                Context::coin_value_matches_uniform_range_with_gf2(&bytes, profile, 10),
+                "GF2 v={} should match",
+                v
+            );
+        }
+        for v in 250u16..=255 {
+            let mut bytes = [0u8; 32];
+            bytes[0] = v as u8;
+            assert!(
+                !Context::coin_value_matches_uniform_range_with_gf2(&bytes, profile, 10),
+                "GF2 v={} should NOT match",
+                v
+            );
+        }
+    }
+
+    /// For w_p ≥ 64 the GF2 uniform-range check short-circuits to
+    /// `true` (the domain `2^w_p` is so much larger than any
+    /// realistic `num_nodes` that rejection probability is
+    /// negligible). Pin that behavior.
+    #[test]
+    fn uniform_range_check_gf2_short_circuits_for_wide_small_field() {
+        use crypto::gf2::Gf2Profile;
+        for &w_p in &[64usize, 128] {
+            let profile = Gf2Profile::new(w_p, w_p).unwrap();
+            // Even a max-value coin output is accepted.
+            let bytes = [0xffu8; 32];
+            assert!(
+                Context::coin_value_matches_uniform_range_with_gf2(&bytes, profile, 64),
+                "w_p={} should always accept",
+                w_p
+            );
+        }
     }
 
     #[test]

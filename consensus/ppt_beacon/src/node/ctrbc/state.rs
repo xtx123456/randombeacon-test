@@ -28,7 +28,8 @@ use types::{
     Replica,
 };
 
-use crate::node::shamir::two_field::BatchExtractor;
+use crate::node::shamir::gf2_two_field::Gf2SuperInvExtractor;
+use crate::node::shamir::two_field::{BatchExtractor, SuperInvExtractor};
 
 /// Post-ACS accountability evidence: who is being blamed, in which
 /// round, and why. The driver in `Context::ban_dealer_global` is the
@@ -127,11 +128,37 @@ pub struct CTRBCState {
     /// Lagrange-coefficient cache for the immutable ACS-decided
     /// evaluation points. Populated by `finalize_acs_round`.
     pub batch_extractor: Option<BatchExtractor>,
+    /// Super-invertible (hyper-invertible) randomness-extraction
+    /// matrix for the immutable ACS-decided set. Built once per round
+    /// by `finalize_acs_round` over `alpha = sorted(decided)+1` with
+    /// `num_outputs = |decided| - f`. Used by `coin_check` to extract
+    /// `|decided| - f` independent beacon values per coin column,
+    /// replacing the degenerate all-ones sum.
+    pub super_inv_extractor: Option<SuperInvExtractor>,
+    /// GF(2^w) sibling of `super_inv_extractor`. Populated by
+    /// `finalize_acs_round` instead of the BigUint variant when the
+    /// Context carries `gf2_profile = Some(_)`. `coin_check`
+    /// dispatches on which of the two `Option`s is `Some`.
+    pub gf2_super_inv_extractor: Option<Gf2SuperInvExtractor>,
     /// Immutable ACS decision used as the reconstruction basis.
     pub acs_decided_set: Option<Vec<Replica>>,
     /// `BeaconConstruct` packets that arrived before ACS finalised;
     /// replayed once `finalize_acs_round` runs.
     pub pre_acs_beacon_constructs: Vec<(BatchWSSReconMsg, Replica, usize)>,
+
+    /// Reconstruction coin-packets `(packet, provider, coin)` that
+    /// could not yet be Merkle-validated because at least one
+    /// ACS-decided dealer's committed root vector (`comm_vectors`)
+    /// was not locally available when the packet arrived. This is a
+    /// transient async condition: the dealer's AVSS packet is
+    /// guaranteed to eventually arrive at every honest node by AVSS
+    /// totality (a decided dealer completed at >= n-f nodes). We
+    /// therefore buffer rather than drop, and replay from
+    /// `maybe_recover_ready_coins` once the missing commitment lands.
+    /// Without this buffer a share that raced ahead of its dealer's
+    /// AVSS commitment would be lost forever, potentially stalling
+    /// reconstruction even though enough honest providers responded.
+    pub pending_recon_shares: Vec<(BatchWSSReconMsg, Replica, usize)>,
 
     // ---- Post-ACS audit / accountability ----
     pub post_complaint_packets: HashMap<
@@ -151,9 +178,12 @@ pub struct CTRBCState {
     /// Coins whose beacon output has already been emitted upstream.
     pub emitted_beacon_coins: HashSet<usize, nohash_hasher::BuildNoHashHasher<usize>>,
     /// Beacon outputs computed by batch recovery, held until the
-    /// post-complaint audit is allowed to release them.
+    /// post-complaint audit is allowed to release them. Each coin
+    /// column now yields a VECTOR of `|decided| - f` extracted values
+    /// (super-invertible extraction), so the map value is a
+    /// `Vec<Vec<u8>>` indexed by sub-output.
     pub pending_beacon_outputs:
-        HashMap<usize, Vec<u8>, nohash_hasher::BuildNoHashHasher<usize>>,
+        HashMap<usize, Vec<Vec<u8>>, nohash_hasher::BuildNoHashHasher<usize>>,
 
     // ---- Round bootstrap flags ----
     /// Pure-PPT mode dealer-launch idempotency flag.
@@ -190,8 +220,11 @@ impl CTRBCState {
             recon_secrets: HashSet::default(),
 
             batch_extractor: None,
+            super_inv_extractor: None,
+            gf2_super_inv_extractor: None,
             acs_decided_set: None,
             pre_acs_beacon_constructs: Vec::new(),
+            pending_recon_shares: Vec::new(),
 
             post_complaint_packets: HashMap::default(),
             recovered_shares_multicast_sent: false,
@@ -339,7 +372,16 @@ impl CTRBCState {
         let mut nonces = Vec::new();
         let mut merkle_proofs = Vec::new();
         let mut mask_shares = Vec::new();
-        let mut f_large_shares = Vec::new();
+        // GF(2^w) wire-format compaction (commit 7): `f_large_shares`
+        // is `None` in GF(2^w) mode — `store_avss_packet` never
+        // populates `self.f_large_shares` for a GF2 dealer (the
+        // incoming BeaconMsg's `f_large_shares` is `None`), so the
+        // map lookup below would always miss in GF2 mode. We detect
+        // the mode via `self.gf2_super_inv_extractor.is_some()` (set
+        // by `finalize_acs_round` based on `ctx.gf2_profile`) and
+        // emit `None` rather than a partial Vec.
+        let in_gf2_mode = self.gf2_super_inv_extractor.is_some();
+        let mut f_large_shares_vec: Vec<types::beacon::Val> = Vec::new();
 
         let decided = self.acs_decided_set.clone().unwrap_or_default();
         for rep in decided.into_iter() {
@@ -363,20 +405,23 @@ impl CTRBCState {
                 Some(mask) => mask,
                 None => continue,
             };
-            let f_large = match self
-                .f_large_shares
-                .get(&rep)
-                .and_then(|v| v.get(coin_number))
-            {
-                Some(f_large) => f_large,
-                None => continue,
+            // BigUint mode requires f_large; GF2 mode skips the lookup.
+            let f_large_opt = if in_gf2_mode {
+                None
+            } else {
+                match self.f_large_shares.get(&rep).and_then(|v| v.get(coin_number)) {
+                    Some(fl) => Some(*fl),
+                    None => continue,
+                }
             };
 
             shares_vector.push(*secret);
             nonces.push(*nonce);
             merkle_proofs.push(merkle_proof.clone());
             mask_shares.push(*mask);
-            f_large_shares.push(*f_large);
+            if let Some(fl) = f_large_opt {
+                f_large_shares_vec.push(fl);
+            }
             replicas.push(rep);
         }
         BatchWSSReconMsg {
@@ -386,23 +431,34 @@ impl CTRBCState {
             origins: replicas,
             mps: merkle_proofs,
             mask_shares,
-            f_large_shares,
+            f_large_shares: if in_gf2_mode { None } else { Some(f_large_shares_vec) },
             empty: false,
         }
     }
 
-    /// Pure-PPT beacon extraction: once every ACS-decided dealer has
-    /// been reconstructed for `coin_number`, sum their secrets modulo
-    /// the secret domain to derive the beacon value.
+    /// PPT batch randomness extraction (slides 8-10): once every
+    /// ACS-decided dealer has been reconstructed for `coin_number`,
+    /// apply the super-invertible (hyper-invertible) matrix to the
+    /// vector of decided dealers' secrets to extract
+    /// `|decided| - f` independent beacon values for this coin column.
+    ///
+    /// This replaces the previous degenerate all-ones sum (which
+    /// produced a single value per coin). The all-ones sum is the
+    /// `m'=1` special case of this extractor; using the full
+    /// `(m-f) × m` super-invertible matrix yields `m-f` independent
+    /// uniform outputs per column, tolerating up to `f` adversarial
+    /// dealer contributions — the extraction-rate the PPT design
+    /// targets.
     ///
     /// Returns `None` if reconstruction is not yet complete for the
-    /// coin or if the ACS-decided set has not been published.
+    /// coin, if the ACS-decided set has not been published, or if the
+    /// super-invertible extractor has not been built.
     pub async fn coin_check(
         &mut self,
         round: Round,
         coin_number: usize,
         _num_nodes: usize,
-    ) -> Option<Vec<u8>> {
+    ) -> Option<Vec<Vec<u8>>> {
         let decided = match self.acs_decided_set.clone() {
             Some(v) if !v.is_empty() => v,
             _ => {
@@ -439,36 +495,107 @@ impl CTRBCState {
             }
         }
 
-        let mut sum_vars = BigUint::from(0u32);
+        // Build the input column in the SAME order as the extractor's
+        // alpha points (sorted decided dealers). Two field paths
+        // (commit 6 of the GF(2^w) migration): the `super_inv_extractor`
+        // and `gf2_super_inv_extractor` `Option`s are mutually
+        // exclusive — populated by `finalize_acs_round` based on
+        // `Context::gf2_profile`. `coin_check` dispatches on which
+        // is `Some`.
         let mut decided_sorted = decided.clone();
         decided_sorted.sort_unstable();
 
-        for dealer in decided_sorted.iter().copied() {
-            let sec = recon_map.get(&dealer).unwrap();
-            log::info!(
-                "[PPT][COIN-CHECK] round {} coin {} including dealer {} reconstructed secret {}",
-                round,
-                coin_number,
-                dealer,
-                sec
-            );
-            sum_vars += sec.clone();
-        }
-
-        let rand_fin = sum_vars % self.secret_domain.clone();
-
-        log::info!(
-            "[PPT][COIN-CHECK] round {} coin {} pure-PPT beacon value computed (mod p)",
-            round,
-            coin_number
-        );
+        let outputs: Vec<Vec<u8>> = match (
+            self.super_inv_extractor.as_ref(),
+            self.gf2_super_inv_extractor.as_ref(),
+        ) {
+            (Some(extractor), None) => {
+                // BigUint path: inputs reduced mod p; outputs are
+                // BigUint converted to big-endian variable-length
+                // byte vecs.
+                let inputs: Vec<BigUint> = decided_sorted
+                    .iter()
+                    .map(|dealer| {
+                        recon_map.get(dealer).unwrap().clone() % self.secret_domain.clone()
+                    })
+                    .collect();
+                let extracted = extractor.extract(&inputs);
+                log::debug!(
+                    "[PPT][COIN-CHECK] round {} coin {} super-invertible extraction produced \
+                     {} beacon value(s) from {} decided dealers (BigUint)",
+                    round,
+                    coin_number,
+                    extracted.len(),
+                    decided_sorted.len()
+                );
+                extracted.iter().map(BigUint::to_bytes_be).collect()
+            }
+            (None, Some(extractor)) => {
+                // GF(2^w) path. Each stored BigUint is a typed
+                // envelope around 32 GF2 element bytes; reconstruct
+                // the element via `Context::pad_shares` (round-trip
+                // lossless for [u8;32]; see commit 5's
+                // `share_bytes_roundtrip_through_biguint_envelope`
+                // test). Outputs are returned as little-endian Gf2
+                // element bytes — same shape (`Vec<u8>`) as the
+                // BigUint path, semantically interpretable by
+                // anyone holding the matching `Gf2Profile`.
+                use crypto::gf2::Gf2Element;
+                let profile = extractor.profile;
+                let mut inputs: Vec<Gf2Element> = Vec::with_capacity(decided_sorted.len());
+                for dealer in decided_sorted.iter() {
+                    let big = recon_map.get(dealer).unwrap().clone();
+                    let bytes = crate::node::Context::pad_shares(big);
+                    match Gf2Element::from_bytes(profile, bytes) {
+                        Ok(elem) => inputs.push(elem),
+                        Err(_) => {
+                            log::error!(
+                                "[PPT][COIN-CHECK] round {} coin {} GF2 dealer {}'s recovered \
+                                 secret has dirty bits beyond w_q; aborting extraction \
+                                 (this should never happen post-Lagrange)",
+                                round, coin_number, dealer
+                            );
+                            return None;
+                        }
+                    }
+                }
+                let extracted = extractor.extract(&inputs);
+                log::debug!(
+                    "[PPT][COIN-CHECK] round {} coin {} super-invertible extraction produced \
+                     {} beacon value(s) from {} decided dealers (GF2 {})",
+                    round,
+                    coin_number,
+                    extracted.len(),
+                    decided_sorted.len(),
+                    profile
+                );
+                extracted.iter().map(|e| e.as_bytes().to_vec()).collect()
+            }
+            (Some(_), Some(_)) => {
+                log::error!(
+                    "[PPT][COIN-CHECK] round {} coin {} skipped: BOTH BigUint and GF2 \
+                     extractors set (programmer bug — finalize_acs_round must populate \
+                     exactly one based on the profile)",
+                    round, coin_number
+                );
+                return None;
+            }
+            (None, None) => {
+                log::error!(
+                    "[PPT][COIN-CHECK] round {} coin {} skipped: super-invertible extractor not built",
+                    round,
+                    coin_number
+                );
+                return None;
+            }
+        };
 
         // Mark and clean up this coin's transient recovery state.
         self.recon_secrets.insert(coin_number);
         self.secret_shares.remove(&coin_number);
         self.reconstructed_secrets.remove(&coin_number);
 
-        Some(BigUint::to_bytes_be(&rand_fin))
+        Some(outputs)
     }
 
     /// Wipe transient state when the round is fully finished (every
@@ -495,8 +622,11 @@ impl CTRBCState {
         self.recon_secrets.clear();
 
         self.batch_extractor = None;
+        self.super_inv_extractor = None;
+        self.gf2_super_inv_extractor = None;
         self.acs_decided_set = None;
         self.pre_acs_beacon_constructs.clear();
+        self.pending_recon_shares.clear();
 
         self.post_complaint_packets.clear();
         self.recovered_shares_multicast_sent = false;
