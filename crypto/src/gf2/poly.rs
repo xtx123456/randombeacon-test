@@ -187,16 +187,91 @@ pub fn gf_sqr(a: u128, w: usize, m_low_bits: u128) -> u128 {
     }
 }
 
-/// Compute `a^{-1}` in GF(2^w) via the extended Euclidean algorithm
-/// over `F_2[x]`. Returns `0` if `a == 0` (caller-checked).
+/// Compute `a^{-1}` in GF(2^w).
 ///
-/// The implementation uses the classical EEA on polynomials encoded as
-/// `u128` bit strings, with `m(x) = x^w + m_low_bits` as the modulus.
-/// Cost: O(w) inner iterations, ~constant time at each step. Adequate
-/// for `w ≤ 128`; production code may eventually swap in Itoh–Tsujii
-/// based on Fermat's little theorem (a^(2^w − 2) = a^{−1}) when the
-/// CLMUL hardware path lands.
+/// Dispatches between two algorithmically distinct implementations
+/// both producing the identical result (verified by
+/// `itoh_tsujii_matches_eea_across_widths`). The current default is
+/// the **EEA** path: with the SOFTWARE CLMUL backend used today,
+/// every `gf_mul` / `gf_sqr` is `O(w²)` bit-shift work, so
+/// Itoh-Tsujii's `w − 1` squarings + `O(log w)` muls (total
+/// `O(w³)` software bit ops) is empirically `5×–28×` slower than
+/// EEA's single `O(w²)` shift-XOR loop on `w ≥ 64`. See the
+/// `two_field_bench` row "lagrange" for `GF2(64,64)` and
+/// `GF2(128,128)` for hard numbers.
+///
+/// The Itoh-Tsujii implementation is kept as
+/// `gf_inv_itoh_tsujii` because once a future commit lands the
+/// hardware CLMUL backend (`pclmulqdq` / `pmull`, single-cycle
+/// per `gf_mul`), the multiplication-count advantage flips and
+/// Itoh-Tsujii becomes the faster choice. At that point this
+/// dispatcher can be swapped to `gf_inv_itoh_tsujii` (or
+/// branch on `cfg!(target_feature = "pclmulqdq")`) without
+/// touching any caller.
+#[inline]
 pub fn gf_inv(a: u128, w: usize, m_low_bits: u128) -> u128 {
+    gf_inv_eea(a, w, m_low_bits)
+}
+
+/// Itoh-Tsujii inversion (Fermat's little theorem):
+/// `a^{2^w - 1} = 1` for any nonzero `a ∈ GF(2^w)`, so
+/// `a^{-1} = a^{2^w - 2}`.
+///
+/// We compute `a^{2^(w-1) - 1}` via the standard binary
+/// addition chain on `w - 1`:
+///
+/// ```text
+///     "double":    a^{2^(2k) - 1}  = a^{2^k - 1} * (a^{2^k - 1})^{2^k}
+///     "increment": a^{2^(k+1) - 1} = (a^{2^k - 1})^2 * a
+/// ```
+///
+/// then square once for `a^{2^w - 2}`. Cost: `w - 1` squarings +
+/// `O(log w)` general multiplications.
+///
+/// For `w == 1`: `GF(2^1) = F_2`, the only nonzero element is `1`
+/// whose inverse is itself.
+pub fn gf_inv_itoh_tsujii(a: u128, w: usize, m_low_bits: u128) -> u128 {
+    debug_assert!(w >= 1 && w <= 128);
+    if a == 0 {
+        return 0;
+    }
+    if w == 1 {
+        return a & 1;
+    }
+    let target = w - 1;
+    let msb_pos = (usize::BITS - 1 - target.leading_zeros()) as usize;
+    let mut acc = a; // a^(2^1 - 1) = a^1 = a
+    let mut k: usize = 1;
+    for i in (0..msb_pos).rev() {
+        // Double: acc = acc * acc^(2^k)  →  a^(2^(2k) - 1)
+        let mut squared_acc = acc;
+        for _ in 0..k {
+            squared_acc = gf_sqr(squared_acc, w, m_low_bits);
+        }
+        acc = gf_mul(acc, squared_acc, w, m_low_bits);
+        k *= 2;
+        // Increment if bit i of `target` is set:
+        //   acc = acc^2 * a  →  a^(2^(k+1) - 1)
+        if (target >> i) & 1 == 1 {
+            acc = gf_sqr(acc, w, m_low_bits);
+            acc = gf_mul(acc, a, w, m_low_bits);
+            k += 1;
+        }
+    }
+    debug_assert_eq!(k, target);
+    // acc = a^(2^(w-1) - 1); square once for a^(2^w - 2) = a^{-1}.
+    gf_sqr(acc, w, m_low_bits)
+}
+
+/// Extended Euclidean algorithm inversion over `F_2[x]` modulo
+/// `m(x) = x^w + m_low_bits`. Retained as `gf_inv_eea` so that
+/// `itoh_tsujii_matches_eea` can pin down algorithmic parity, and so
+/// downstream code can A/B-test the two paths on a target deployment
+/// (`gf_inv_itoh_tsujii` wins on hardware-CLMUL platforms; software
+/// CLMUL can favour either depending on `w`).
+///
+/// Returns `0` if `a == 0` (caller-checked).
+pub fn gf_inv_eea(a: u128, w: usize, m_low_bits: u128) -> u128 {
     debug_assert!(w >= 1 && w <= 128);
     if a == 0 {
         return 0;
@@ -418,6 +493,52 @@ mod tests {
         assert_eq!(hi & 1, 1, "expected x^128 bit in hi");
         let red = reduce_polynomial(lo, hi, 128, m_low);
         assert_eq!(red, m_low);
+    }
+
+    /// `gf_inv_itoh_tsujii` and `gf_inv_eea` MUST agree on every
+    /// nonzero input across every registered width. Pins the
+    /// algorithmic equivalence (both compute `a^{-1}`) so future
+    /// refactors of either path can't silently drift.
+    #[test]
+    fn itoh_tsujii_matches_eea_across_widths() {
+        // (w, m_low_bits) test matrix mirroring `profile::base_irreducible`.
+        for &(w, m_low) in &[
+            (8usize, 0x1bu128),
+            (16, (1 << 5) | (1 << 3) | (1 << 2) | 1),
+            (32, (1 << 7) | (1 << 3) | (1 << 2) | 1),
+            (64, (1 << 4) | (1 << 3) | (1 << 1) | 1),
+            (128, (1 << 7) | (1 << 2) | (1 << 1) | 1),
+        ] {
+            // Sample a range of inputs: low values, high values, mid.
+            let mask = if w == 128 { u128::MAX } else { (1u128 << w) - 1 };
+            let probes: Vec<u128> = vec![
+                1,
+                2,
+                3,
+                17,
+                0xdead_beef & mask,
+                0x1234_5678_9abc_def0 & mask,
+                (1u128 << (w - 1)) & mask,
+                mask,            // all ones in the field
+                mask ^ 1,        // mask minus one
+                mask >> 1,       // ~half max
+            ];
+            for &a in &probes {
+                if a == 0 {
+                    continue;
+                }
+                let inv_it = gf_inv_itoh_tsujii(a, w, m_low);
+                let inv_ee = gf_inv_eea(a, w, m_low);
+                assert_eq!(
+                    inv_it, inv_ee,
+                    "Itoh-Tsujii vs EEA divergence at w={} a={:#x}: it={:#x} ee={:#x}",
+                    w, a, inv_it, inv_ee
+                );
+                // And both must actually be the field inverse.
+                let one = gf_mul(a, inv_it, w, m_low);
+                assert_eq!(one, 1, "a · a^-1 ≠ 1 at w={} a={:#x}", w, a);
+            }
+        }
     }
 
     #[test]

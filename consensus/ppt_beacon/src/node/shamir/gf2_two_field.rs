@@ -73,6 +73,16 @@ pub struct Gf2TwoFieldDealer {
     pub profile: Gf2Profile,
     pub threshold: usize,
     pub share_amount: usize,
+    /// Cached `(w_p, w_p)` profile for the **small-field-only**
+    /// arithmetic path (commit 8b). Used by `sample_shares` to run
+    /// the f-polynomial Horner evaluation in `GF(2^w_p)` instead of
+    /// the larger tower, skipping `tower_depth` levels of Karatsuba
+    /// recursion per multiplication. Subfield closure guarantees the
+    /// result lies in the same small-field image bytes whether we
+    /// compute in `(w_p, w_p)` or `(w_p, w_q)`, so this is purely a
+    /// performance optimisation — no observable correctness or wire
+    /// format change.
+    small_profile: Gf2Profile,
 }
 
 /// Full set of per-recipient shares plus the public degree-test
@@ -144,10 +154,16 @@ impl Gf2TwoFieldDealer {
                 share_amount, max, profile.w_p, needed_bits
             ));
         }
+        // Cached small-field-only profile for the 8b fast path. Always
+        // valid when `profile` itself is valid (registry covers all
+        // `w` ≥ 1).
+        let small_profile = Gf2Profile::new(profile.w_p, profile.w_p)
+            .expect("(w_p, w_p) is always a valid registered profile");
         Ok(Self {
             profile,
             threshold,
             share_amount,
+            small_profile,
         })
     }
 
@@ -198,22 +214,44 @@ impl Gf2TwoFieldDealer {
             g_poly.push(random_large_field(self.profile, &mut rng));
         }
 
-        // f(i) for i = 1..=n. Computed in GF(2^w_q) on small-field
-        // image inputs; by subfield closure the output stays in the
-        // image. We expose two API-equivalent views.
+        // f(i) for i = 1..=n. **Commit 8b fast path**: instead of
+        // evaluating f in the large field `(w_p, w_q)` and relying on
+        // subfield closure to keep the result in the image, we
+        // re-type f's coefficients into `(w_p, w_p)` (depth-0 tower)
+        // and run Horner there. Each multiplication then bottoms out
+        // at a single `poly::gf_mul(w_p, …)` call instead of the
+        // `tower_depth` levels of Karatsuba recursion the large field
+        // does — roughly a `3^d` speedup for depth `d` (e.g. ~9× for
+        // `(32, 128)`, ~27× for `(32, 256)`).
+        //
+        // Re-typing is byte-aliasing only (the bytes of a small-image
+        // element are profile-agnostic) so the per-coin cost added
+        // here is a handful of byte copies, negligible.
+        let f_poly_small: Vec<Gf2Element> = f_poly
+            .iter()
+            .map(|c| {
+                Gf2Element::from_bytes(self.small_profile, *c.as_bytes())
+                    .expect("f-poly coefficient is in small-field image")
+            })
+            .collect();
         let mut secret_shares = Vec::with_capacity(self.share_amount);
         let mut f_large_shares = Vec::with_capacity(self.share_amount);
         for i in 1..=self.share_amount {
-            let x = small_field_point(self.profile, i);
-            let y = eval_poly_horner(self.profile, &f_poly, x);
+            let x_small = small_field_point(self.small_profile, i);
+            let y_small = eval_poly_horner(self.small_profile, &f_poly_small, x_small);
+            // Re-encode y under the large profile for the API.
+            // Small-image bytes are byte-equal across the two profiles
+            // so `from_bytes` succeeds (high bytes already zero).
+            let y_large = Gf2Element::from_bytes(self.profile, *y_small.as_bytes())
+                .expect("small-image bytes are canonical under (w_p, w_q)");
             debug_assert!(
-                y.is_in_small_field(),
+                y_large.is_in_small_field(),
                 "subfield closure broken: f({}) escaped the GF(2^{}) image",
                 i,
                 self.profile.w_p
             );
-            secret_shares.push((i, y));
-            f_large_shares.push((i, y));
+            secret_shares.push((i, y_large));
+            f_large_shares.push((i, y_large));
         }
 
         // g(i) for i = 1..=n. Evaluated at the same lifted x; full
@@ -377,6 +415,35 @@ pub fn lagrange_recover_at_zero(
     if t == 0 {
         return Gf2Element::zero(profile);
     }
+    // **Commit 8b fast path.** All Lagrange callers in production
+    // (`secret_reconstruct`, `acs::coin`) pass small-field-image
+    // inputs (f-shares), and the recovered `f(0)` is also in the
+    // small-field image by polynomial closure. We can therefore run
+    // the entire basis computation under the `(w_p, w_p)` profile,
+    // dropping `tower_depth` levels of Karatsuba recursion per
+    // multiplication AND making every `gf_inv` call land in the
+    // narrowest base field (where EEA / Itoh-Tsujii are cheapest).
+    //
+    // Falls back to the legacy large-profile path if any input
+    // happens NOT to be in the small-field image. This shouldn't
+    // happen on the production hot paths, but the dispatch keeps
+    // the function safe for any caller.
+    let all_small = points.iter().all(|(_, y)| y.is_in_small_field());
+    if all_small {
+        return lagrange_recover_at_zero_small(profile, points);
+    }
+    lagrange_recover_at_zero_large(profile, points)
+}
+
+/// Slow-path Lagrange that runs entirely in the caller's large
+/// profile. Kept for callers that pass non-small-image inputs;
+/// the fast `lagrange_recover_at_zero` dispatches to here only when
+/// at least one input has high bits beyond `w_p`.
+fn lagrange_recover_at_zero_large(
+    profile: Gf2Profile,
+    points: &[(usize, Gf2Element)],
+) -> Gf2Element {
+    let t = points.len();
     let xs: Vec<Gf2Element> = points
         .iter()
         .map(|(i, _)| small_field_point(profile, *i))
@@ -390,8 +457,8 @@ pub fn lagrange_recover_at_zero(
         let mut den = one;
         for k in 0..t {
             if k != j {
-                num = num.mul(&xs[k]); // char 2: −x_k = x_k
-                let diff = xs[j].add(&xs[k]); // char 2: x_j − x_k = x_j + x_k
+                num = num.mul(&xs[k]);
+                let diff = xs[j].add(&xs[k]);
                 den = den.mul(&diff);
             }
         }
@@ -399,6 +466,51 @@ pub fn lagrange_recover_at_zero(
         result = result.add(&ys[j].mul(&l_j));
     }
     result
+}
+
+/// Fast-path Lagrange that drops to the `(w_p, w_p)` profile for
+/// all internal arithmetic, then re-encodes the result under the
+/// caller's large profile. Pre: every `points[*].1` lies in the
+/// small-field image of `profile`.
+fn lagrange_recover_at_zero_small(
+    profile: Gf2Profile,
+    points: &[(usize, Gf2Element)],
+) -> Gf2Element {
+    let t = points.len();
+    let small_profile = Gf2Profile::new(profile.w_p, profile.w_p)
+        .expect("(w_p, w_p) is always a valid registered profile");
+
+    let xs_small: Vec<Gf2Element> = points
+        .iter()
+        .map(|(i, _)| small_field_point(small_profile, *i))
+        .collect();
+    let ys_small: Vec<Gf2Element> = points
+        .iter()
+        .map(|(_, y)| {
+            // Byte-aliasing reinterpretation. `is_in_small_field`
+            // already checked, so `from_bytes` accepts.
+            Gf2Element::from_bytes(small_profile, *y.as_bytes())
+                .expect("caller verified small-field-image precondition")
+        })
+        .collect();
+
+    let mut result_small = Gf2Element::zero(small_profile);
+    let one_small = Gf2Element::one(small_profile);
+    for j in 0..t {
+        let mut num = one_small;
+        let mut den = one_small;
+        for k in 0..t {
+            if k != j {
+                num = num.mul(&xs_small[k]);
+                let diff = xs_small[j].add(&xs_small[k]);
+                den = den.mul(&diff);
+            }
+        }
+        let l_j = num.mul(&den.inv());
+        result_small = result_small.add(&ys_small[j].mul(&l_j));
+    }
+    Gf2Element::from_bytes(profile, *result_small.as_bytes())
+        .expect("small-image bytes are canonical under any larger profile")
 }
 
 /// Super-invertible (hyper-invertible) randomness extractor for the
@@ -445,8 +557,17 @@ pub struct Gf2SuperInvExtractor {
     pub profile: Gf2Profile,
     pub num_inputs: usize,
     pub num_outputs: usize,
-    /// `matrix[i][j] = L_j(β_i)` in `GF(2^w_p)` (small-field image).
+    /// `matrix[i][j] = L_j(β_i)` typed under the **small-field-only**
+    /// `(w_p, w_p)` profile (commit 8b). The matrix entries
+    /// previously carried the full `(w_p, w_q)` profile and ran
+    /// through the tower mul on every extract — at depth `d` that's
+    /// `~3^d` Karatsuba sub-multiplies per entry. Storing them under
+    /// `small_profile` puts every mul directly on `poly::gf_mul` at
+    /// width `w_p`.
     matrix: Vec<Vec<Gf2Element>>,
+    /// Cached `(w_p, w_p)` profile so `extract` can re-type inputs
+    /// without recomputing.
+    small_profile: Gf2Profile,
 }
 
 impl Gf2SuperInvExtractor {
@@ -460,18 +581,26 @@ impl Gf2SuperInvExtractor {
     /// `share_amount < 2^w_p` capacity guarantee carries over: all
     /// `m + num_outputs` `small_field_point` values are distinct.
     pub fn new(profile: Gf2Profile, alpha_points: Vec<usize>, num_outputs: usize) -> Self {
+        let small_profile = Gf2Profile::new(profile.w_p, profile.w_p)
+            .expect("(w_p, w_p) is always a valid registered profile");
+
+        // Build the entire Lagrange-basis matrix under `small_profile`
+        // (commit 8b). All α / β points are integer ids in [1, n+R];
+        // small_field_point lifts them into the small-field image of
+        // `small_profile`, which makes every mul + inv inside the
+        // basis loop a depth-0 base-field operation.
         let m = alpha_points.len();
         let alphas: Vec<Gf2Element> = alpha_points
             .iter()
-            .map(|&a| small_field_point(profile, a))
+            .map(|&a| small_field_point(small_profile, a))
             .collect();
 
         let max_alpha = alpha_points.iter().copied().max().unwrap_or(0);
         let betas: Vec<Gf2Element> = (1..=num_outputs)
-            .map(|i| small_field_point(profile, max_alpha + i))
+            .map(|i| small_field_point(small_profile, max_alpha + i))
             .collect();
 
-        let one = Gf2Element::one(profile);
+        let one = Gf2Element::one(small_profile);
         let mut matrix = Vec::with_capacity(num_outputs);
         for beta in betas.iter() {
             let mut row = Vec::with_capacity(m);
@@ -495,6 +624,7 @@ impl Gf2SuperInvExtractor {
             num_inputs: m,
             num_outputs,
             matrix,
+            small_profile,
         }
     }
 
@@ -504,16 +634,54 @@ impl Gf2SuperInvExtractor {
     ///
     /// Output element `i` equals `P(β_i)` where `P` is the unique
     /// degree-`<m` polynomial interpolating `(α_j, inputs[j])`.
+    /// Inputs are expected to be in the small-field image (the case
+    /// in PPT production); fall back to large-profile arithmetic
+    /// otherwise.
     pub fn extract(&self, inputs: &[Gf2Element]) -> Vec<Gf2Element> {
         let cols = self.num_inputs.min(inputs.len());
-        let zero = Gf2Element::zero(self.profile);
-        let mut out = Vec::with_capacity(self.num_outputs);
-        for i in 0..self.num_outputs {
-            let mut acc = zero;
-            for j in 0..cols {
-                acc = acc.add(&self.matrix[i][j].mul(&inputs[j]));
+        // Pre-convert inputs to `small_profile` once. The fast path
+        // (production case) skips the tower recursion on every mul;
+        // a slow-path fallback re-runs the inner product under the
+        // large profile if any input has dirty high bits.
+        let mut inputs_small: Vec<Gf2Element> = Vec::with_capacity(cols);
+        let mut any_dirty = false;
+        for inp in inputs.iter().take(cols) {
+            match Gf2Element::from_bytes(self.small_profile, *inp.as_bytes()) {
+                Ok(e) => inputs_small.push(e),
+                Err(_) => {
+                    any_dirty = true;
+                    break;
+                }
             }
-            out.push(acc);
+        }
+        let zero_small = Gf2Element::zero(self.small_profile);
+        let mut out = Vec::with_capacity(self.num_outputs);
+        if !any_dirty {
+            for i in 0..self.num_outputs {
+                let mut acc = zero_small;
+                for j in 0..cols {
+                    acc = acc.add(&self.matrix[i][j].mul(&inputs_small[j]));
+                }
+                let acc_large = Gf2Element::from_bytes(self.profile, *acc.as_bytes())
+                    .expect("small-image bytes are canonical under any larger profile");
+                out.push(acc_large);
+            }
+        } else {
+            // Fallback: re-type matrix entries to large profile and
+            // run the inner product there. This branch is dead in
+            // PPT production (inputs are always f_d(0) ∈ small image)
+            // but kept for safety / unit-test inputs.
+            let zero_large = Gf2Element::zero(self.profile);
+            for i in 0..self.num_outputs {
+                let mut acc = zero_large;
+                for j in 0..cols {
+                    let m_large =
+                        Gf2Element::from_bytes(self.profile, *self.matrix[i][j].as_bytes())
+                            .expect("small-image matrix entry");
+                    acc = acc.add(&m_large.mul(&inputs[j]));
+                }
+                out.push(acc);
+            }
         }
         out
     }
