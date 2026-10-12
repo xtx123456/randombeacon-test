@@ -24,21 +24,80 @@
 //! ```
 //!
 //! with `α_k ∈ GF(2^k)` chosen so `Tr_{GF(2^k)/F_2}(α_k) = 1` (the
-//! Artin-Schreier irreducibility criterion). The level-specific
-//! `α_k` is stored alongside the base poly in the registry.
+//! Artin-Schreier irreducibility criterion).
+//!
+//! Why `α` depends on the BASE width, not just the level
+//! ------------------------------------------------------
+//!
+//! The trace condition `Tr(α_k) = 1` is a statement about `α_k` *as an
+//! element of a concrete representation* of `GF(2^k)`. Above the base
+//! width there are two different representations in play and they are
+//! **not** the same map from integers to field elements:
+//!
+//!   * the polynomial basis `F_2[x] / m_k(x)` using the registry's
+//!     degree-`k` irreducible, and
+//!   * the tower representation `GF(2^(k/2))[y] / (y² + y + α_{k/2})`
+//!     that `tower.rs` actually computes in.
+//!
+//! They are isomorphic as fields but the isomorphism is not the
+//! identity on bit patterns. Picking `α_k` by a trace search in the
+//! polynomial basis and then feeding that integer to `tower.rs` —
+//! which reads it in tower coordinates — is therefore a representation
+//! mismatch: the resulting `y² + y + α_k` can be **reducible** over the
+//! tower, and the "field" one level up degenerates into a ring with
+//! zero divisors. Concretely, with base `w_p = 8` the old code chose
+//! `α_16 = 0x800`, and `c = 0x87a2` satisfies `c² + c = 0x800` in the
+//! tower `GF(2^16)`, so `y² + y + α_16 = (y + c)(y + c + 1)` split and
+//! `GF2(8,64)` admitted the zero divisors `0x187a2 · 0x187a3 = 0`.
+//!
+//! The fix is to compute the trace in the representation that is
+//! actually used. For a quadratic tower level `L = K[y]/(y² + y + α_K)`
+//! the relative trace collapses to the high coordinate,
+//!
+//! ```text
+//!     Tr_{L/K}(a_lo + a_hi · y) = (a_lo + a_hi·y) + (a_lo + a_hi·(y+1))
+//!                               = a_hi
+//! ```
+//!
+//! because the nontrivial `K`-automorphism of `L` maps `y ↦ y + 1` (the
+//! two roots of `y² + y + α_K`). Composing with trace transitivity
+//! `Tr_{L/F_2} = Tr_{K/F_2} ∘ Tr_{L/K}` gives
+//!
+//! ```text
+//!     Tr_{L/F_2}(a_lo + a_hi · y) = Tr_{K/F_2}(a_hi).
+//! ```
+//!
+//! So `α_L := α_K · y` (low coordinate `0`, high coordinate `α_K`) has
+//! `Tr_{L/F_2}(α_L) = Tr_{K/F_2}(α_K) = 1` by induction. Unrolling the
+//! recursion, with `α_base` the polynomial-basis trace-1 element of the
+//! base field (where tower coordinates and polynomial basis DO
+//! coincide):
+//!
+//! ```text
+//!     α_level  =  α_base  <<  (level − base_w)
+//! ```
+//!
+//! which is a single shift — no per-level trace search, no locking, and
+//! still a single-bit value so the `α`-multiply inside Karatsuba stays
+//! cheap. `ALPHA_TABLE` materialises this once per registered base
+//! width in a read-only `lazy_static`.
 //!
 //! What this file does
 //! -------------------
 //!
 //! - `Gf2Profile::new(w_p, w_q)` validates the input and looks up the
 //!   registry entries.
-//! - `BASE_REGISTRY` returns the irreducible `m_p(x)` low-bits for any
-//!   supported `w_p`.
-//! - `quadratic_alpha(level_w)` returns the `α` used to build
-//!   `GF(2^(2 · level_w))` from `GF(2^(level_w))`.
+//! - `base_irreducible(w)` returns the irreducible `m_w(x)` low-bits for
+//!   any supported base width.
+//! - `quadratic_alpha(base_w, level_w)` returns the `α` used to build
+//!   `GF(2^(2 · level_w))` from the **tower** `GF(2^level_w)` that sits
+//!   above base width `base_w`.
 //!
 //! Tests at the bottom validate every registry entry's irreducibility
-//! and the `Tr(α) = 1` condition at startup-equivalent rigor.
+//! and re-derive `Tr(α) = 1` from the *definition*
+//! (`a + a² + a⁴ + …` via repeated tower squaring) rather than from the
+//! high-coordinate shortcut used to build the table, so the two
+//! independent routes must agree.
 
 use std::fmt;
 use std::str::FromStr;
@@ -84,12 +143,15 @@ impl Gf2Profile {
             );
         }
         // Confirm registry has both the base poly and every tower
-        // quadratic-extension `α` we'll need.
+        // quadratic-extension `α` we'll need. The `α` lookup is keyed
+        // by `(w_p, level)` because the trace condition that makes
+        // `y² + y + α` irreducible is relative to the tower
+        // representation rooted at `w_p` — see the module docs.
         base_irreducible(w_p)?;
         let depth = (ext_deg.trailing_zeros()) as usize;
         let mut level_w = w_p;
         for _ in 0..depth {
-            quadratic_alpha(level_w)?;
+            quadratic_alpha(w_p, level_w)?;
             level_w *= 2;
         }
         Ok(Self { w_p, w_q })
@@ -216,32 +278,48 @@ pub fn base_irreducible(w: usize) -> Result<u128, &'static str> {
     }
 }
 
-/// Return the `α ∈ GF(2^level_w)` used to build the next quadratic
-/// extension `GF(2^(2 · level_w)) = GF(2^level_w)[y] / (y² + y + α)`.
+/// Return the `α` used to build the next quadratic extension
+/// `GF(2^(2 · level_w)) = GF(2^level_w)[y] / (y² + y + α)`, where
+/// `GF(2^level_w)` is the **tower** representation rooted at base
+/// width `base_w` (so `base_w | level_w` and the quotient is a power
+/// of two).
 ///
-/// All returned `α` satisfy `Tr_{GF(2^level_w)/F_2}(α) = 1`
-/// (verified by `tower_alphas_have_trace_one` in tests), which is
-/// the necessary and sufficient condition for `y² + y + α` to be
-/// irreducible over `GF(2^level_w)` (Artin-Schreier).
+/// The returned `α` satisfies `Tr_{GF(2^level_w)/F_2}(α) = 1` **in the
+/// tower representation**, which is the necessary and sufficient
+/// Artin-Schreier condition for `y² + y + α` to be irreducible there.
+/// Verified in tests by recomputing the absolute trace from its
+/// definition via repeated tower squaring.
 ///
-/// Convention: `α` encoded in the low `level_w` bits of a `u128`,
-/// using the same polynomial-basis encoding as the base field.
+/// Passing `base_w == level_w` returns the base field's
+/// polynomial-basis trace-1 element: at the base width the tower
+/// coordinates and the polynomial basis are the same encoding.
 ///
-/// Implementation: the value is the smallest positive integer `α`
-/// (when interpreted by polynomial-bit encoding) whose trace under
-/// the registered `m_p(x)` is `1`. Cached on first call.
-pub fn quadratic_alpha(level_w: usize) -> Result<u128, &'static str> {
-    if level_w == 1 {
-        // F_2: the only nonzero element is 1, and Tr_{F_2/F_2}(1) = 1.
-        return Ok(1);
+/// Lookup is a read-only table indexed by `(base_w, level_w)`; no
+/// trace search, allocation, or locking happens per call.
+pub fn quadratic_alpha(base_w: usize, level_w: usize) -> Result<u128, &'static str> {
+    if base_w == 0 || level_w < base_w || level_w % base_w != 0 {
+        return Err("quadratic_alpha: base_w must divide level_w");
     }
-    // Lookup precomputed; populate on first call.
-    let cache = alpha_cache();
-    cache
-        .iter()
-        .find(|&&(w, _)| w == level_w)
-        .map(|&(_, a)| a)
-        .ok_or("unsupported quadratic-tower level — extend `BASE_REGISTRY` and re-run cache")
+    if !(level_w / base_w).is_power_of_two() {
+        return Err("quadratic_alpha: level_w / base_w must be a power of two");
+    }
+    if !base_w.is_power_of_two() {
+        return Err("unsupported tower base width — extend the base registry");
+    }
+    // `REGISTERED_BASE_WIDTHS` is exactly `{2^0, …, 2^7}`, so the base
+    // width indexes the table directly. This runs at every internal
+    // node of every Karatsuba multiplication, so the lookup has to be
+    // an array index rather than a scan.
+    let table = alpha_table()
+        .get(base_w.trailing_zeros() as usize)
+        .ok_or("unsupported tower base width — extend the base registry")?;
+    debug_assert_eq!(table.base_w, base_w, "alpha table index invariant broken");
+    let step = (level_w / base_w).trailing_zeros() as usize;
+    table
+        .levels
+        .get(step)
+        .copied()
+        .ok_or("unsupported quadratic-tower level — exceeds the 128-bit level cap")
 }
 
 /// Search for an `α ∈ GF(2^w)` with `Tr_{GF(2^w)/F_2}(α) = 1`.
@@ -285,7 +363,31 @@ fn trace(w: usize, m_low: u128, a: u128) -> u128 {
     t
 }
 
-fn alpha_cache() -> &'static [(usize, u128)] {
+/// Base widths for which a tower may be rooted. Every entry must have
+/// a `base_irreducible` registry entry.
+pub(crate) const REGISTERED_BASE_WIDTHS: [usize; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
+
+/// Per-base-width `α` table. `levels[k]` is the `α` used to build
+/// level `base_w << (k + 1)` out of level `base_w << k`, expressed in
+/// the tower coordinates of level `base_w << k`.
+///
+/// Entry `k` is for base width `REGISTERED_BASE_WIDTHS[k] == 1 << k`,
+/// so `quadratic_alpha` can index instead of search.
+struct AlphaTable {
+    base_w: usize,
+    levels: Vec<u128>,
+}
+
+/// Read-only `(base_w, level_w) → α` table.
+///
+/// Built once from the closed form derived in the module docs,
+/// `α_level = α_base << (level − base_w)`, where `α_base` comes from a
+/// polynomial-basis trace search (valid at the base width, where tower
+/// coordinates and polynomial basis coincide). Tests re-derive each
+/// entry's trace from the definition in the tower representation, so
+/// the shortcut is checked against an independent computation rather
+/// than assumed.
+fn alpha_table() -> &'static [AlphaTable] {
     // NOTE: we use `lazy_static` (already a `crypto` crate
     // dependency) rather than `std::sync::OnceLock` because the
     // latter only stabilised in Rust 1.70. The `lazy_static`
@@ -293,18 +395,31 @@ fn alpha_cache() -> &'static [(usize, u128)] {
     // (the only requirement is whatever rustc the workspace's
     // other crates need; see workspace MSRV).
     lazy_static::lazy_static! {
-        static ref ALPHA_CACHE: Vec<(usize, u128)> = {
-            let mut v = Vec::new();
-            for &w in &[2usize, 4, 8, 16, 32, 64, 128] {
-                let m_low = base_irreducible(w).expect("registered base");
-                let alpha = find_alpha_trace_one(w, m_low)
-                    .expect("trace-1 element exists in any GF(2^w), w ≥ 2");
-                v.push((w, alpha));
+        static ref ALPHA_TABLE: Vec<AlphaTable> = {
+            let mut tables = Vec::with_capacity(REGISTERED_BASE_WIDTHS.len());
+            for (k, &base_w) in REGISTERED_BASE_WIDTHS.iter().enumerate() {
+                // `quadratic_alpha` indexes by `base_w.trailing_zeros()`.
+                assert_eq!(base_w, 1usize << k, "alpha table must be index-addressable");
+                // Derived from the live registry rather than hardcoded,
+                // so the table can never go stale against a registry edit.
+                let base_poly = base_irreducible(base_w).expect("registered base");
+                let alpha_base = find_alpha_trace_one(base_w, base_poly)
+                    .expect("trace-1 element exists in every GF(2^w)");
+                // Levels base_w, 2·base_w, … up to MAX_BASE_WIDTH: a
+                // level above 128 is never used as the `half` of a
+                // Karatsuba step because `w_q ≤ 256`.
+                let mut levels = Vec::new();
+                let mut level_w = base_w;
+                while level_w <= MAX_BASE_WIDTH {
+                    levels.push(alpha_base << (level_w - base_w));
+                    level_w *= 2;
+                }
+                tables.push(AlphaTable { base_w, levels });
             }
-            v
+            tables
         };
     }
-    &ALPHA_CACHE
+    &ALPHA_TABLE
 }
 
 #[cfg(test)]
@@ -324,16 +439,17 @@ mod tests {
         }
     }
 
-    /// For `m(y) = y² + y + α` over GF(2^k), irreducibility is
-    /// equivalent to `Tr_{GF(2^k)/F_2}(α) = 1` (Artin-Schreier).
-    /// We verify this for every registered base width, using the
-    /// `α` returned by `quadratic_alpha` (which itself was computed
-    /// by an offline search for the smallest valid α).
+    /// At the BASE width the tower coordinates and the polynomial
+    /// basis are the same encoding, so `quadratic_alpha(w, w)` must
+    /// have polynomial-basis trace 1. (The trace condition at levels
+    /// ABOVE the base is representation-sensitive and is checked in
+    /// `tower.rs` against the tower arithmetic itself — see
+    /// `tower_alpha_trace_is_one_in_tower_representation`.)
     #[test]
-    fn tower_alphas_have_trace_one() {
-        for &w in &[1usize, 2, 4, 8, 16, 32, 64, 128] {
+    fn base_alphas_have_polynomial_basis_trace_one() {
+        for &w in REGISTERED_BASE_WIDTHS.iter() {
             let m_low = base_irreducible(w).unwrap();
-            let alpha = quadratic_alpha(w).unwrap();
+            let alpha = quadratic_alpha(w, w).unwrap();
             assert_eq!(
                 trace(w, m_low, alpha),
                 1,
@@ -342,6 +458,75 @@ mod tests {
                 alpha
             );
         }
+    }
+
+    /// `α` must be keyed by the tower's base width: the same level
+    /// reached from different bases is a different representation and
+    /// generally needs a different `α`. This is the exact regression
+    /// that produced zero divisors in `GF2(8,64)` and `GF2(64,256)`.
+    #[test]
+    fn alpha_depends_on_base_width_not_just_level() {
+        // Level 128 reached from base 8, 16, 32, 64 and 128.
+        let from_8 = quadratic_alpha(8, 128).unwrap();
+        let from_64 = quadratic_alpha(64, 128).unwrap();
+        let from_128 = quadratic_alpha(128, 128).unwrap();
+        assert_ne!(
+            from_8, from_128,
+            "level-128 α must differ between base 8 and base 128"
+        );
+        assert_ne!(
+            from_64, from_128,
+            "level-128 α must differ between base 64 and base 128"
+        );
+    }
+
+    /// Closed form from the module docs: `α_level = α_base << (level −
+    /// base_w)`, and every `α` is a single bit (keeps the Karatsuba
+    /// `α`-multiply cheap).
+    #[test]
+    fn alpha_closed_form_and_sparsity() {
+        for &base_w in REGISTERED_BASE_WIDTHS.iter() {
+            let alpha_base = quadratic_alpha(base_w, base_w).unwrap();
+            assert_eq!(
+                alpha_base.count_ones(),
+                1,
+                "base α at w={} should be a single bit, got {:#x}",
+                base_w,
+                alpha_base
+            );
+            let mut level_w = base_w;
+            while level_w <= MAX_BASE_WIDTH {
+                let a = quadratic_alpha(base_w, level_w).unwrap();
+                assert_eq!(
+                    a,
+                    alpha_base << (level_w - base_w),
+                    "closed form broken at base={} level={}",
+                    base_w,
+                    level_w
+                );
+                assert_eq!(a.count_ones(), 1, "α must stay single-bit");
+                // α must be a genuine element of the level, i.e. fit
+                // in its low `level_w` bits.
+                if level_w < 128 {
+                    assert!(a < (1u128 << level_w), "α escapes level {} width", level_w);
+                }
+                level_w *= 2;
+            }
+        }
+    }
+
+    #[test]
+    fn quadratic_alpha_rejects_invalid_level_requests() {
+        // level not a multiple of base
+        assert!(quadratic_alpha(8, 12).is_err());
+        // quotient not a power of two
+        assert!(quadratic_alpha(8, 24).is_err());
+        // level below base
+        assert!(quadratic_alpha(64, 32).is_err());
+        // unregistered base
+        assert!(quadratic_alpha(7, 14).is_err());
+        // beyond the 128-bit level cap
+        assert!(quadratic_alpha(128, 256).is_err());
     }
 
     #[test]

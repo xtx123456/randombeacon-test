@@ -446,8 +446,13 @@ impl Context {
                 sum
             }
             Some(profile) => {
-                use crate::node::shamir::gf2_two_field::lagrange_recover_at_zero;
+                use crate::node::shamir::gf2_two_field::Gf2LagrangeCache;
                 use crypto::gf2::Gf2Element;
+                // One basis per distinct provider set, reused across
+                // the decided dealers. Dealers commonly share the same
+                // f+1 revealers, but each is keyed independently so a
+                // dealer with a different set still reconstructs.
+                let mut lagrange_cache = Gf2LagrangeCache::new(profile);
                 let mut acc = Gf2Element::zero(profile);
                 for d in decided.iter() {
                     let pmap = match shares_map.get(d) {
@@ -480,7 +485,24 @@ impl Context {
                     if !ok {
                         return false;
                     }
-                    let c_d = lagrange_recover_at_zero(profile, &points);
+                    let c_d = match lagrange_cache.recover_at_zero(&points) {
+                        Ok(elem) => elem,
+                        Err(e) => {
+                            // A rejected provider set means this coin
+                            // secret is not recoverable; report and
+                            // abstain rather than folding a bogus
+                            // value into the common coin.
+                            log::error!(
+                                "[PPT][GF2-COIN] dealer {} acs_round {} aba_round {}: \
+                                 Lagrange recovery rejected the provider set: {}",
+                                d,
+                                acs_round,
+                                aba_round,
+                                e
+                            );
+                            return false;
+                        }
+                    };
                     // Char-2 sum: XOR each coordinate.
                     acc = acc.add(&c_d);
                 }
