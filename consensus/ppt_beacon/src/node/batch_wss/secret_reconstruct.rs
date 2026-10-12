@@ -1297,9 +1297,22 @@ impl Context {
                     out
                 }
                 Some(profile) => {
-                    use crate::node::shamir::gf2_two_field::lagrange_recover_at_zero;
+                    use crate::node::shamir::gf2_two_field::Gf2LagrangeCache;
                     use crypto::gf2::Gf2Element;
 
+                    // Mirror the BigUint branch's `BatchExtractor`
+                    // cache: the Lagrange basis depends only on the
+                    // provider id set, which repeats across every coin
+                    // of a dealer and usually across dealers too, so
+                    // the O(t²) basis build happens once per distinct
+                    // set instead of once per (coin, dealer). The
+                    // cache keys on the ACTUAL point set, so dealers
+                    // that ended up with different provider sets each
+                    // get their own basis and the "any f+1 validated
+                    // shares" rule is untouched. Scope is this
+                    // round's blocking task, so nothing accumulates
+                    // across rounds.
+                    let mut lagrange_cache = Gf2LagrangeCache::new(profile);
                     let mut out = Vec::with_capacity(tasks.len());
                     for task in tasks.into_iter() {
                         // `task.eval_points` contains 1-based node ids
@@ -1328,7 +1341,7 @@ impl Context {
                         if !ok {
                             continue;
                         }
-                        let secret_elem = match lagrange_recover_at_zero(profile, &points) {
+                        let secret_elem = match lagrange_cache.recover_at_zero(&points) {
                             Ok(elem) => elem,
                             Err(e) => {
                                 // Explicit failure, never a silent

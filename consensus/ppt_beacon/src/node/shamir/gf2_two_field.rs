@@ -569,10 +569,12 @@ pub fn eval_poly_horner_small_x(
 /// evaluation points.
 ///
 /// Building the basis costs `O(t²)` base-field multiplications plus
-/// `t` inversions — by far the dominant term in reconstruction —
-/// while the recovery itself is only a `t`-term dot product. Keeping
-/// the two apart is what lets the point-set validation happen once,
-/// up front, instead of being re-derived inside every recovery.
+/// `t` inversions — by far the dominant term in reconstruction. The
+/// points, however, are the *provider ids*, which are shared across
+/// every coin and (usually) every dealer in a round. Splitting the
+/// basis out lets the `O(t²)` work happen once per distinct provider
+/// set while each individual recovery degenerates to a `t`-term dot
+/// product.
 ///
 /// Coefficients are stored under the `(w_p, w_p)` profile: both the
 /// points and the recovered secret live in the base field, so the
@@ -679,6 +681,100 @@ impl Gf2LagrangeBasis {
     }
 }
 
+/// Bounded cache of `Gf2LagrangeBasis` keyed by the field definition
+/// and the canonical (ascending) evaluation-point set.
+///
+/// A round reconstructs `batch × |decided|` secrets. Providers
+/// respond per dealer, so different dealers can legitimately end up
+/// with different `f+1` provider sets — the cache keys on the actual
+/// set rather than assuming a single global one, which keeps the
+/// "any `f+1` validated shares" liveness property intact while still
+/// collapsing the common case (same providers for every coin of a
+/// dealer, and usually across dealers too) to one basis build.
+///
+/// `capacity` bounds the number of retained bases so a long run
+/// cannot accumulate one entry per transient provider set. On
+/// overflow the cache is cleared rather than evicting by age: the
+/// access pattern is "a handful of hot sets per round", so a full
+/// reset at a round boundary is both cheap and self-limiting.
+pub struct Gf2LagrangeCache {
+    profile: Gf2Profile,
+    /// Key: `(w_p, w_q, ascending point ids)`. The widths are part of
+    /// the key so an entry can never be reused under a different
+    /// field definition.
+    entries: std::collections::HashMap<(usize, usize, Vec<usize>), Gf2LagrangeBasis>,
+    capacity: usize,
+    hits: u64,
+    misses: u64,
+}
+
+impl Gf2LagrangeCache {
+    /// Default bound on retained bases. One round needs at most a few
+    /// distinct provider sets; 256 leaves ample headroom while keeping
+    /// the map small enough to stay cache-resident.
+    pub const DEFAULT_CAPACITY: usize = 256;
+
+    pub fn new(profile: Gf2Profile) -> Self {
+        Self::with_capacity(profile, Self::DEFAULT_CAPACITY)
+    }
+
+    pub fn with_capacity(profile: Gf2Profile, capacity: usize) -> Self {
+        Self {
+            profile,
+            entries: std::collections::HashMap::new(),
+            capacity: capacity.max(1),
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    /// `(hits, misses)` since construction — used by the benchmark to
+    /// report how much repeated work the cache actually removed,
+    /// rather than asserting a speedup.
+    pub fn stats(&self) -> (u64, u64) {
+        (self.hits, self.misses)
+    }
+
+    /// Recover `f(0)` from `points`, reusing a cached basis whenever
+    /// the same evaluation-point set has been seen before.
+    ///
+    /// `points` may be in any order; the basis is keyed and stored in
+    /// ascending point order and the shares are permuted to match, so
+    /// two callers that supply the same set in different orders still
+    /// share one basis and both get the correct answer.
+    pub fn recover_at_zero(
+        &mut self,
+        points: &[(usize, Gf2Element)],
+    ) -> Result<Gf2Element, String> {
+        if points.is_empty() {
+            return Err("cannot recover from an empty share set".to_string());
+        }
+        // Canonical ascending order over evaluation points.
+        let mut order: Vec<usize> = (0..points.len()).collect();
+        order.sort_unstable_by_key(|&i| points[i].0);
+        let ids: Vec<usize> = order.iter().map(|&i| points[i].0).collect();
+
+        let key = (self.profile.w_p, self.profile.w_q, ids.clone());
+        if !self.entries.contains_key(&key) {
+            if self.entries.len() >= self.capacity {
+                self.entries.clear();
+            }
+            let basis = Gf2LagrangeBasis::new(self.profile, &ids)?;
+            self.entries.insert(key.clone(), basis);
+            self.misses += 1;
+        } else {
+            self.hits += 1;
+        }
+        let basis = self
+            .entries
+            .get(&key)
+            .expect("just inserted or already present");
+
+        let shares: Vec<Gf2Element> = order.iter().map(|&i| points[i].1).collect();
+        basis.recover(self.profile, &shares)
+    }
+}
+
 /// Recover `f(0)` from `t` (or more) `(node_id, share)` pairs via
 /// Lagrange interpolation. Uses the **char-2-specialised** formula:
 ///
@@ -692,6 +788,10 @@ impl Gf2LagrangeBasis {
 /// wrong value — when the point set is empty, contains duplicates,
 /// contains `0`, or exceeds the `GF(2^w_p)` point capacity. A
 /// singular Lagrange denominator is reported, never treated as zero.
+///
+/// This is the uncached entry point; callers that recover many
+/// secrets over the same provider set should hold a
+/// `Gf2LagrangeCache` instead, which reuses the `O(t²)` basis.
 pub fn lagrange_recover_at_zero(
     profile: Gf2Profile,
     points: &[(usize, Gf2Element)],
@@ -1285,6 +1385,148 @@ mod tests {
     }
 
     // =====================================================================
+    // Lagrange coefficient cache
+    // =====================================================================
+
+    /// The cache must return exactly what the uncached path returns,
+    /// for the same provider set and for different ones, and must
+    /// actually register reuse (hits) when a set repeats.
+    #[test]
+    fn lagrange_cache_matches_uncached_and_reuses_bases() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xcac8e);
+        for &(w_p, w_q) in SUPPORTED_PROFILES {
+            let profile = Gf2Profile::new(w_p, w_q).unwrap();
+            let (f, n) = (5usize, 16usize);
+            let t = f + 1;
+            let dealer = Gf2TwoFieldDealer::new(profile, t, n).unwrap();
+            let mut cache = Gf2LagrangeCache::new(profile);
+
+            // Several dealers, two distinct provider sets.
+            let set_a: Vec<usize> = (1..=t).collect();
+            let set_b: Vec<usize> = (n - t + 1..=n).collect();
+            assert_ne!(set_a, set_b);
+
+            for d in 0..6usize {
+                let secret = small_random(profile, &mut rng);
+                let theta = random_large_field(profile, &mut rng);
+                let shares = dealer.share_secret(secret, &theta);
+                let ids = if d % 2 == 0 { &set_a } else { &set_b };
+
+                let points: Vec<(usize, Gf2Element)> = ids
+                    .iter()
+                    .map(|&id| (id, shares.secret_shares[id - 1].1))
+                    .collect();
+
+                let cached = cache.recover_at_zero(&points).expect("valid set");
+                let uncached = lagrange_recover_at_zero(profile, &points).expect("valid set");
+                assert_eq!(
+                    cached, uncached,
+                    "cached != uncached at ({},{}) dealer {}",
+                    w_p, w_q, d
+                );
+                assert_eq!(
+                    cached, secret,
+                    "recovery wrong at ({},{}) dealer {}",
+                    w_p, w_q, d
+                );
+            }
+            let (hits, misses) = cache.stats();
+            assert_eq!(misses, 2, "exactly two distinct provider sets were used");
+            assert_eq!(hits, 4, "the remaining four recoveries must reuse a basis");
+        }
+    }
+
+    /// Point order must not matter: the same set supplied in a
+    /// different order shares one cached basis and still recovers the
+    /// same secret.
+    #[test]
+    fn lagrange_cache_is_order_insensitive() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x00de4);
+        let profile = Gf2Profile::new(32, 128).unwrap();
+        let (f, n) = (5usize, 16usize);
+        let t = f + 1;
+        let dealer = Gf2TwoFieldDealer::new(profile, t, n).unwrap();
+        let secret = small_random(profile, &mut rng);
+        let theta = random_large_field(profile, &mut rng);
+        let shares = dealer.share_secret(secret, &theta);
+
+        let ascending: Vec<(usize, Gf2Element)> =
+            shares.secret_shares.iter().take(t).copied().collect();
+        let mut descending = ascending.clone();
+        descending.reverse();
+
+        let mut cache = Gf2LagrangeCache::new(profile);
+        let a = cache.recover_at_zero(&ascending).unwrap();
+        let b = cache.recover_at_zero(&descending).unwrap();
+        assert_eq!(a, secret);
+        assert_eq!(b, secret);
+        let (hits, misses) = cache.stats();
+        assert_eq!((hits, misses), (1, 1), "reordering must hit the same basis");
+    }
+
+    /// Different honest subsets of `f+1` shares must all recover the
+    /// same secret, with the cache in play — this is the "any f+1
+    /// validated providers" liveness property, which the cache must
+    /// not quietly narrow to one fixed set.
+    #[test]
+    fn any_f_plus_one_subset_recovers_identically_through_the_cache() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x5ab5e7);
+        for &(w_p, w_q) in SUPPORTED_PROFILES {
+            let profile = Gf2Profile::new(w_p, w_q).unwrap();
+            let (f, n) = (5usize, 16usize);
+            let t = f + 1;
+            let dealer = Gf2TwoFieldDealer::new(profile, t, n).unwrap();
+            let secret = small_random(profile, &mut rng);
+            let theta = random_large_field(profile, &mut rng);
+            let shares = dealer.share_secret(secret, &theta);
+
+            let mut cache = Gf2LagrangeCache::new(profile);
+            // Sliding windows give n - t + 1 distinct provider sets.
+            for start in 0..=(n - t) {
+                let points: Vec<(usize, Gf2Element)> =
+                    shares.secret_shares[start..start + t].to_vec();
+                let got = cache.recover_at_zero(&points).expect("valid set");
+                assert_eq!(
+                    got, secret,
+                    "subset starting at {} recovered a different secret at ({},{})",
+                    start, w_p, w_q
+                );
+            }
+            let (_, misses) = cache.stats();
+            assert_eq!(
+                misses as usize,
+                n - t + 1,
+                "each distinct provider set needs its own basis"
+            );
+        }
+    }
+
+    /// The cache is bounded: feeding it more distinct sets than its
+    /// capacity must not grow it without limit, and must not change
+    /// any answer.
+    #[test]
+    fn lagrange_cache_is_bounded() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xb0117d);
+        let profile = Gf2Profile::new(16, 64).unwrap();
+        let (f, n) = (5usize, 40usize);
+        let t = f + 1;
+        let dealer = Gf2TwoFieldDealer::new(profile, t, n).unwrap();
+        let secret = small_random(profile, &mut rng);
+        let theta = random_large_field(profile, &mut rng);
+        let shares = dealer.share_secret(secret, &theta);
+
+        let mut cache = Gf2LagrangeCache::with_capacity(profile, 4);
+        for start in 0..=(n - t) {
+            let points: Vec<(usize, Gf2Element)> = shares.secret_shares[start..start + t].to_vec();
+            assert_eq!(cache.recover_at_zero(&points).unwrap(), secret);
+            assert!(
+                cache.entries.len() <= 4,
+                "cache exceeded its capacity: {}",
+                cache.entries.len()
+            );
+        }
+    }
+
     // =====================================================================
     // mul_small fast path, as used by this module
     // =====================================================================
