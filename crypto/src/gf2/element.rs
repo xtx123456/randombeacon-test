@@ -277,6 +277,52 @@ impl Gf2Element {
         }
     }
 
+    /// Field multiplication specialised to a **base-field** right
+    /// operand, i.e. `rhs ∈ GF(2^w_p) ⊂ GF(2^w_q)`.
+    ///
+    /// Equal in value to `self.mul(rhs)` whenever the precondition
+    /// holds, but computed by scaling each `GF(2^w_p)` coordinate of
+    /// `self` instead of running the full Karatsuba recursion — see
+    /// `tower::mul_by_small_u128` for why that is the same product.
+    ///
+    /// # Precondition
+    ///
+    /// `rhs.is_in_small_field()` must hold. The caller is responsible
+    /// for establishing it, either because `rhs` was built in the
+    /// small field (`lift_small`, `small_field_point`, a small-field
+    /// sampler) or because an explicit membership check was performed
+    /// on untrusted input. Violating it yields a wrong product rather
+    /// than an error: this is a performance path for values whose
+    /// provenance is already known, not an input validator.
+    ///
+    /// Checked by `debug_assert!`, so test and debug builds catch a
+    /// misuse immediately.
+    pub fn mul_small(&self, rhs: &Self) -> Self {
+        debug_assert_eq!(self.profile, rhs.profile, "mul_small: profile mismatch");
+        debug_assert!(
+            rhs.is_in_small_field(),
+            "mul_small: rhs must lie in the GF(2^w_p) image"
+        );
+        let b = u128_from_lo(rhs.as_bytes()) & tower::mask_low(self.profile.w_p);
+        if self.profile.w_q <= 128 {
+            let a = u128_from_lo(&self.bytes);
+            let prod = tower::mul_by_small_u128(&self.profile, self.profile.w_q, a, b);
+            let mut out = [0u8; 32];
+            write_u128_lo(&mut out, prod);
+            Self {
+                bytes: out,
+                profile: self.profile,
+            }
+        } else {
+            let a = u256_from_bytes(&self.bytes);
+            let prod = tower::mul_by_small_u256(&self.profile, a, b);
+            Self {
+                bytes: u256_to_bytes(prod),
+                profile: self.profile,
+            }
+        }
+    }
+
     /// Field inversion. `0.inv()` returns `Self::zero()` (sentinel —
     /// callers must check `is_zero()` first when correctness matters).
     pub fn inv(&self) -> Self {
@@ -506,6 +552,57 @@ mod tests {
                 if !a.is_zero() {
                     let inv = a.inv();
                     assert_eq!(a.mul(&inv), one);
+                }
+            }
+        }
+    }
+
+    /// `mul_small` must equal `mul` whenever the right operand is in
+    /// the base field, across every registered profile, including the
+    /// zero and one edge cases.
+    #[test]
+    fn mul_small_matches_mul_on_small_right_operand() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x3f_a57);
+        for &(w_p, w_q) in &[
+            (8usize, 8usize),
+            (8, 64),
+            (16, 64),
+            (32, 128),
+            (32, 256),
+            (64, 64),
+            (64, 128),
+            (64, 256),
+            (128, 128),
+            (128, 256),
+            (8, 256),
+        ] {
+            let p = Gf2Profile::new(w_p, w_q).unwrap();
+            let small_len = p.small_byte_len();
+
+            let mut small_vals = vec![Gf2Element::zero(p), Gf2Element::one(p)];
+            for _ in 0..8 {
+                let mut buf = vec![0u8; small_len];
+                rng.fill(&mut buf[..]);
+                small_vals.push(Gf2Element::lift_small(p, &buf));
+            }
+
+            let mut large_vals = vec![Gf2Element::zero(p), Gf2Element::one(p)];
+            for _ in 0..8 {
+                large_vals.push(Gf2Element::random(p, &mut rng));
+            }
+
+            for b in &small_vals {
+                assert!(b.is_in_small_field());
+                for a in &large_vals {
+                    assert_eq!(
+                        a.mul_small(b),
+                        a.mul(b),
+                        "mul_small ≠ mul at ({},{}) a={:?} b={:?}",
+                        w_p,
+                        w_q,
+                        a,
+                        b
+                    );
                 }
             }
         }

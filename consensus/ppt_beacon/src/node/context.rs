@@ -185,6 +185,12 @@ pub struct Context {
     /// observable when the flag is set.
     pub gf2_profile: Option<Gf2Profile>,
 
+    /// Rejection-sampling mapper from raw coin values to uniform
+    /// leader numbers `{1, …, n}` and binary bits. Built once from
+    /// the field mode and `num_nodes`; used by
+    /// `self_coin_check_transmit` and `coin_value_matches_uniform_range`.
+    pub coin_mapper: crate::node::coin_mapper::CoinMapper,
+
     // ---- Round bookkeeping ----
     pub curr_round: u32,
     pub max_rounds: u32,
@@ -240,10 +246,8 @@ pub struct Context {
     // In commit 6 the handlers stop at "store decrypted bytes" — no
     // AVSS-completion is signalled via this path, so the dealer's
     // legacy `AVSSSend` continues to drive the actual quorum.
-    pub avss_secmsg_state: HashMap<
-        (Round, Replica),
-        crate::node::shoup_smart::sec_msg_dst::SecMsgDstState,
-    >,
+    pub avss_secmsg_state:
+        HashMap<(Round, Replica), crate::node::shoup_smart::sec_msg_dst::SecMsgDstState>,
     pub avss_secmsg_public: HashMap<(Round, Replica), types::beacon::AvssPublicCommitMsg>,
     pub avss_secmsg_delivered_bytes: HashMap<(Round, Replica), Vec<u8>>,
 
@@ -260,10 +264,7 @@ pub struct Context {
     // Per (acs_round, aba_round): collected, Merkle-validated coin
     // shares `dealer -> provider -> share`. Reconstruction of each
     // dealer's sealed coin-secret needs f+1 providers.
-    pub coin_shares: HashMap<
-        (Round, u64),
-        HashMap<Replica, HashMap<Replica, BigUint>>,
-    >,
+    pub coin_shares: HashMap<(Round, u64), HashMap<Replica, HashMap<Replica, BigUint>>>,
     // Reconstructed coin secret `C = Σ_d c_{d}` per (acs_round, aba_round).
     pub coin_reconstructed: HashMap<(Round, u64), BigUint>,
     // (acs_round, aba_round) for which this node has already broadcast
@@ -272,8 +273,7 @@ pub struct Context {
     pub coin_reveal_sent: HashSet<(Round, u64)>,
     // Reveals that arrived before `coin_material[acs_round-1]` was
     // locally available; replayed once the material is stashed.
-    pub coin_reveal_pending:
-        HashMap<(Round, u64), Vec<(types::beacon::BatchWSSReconMsg, Replica)>>,
+    pub coin_reveal_pending: HashMap<(Round, u64), Vec<(types::beacon::BatchWSSReconMsg, Replica)>>,
 
     /// Selected AVSS transport for this node's PPT deployment
     /// (`Lite` default = O(n) per-recipient unicast; `SecMsg` =
@@ -464,10 +464,9 @@ impl Context {
             SyncHandler::new(tx_net_to_client),
         );
 
-        let consensus_net =
-            TcpReliableSender::<Replica, WrapperMsg, Acknowledgement>::with_peers(
-                consensus_addrs.clone(),
-            );
+        let consensus_net = TcpReliableSender::<Replica, WrapperMsg, Acknowledgement>::with_peers(
+            consensus_addrs.clone(),
+        );
         let sync_net =
             TcpReliableSender::<Replica, SyncMsg, Acknowledgement>::with_peers(syncer_map);
 
@@ -522,6 +521,18 @@ impl Context {
                 secret_domain: prime.clone(),
                 nonce_domain: nonce_prime.clone(),
                 gf2_profile,
+                coin_mapper: match gf2_profile {
+                    Some(profile) => {
+                        crate::node::coin_mapper::CoinMapper::for_gf2(profile, config.num_nodes)
+                            .expect("CoinMapper construction must succeed for a valid profile + n")
+                    }
+                    None => {
+                        crate::node::coin_mapper::CoinMapper::for_prime(&prime, config.num_nodes)
+                            .expect(
+                                "CoinMapper construction must succeed for the production prime + n",
+                            )
+                    }
+                },
 
                 curr_round: 0,
                 max_rounds: 20000,
@@ -637,24 +648,22 @@ impl Context {
     /// and must be discarded by the consumer; the protocol picks the
     /// *first* coin (in batch order) that satisfies the rule.
     ///
-    /// This helper just answers the boolean check; the iteration
-    /// over the batch is done by the consumer (e.g. the syncer or a
-    /// downstream BFT module) so that the protocol does not silently
-    /// drop coins that some other consumer may still want for
-    /// non-uniform purposes.
+    /// Delegates to the pre-built `CoinMapper` which encapsulates
+    /// both GF(2^w_p) and BigUint domains.
     pub fn coin_value_matches_uniform_range(&self, coin_bytes: &[u8]) -> bool {
-        match self.gf2_profile {
-            None => Self::coin_value_matches_uniform_range_with(
-                coin_bytes,
-                &self.secret_domain,
-                self.num_nodes,
-            ),
-            Some(profile) => Self::coin_value_matches_uniform_range_with_gf2(
-                coin_bytes,
-                profile,
-                self.num_nodes,
-            ),
-        }
+        self.coin_mapper.is_accepted(coin_bytes)
+    }
+
+    /// Return the first-match leader for `round`, or `None` if no
+    /// coin output has been accepted yet (or the round state does
+    /// not exist).
+    pub fn first_match_leader_for_round(
+        &self,
+        round: Round,
+    ) -> Option<&crate::node::coin_mapper::FirstMatchLeader> {
+        self.round_state
+            .get(&round)
+            .and_then(|st| st.first_match_leader.as_ref())
     }
 
     /// Fiat-Shamir degree-test challenge θ for a dealer's AVSS
@@ -693,11 +702,7 @@ impl Context {
     /// Pulled out as a separate helper so
     /// `theta_from_commitment_gf2` can reuse it without re-
     /// expressing the binding rule.
-    pub(crate) fn theta_seed_bytes(
-        round: Round,
-        dealer: Replica,
-        root_vec: &[Hash],
-    ) -> Vec<u8> {
+    pub(crate) fn theta_seed_bytes(round: Round, dealer: Replica, root_vec: &[Hash]) -> Vec<u8> {
         let mut buf: Vec<u8> = b"PPT_BEACON_FS_THETA_v1::".to_vec();
         buf.extend_from_slice(&round.to_be_bytes());
         buf.extend_from_slice(&(dealer as u64).to_be_bytes());
@@ -864,8 +869,8 @@ impl Context {
     pub async fn broadcast(&mut self, protmsg: CoinMsg, round: Round) {
         // (1) serialise once -- this is what `WrapperMsg::new`
         //     internally did n-1 times before.
-        let bytes = bincode::serialize(&protmsg)
-            .expect("Failed to serialize protmsg for broadcast");
+        let bytes =
+            bincode::serialize(&protmsg).expect("Failed to serialize protmsg for broadcast");
 
         let myid = self.myid;
 
@@ -875,8 +880,7 @@ impl Context {
         //     touching `self.net_send` and `self.cancel_handlers`.
         //     This loop is pure CPU (HMAC-SHA256) and runs in tens
         //     of microseconds per recipient.
-        let mut wrappers: Vec<(Replica, WrapperMsg)> =
-            Vec::with_capacity(self.sec_key_map.len());
+        let mut wrappers: Vec<(Replica, WrapperMsg)> = Vec::with_capacity(self.sec_key_map.len());
         for (replica, sec_key) in self.sec_key_map.iter() {
             if *replica == myid {
                 continue;
@@ -1159,9 +1163,13 @@ mod tests {
         let p = BigUint::from(11u32);
         // 19 mod 11 = 8, which is the rejection boundary.
         let bytes = BigUint::from(19u32).to_bytes_be();
-        assert!(!Context::coin_value_matches_uniform_range_with(&bytes, &p, 4));
+        assert!(!Context::coin_value_matches_uniform_range_with(
+            &bytes, &p, 4
+        ));
         // 18 mod 11 = 7, accepted.
         let bytes = BigUint::from(18u32).to_bytes_be();
-        assert!(Context::coin_value_matches_uniform_range_with(&bytes, &p, 4));
+        assert!(Context::coin_value_matches_uniform_range_with(
+            &bytes, &p, 4
+        ));
     }
 }

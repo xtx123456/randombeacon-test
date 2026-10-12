@@ -22,12 +22,11 @@ use crypto::hash::Hash;
 use num_bigint::BigUint;
 
 use types::{
-    beacon::{
-        BatchWSSMsg, BatchWSSReconMsg, BeaconMsg, MulticastRecoveredSharesMsg, Round, Val,
-    },
+    beacon::{BatchWSSMsg, BatchWSSReconMsg, BeaconMsg, MulticastRecoveredSharesMsg, Round, Val},
     Replica,
 };
 
+use crate::node::coin_mapper::FirstMatchLeader;
 use crate::node::shamir::gf2_two_field::Gf2SuperInvExtractor;
 use crate::node::shamir::two_field::{BatchExtractor, SuperInvExtractor};
 
@@ -77,8 +76,7 @@ pub struct CTRBCState {
     pub comm_vectors: HashMap<Replica, Vec<Hash>, nohash_hasher::BuildNoHashHasher<Replica>>,
 
     /// Public hash transcript commitment per dealer's AVSS instance.
-    pub avss_transcript_roots:
-        HashMap<Replica, Hash, nohash_hasher::BuildNoHashHasher<Replica>>,
+    pub avss_transcript_roots: HashMap<Replica, Hash, nohash_hasher::BuildNoHashHasher<Replica>>,
 
     /// Dealers for which this node has locally validated the AVSS packet.
     pub avss_local_valid: HashSet<Replica, nohash_hasher::BuildNoHashHasher<Replica>>,
@@ -161,11 +159,8 @@ pub struct CTRBCState {
     pub pending_recon_shares: Vec<(BatchWSSReconMsg, Replica, usize)>,
 
     // ---- Post-ACS audit / accountability ----
-    pub post_complaint_packets: HashMap<
-        Replica,
-        MulticastRecoveredSharesMsg,
-        nohash_hasher::BuildNoHashHasher<Replica>,
-    >,
+    pub post_complaint_packets:
+        HashMap<Replica, MulticastRecoveredSharesMsg, nohash_hasher::BuildNoHashHasher<Replica>>,
     pub recovered_shares_multicast_sent: bool,
     pub batch_reconstruction_complete: bool,
     pub post_complaint_complete: bool,
@@ -184,6 +179,14 @@ pub struct CTRBCState {
     /// `Vec<Vec<u8>>` indexed by sub-output.
     pub pending_beacon_outputs:
         HashMap<usize, Vec<Vec<u8>>, nohash_hasher::BuildNoHashHasher<usize>>,
+
+    // ---- First-match leader election ----
+    /// The first accepted leader from the rejection-sampling scan
+    /// across all `(coin, sub_output)` pairs in batch order.
+    /// Set once by `self_coin_check_transmit` when the first value
+    /// passes `CoinMapper::try_leader`; subsequent coins are still
+    /// emitted to the syncer but do not overwrite this.
+    pub first_match_leader: Option<FirstMatchLeader>,
 
     // ---- Round bootstrap flags ----
     /// Pure-PPT mode dealer-launch idempotency flag.
@@ -236,6 +239,8 @@ impl CTRBCState {
             multicast_disclosed_coins: HashSet::default(),
             emitted_beacon_coins: HashSet::default(),
             pending_beacon_outputs: HashMap::default(),
+
+            first_match_leader: None,
 
             ppt_round_started: false,
             ppt_round_finished: false,
@@ -409,7 +414,11 @@ impl CTRBCState {
             let f_large_opt = if in_gf2_mode {
                 None
             } else {
-                match self.f_large_shares.get(&rep).and_then(|v| v.get(coin_number)) {
+                match self
+                    .f_large_shares
+                    .get(&rep)
+                    .and_then(|v| v.get(coin_number))
+                {
                     Some(fl) => Some(*fl),
                     None => continue,
                 }
@@ -431,7 +440,11 @@ impl CTRBCState {
             origins: replicas,
             mps: merkle_proofs,
             mask_shares,
-            f_large_shares: if in_gf2_mode { None } else { Some(f_large_shares_vec) },
+            f_large_shares: if in_gf2_mode {
+                None
+            } else {
+                Some(f_large_shares_vec)
+            },
             empty: false,
         }
     }
@@ -553,7 +566,9 @@ impl CTRBCState {
                                 "[PPT][COIN-CHECK] round {} coin {} GF2 dealer {}'s recovered \
                                  secret has dirty bits beyond w_q; aborting extraction \
                                  (this should never happen post-Lagrange)",
-                                round, coin_number, dealer
+                                round,
+                                coin_number,
+                                dealer
                             );
                             return None;
                         }
@@ -576,7 +591,8 @@ impl CTRBCState {
                     "[PPT][COIN-CHECK] round {} coin {} skipped: BOTH BigUint and GF2 \
                      extractors set (programmer bug — finalize_acs_round must populate \
                      exactly one based on the profile)",
-                    round, coin_number
+                    round,
+                    coin_number
                 );
                 return None;
             }
@@ -638,6 +654,8 @@ impl CTRBCState {
         self.multicast_disclosed_coins.clear();
         self.emitted_beacon_coins.clear();
         self.pending_beacon_outputs.clear();
+
+        self.first_match_leader = None;
 
         self.ppt_round_started = false;
         self.ppt_round_finished = false;

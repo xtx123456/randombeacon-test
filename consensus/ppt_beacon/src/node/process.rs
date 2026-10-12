@@ -259,8 +259,42 @@ pub(crate) fn avss_local_packet_valid_pure(
         }
     }
 
+    // Canonical coefficient count for every committed polynomial:
+    // `t = f + 1`, i.e. degree `<= f`.
+    let canonical_coeff_len = num_faults + 1;
+
     for coin_num in 0..batch_size {
         let coeffs = &degree_test_coeffs[coin_num];
+
+        // **Degree bound on the public degree-test polynomial.**
+        //
+        // The pointwise identity `h(e_i) = g(e_i) + θ·f(e_i)` that
+        // `verify_share` checks says nothing about `deg(h)`: a dealer
+        // that publishes `F(x) = x^(f+1)`, `G = 0` and
+        // `h = θ·F` satisfies it at every evaluation point while
+        // secret-sharing a degree-`f+1` polynomial, so `f + 1` shares
+        // no longer determine the secret and the scheme loses
+        // `f`-privacy. The bound therefore has to be enforced on the
+        // ENCODING, before any evaluation happens.
+        //
+        // The encoding is fixed-length: honest dealers always emit
+        // exactly `f + 1` coefficients (`compute_degree_test_poly`
+        // zero-pads lower-degree polynomials), so anything longer or
+        // shorter is rejected outright rather than truncated or
+        // padded here. Both field paths share this check.
+        if coeffs.len() != canonical_coeff_len {
+            log::warn!(
+                "[PPT][AVSS] dealer {} round {} coin {} published {} degree-test \
+                 coefficients, expected exactly {} (deg(h) <= f); rejecting at node {}",
+                dealer,
+                round,
+                coin_num,
+                coeffs.len(),
+                canonical_coeff_len,
+                myid
+            );
+            return Err("degree-test polynomial violates the deg <= f bound");
+        }
 
         // Per-coin degree-test verification + small/large cross-binding,
         // dispatched on the field profile. Both branches return on
@@ -307,13 +341,41 @@ pub(crate) fn avss_local_packet_valid_pure(
                 // is the identity (the bytes are the same). This
                 // also makes the cross-binding check below
                 // tautological, so we skip it.
-                let f_large =
+                //
+                // `from_bytes` only establishes that the value fits in
+                // `w_q` bits. Dropping the f_large channel means the
+                // share IS the thing the degree test consumes, so it
+                // additionally has to be a genuine `GF(2^w_p)`
+                // element: the reconstruction path interpolates these
+                // as base-field values and the two-field privacy
+                // argument is stated over the small field. A share
+                // with components above `w_p` is rejected, never
+                // masked down — masking would accept a value the
+                // dealer never committed to.
+                let share_elem =
                     crypto::gf2::Gf2Element::from_bytes(profile, wssmsg.secrets[coin_num])
                         .map_err(|_| "GF2 small share has dirty high bits")?;
+                if !share_elem.is_in_small_field() {
+                    log::warn!(
+                        "[PPT][AVSS] dealer {} round {} coin {}: share is not a GF(2^{}) \
+                         element (has components above w_p) at node {}",
+                        dealer,
+                        round,
+                        coin_num,
+                        profile.w_p,
+                        myid
+                    );
+                    return Err("share is not an element of the small field GF(2^w_p)");
+                }
+                let f_large = share_elem;
                 let g_share = crypto::gf2::Gf2Element::from_bytes(profile, mask_shares[coin_num])
                     .map_err(|_| "GF2 mask_share has dirty high bits")?;
 
-                if !verifier.verify_share(
+                // `verify_share_checked` re-asserts the degree bound
+                // and the base-field membership independently of the
+                // checks above, so the dealer API is safe on its own,
+                // and returns the specific reason for blame routing.
+                if let Err(reason) = verifier.verify_share_checked(
                     myid + 1,
                     &f_large,
                     &g_share,
@@ -321,10 +383,11 @@ pub(crate) fn avss_local_packet_valid_pure(
                     theta_elem,
                 ) {
                     log::warn!(
-                        "[PPT][AVSS] GF2 degree-test failed for dealer {} round {} coin {} at node {}",
-                        dealer, round, coin_num, myid
+                        "[PPT][AVSS] GF2 share rejected for dealer {} round {} coin {} at \
+                         node {}: {}",
+                        dealer, round, coin_num, myid, reason
                     );
-                    return Err("degree test failed");
+                    return Err(reason);
                 }
             }
         }
@@ -1196,11 +1259,31 @@ impl Context {
                 }
                 Some(profile) => {
                     rbc_state.super_inv_extractor = None;
-                    rbc_state.gf2_super_inv_extractor = Some(Gf2SuperInvExtractor::new(
-                        profile,
-                        alpha_points,
-                        num_outputs,
-                    ));
+                    // The GF(2^w) extractor needs `m + num_outputs`
+                    // distinct base-field points; with a narrow `w_p`
+                    // that budget can genuinely run out. Surface the
+                    // failure instead of silently extracting fewer or
+                    // aliased outputs — `coin_check` already treats a
+                    // missing extractor as "cannot extract this round".
+                    match Gf2SuperInvExtractor::new(profile, alpha_points, num_outputs) {
+                        Ok(extractor) => {
+                            rbc_state.gf2_super_inv_extractor = Some(extractor);
+                        }
+                        Err(e) => {
+                            log::error!(
+                                "[PPT][ACS-RECON] node {} round {} cannot build the GF(2^w) \
+                                 super-invertible extractor for {} decided dealers with \
+                                 {} outputs under {}: {}",
+                                self.myid,
+                                round,
+                                m,
+                                num_outputs,
+                                profile,
+                                e
+                            );
+                            rbc_state.gf2_super_inv_extractor = None;
+                        }
+                    }
                 }
             }
 
@@ -1846,5 +1929,341 @@ mod avss_binding_tests {
             res.is_err(),
             "GF2-produced packet must NOT pass BigUint verification (cluster-config mismatch must fail-loud)"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Byzantine-dealer tests against the REAL inbound validation path.
+    //
+    // Each of these builds a packet that is internally consistent in
+    // every way an honest dealer's packet is — committed Merkle leaves,
+    // a root_vec the proofs chain to, and a degree-test polynomial
+    // computed under the genuine Fiat-Shamir θ derived from that very
+    // root_vec — and violates exactly one of the properties the
+    // receiver is supposed to enforce. They go through
+    // `avss_local_packet_valid_pure`, not through a helper, so a check
+    // that exists only in the dealer API would not satisfy them.
+    // -----------------------------------------------------------------
+
+    /// Which property the Byzantine dealer violates.
+    #[derive(Clone, Copy)]
+    enum Gf2DealerAttack {
+        /// `F(x) = x^(f+1)`, `G = 0`, `h = θ·F`. The pointwise
+        /// identity `g(i) + θ·f(i) = h(i)` holds at every evaluation
+        /// point, so an evaluation-only verifier accepts, but
+        /// `deg(F) = f + 1` destroys `f`-privacy.
+        OverDegreeH,
+        /// `f` is sampled with full-width `GF(2^w_q)` coefficients, so
+        /// the shares are not base-field elements. Degree `f` and the
+        /// degree test are both respected; only the two-field
+        /// small-field invariant is broken.
+        ShareOutsideSmallField,
+    }
+
+    /// Byzantine sibling of `build_honest_packet_gf2`.
+    fn build_byzantine_packet_gf2(
+        profile: Gf2Profile,
+        dealer: Replica,
+        myid: usize,
+        round: Round,
+        batch_size: usize,
+        n: usize,
+        f: usize,
+        attack: Gf2DealerAttack,
+    ) -> (BeaconMsg, Hash, BigUint, HashState) {
+        use crate::node::shamir::gf2_two_field::{eval_poly_horner, small_field_point};
+
+        let q = large_prime();
+        let hc = hash_state();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xBAD_5EED);
+
+        let t = f + 1;
+        let zero = Gf2Element::zero(profile);
+
+        // Per coin: the (possibly malformed) f and g polynomials.
+        let mut polys: Vec<(Vec<Gf2Element>, Vec<Gf2Element>)> = Vec::with_capacity(batch_size);
+        for _ in 0..batch_size {
+            match attack {
+                Gf2DealerAttack::OverDegreeH => {
+                    // F(x) = x^(f+1): one coefficient too many.
+                    let mut f_poly = vec![zero; t + 1];
+                    f_poly[t] = Gf2Element::one(profile);
+                    let g_poly = vec![zero; t + 1];
+                    polys.push((f_poly, g_poly));
+                }
+                Gf2DealerAttack::ShareOutsideSmallField => {
+                    // Degree f, but coefficients drawn from the FULL
+                    // large field rather than the base field.
+                    let mut f_poly = Vec::with_capacity(t);
+                    let mut g_poly = Vec::with_capacity(t);
+                    for _ in 0..t {
+                        let mut buf = [0u8; 32];
+                        rng.fill(&mut buf[..]);
+                        f_poly.push(Gf2Element::from_random_bytes(profile, buf));
+                        let mut buf2 = [0u8; 32];
+                        rng.fill(&mut buf2[..]);
+                        g_poly.push(Gf2Element::from_random_bytes(profile, buf2));
+                    }
+                    polys.push((f_poly, g_poly));
+                }
+            }
+        }
+
+        // Evaluate at every recipient and commit, exactly as an
+        // honest dealer would.
+        let mut mask_per_node: Vec<Vec<Val>> = vec![Vec::with_capacity(batch_size); n];
+        let mut secret_per_node: Vec<Vec<Val>> = vec![Vec::with_capacity(batch_size); n];
+        let mut nonce_per_node: Vec<Vec<Val>> = vec![Vec::with_capacity(batch_size); n];
+        let mut hashes_vec: Vec<Vec<Hash>> = Vec::with_capacity(batch_size);
+
+        for coin in 0..batch_size {
+            let (f_poly, g_poly) = &polys[coin];
+            let nonce = rng.gen_biguint_range(&BigUint::from(0u32), &q);
+            let nonce_bytes = pad32(nonce);
+            let mut coin_leaves: Vec<Hash> = Vec::with_capacity(n);
+            for i in 1..=n {
+                let x = small_field_point(profile, i);
+                let f_at = eval_poly_horner(profile, f_poly, x);
+                let g_at = eval_poly_horner(profile, g_poly, x);
+                let f_share = *f_at.as_bytes();
+                let g_share = *g_at.as_bytes();
+                coin_leaves.push(types::beacon::avss_commit_leaf_gf2(
+                    &f_share,
+                    &g_share,
+                    &nonce_bytes,
+                ));
+                secret_per_node[i - 1].push(f_share);
+                mask_per_node[i - 1].push(g_share);
+                nonce_per_node[i - 1].push(nonce_bytes);
+            }
+            hashes_vec.push(coin_leaves);
+        }
+
+        let mt_vec = MerkleTree::build_trees(hashes_vec, &hc);
+        let roots_vec: Vec<Hash> = mt_vec.iter().map(|mt| mt.root()).collect();
+
+        // The genuine Fiat-Shamir challenge, derived from the dealer's
+        // own commitment — the attack does not depend on cheating here.
+        let theta = Context::theta_from_commitment_gf2(round, dealer, &roots_vec, profile);
+
+        // h = g + θ·f, computed with the general multiplication so the
+        // dealer-side small-field assertions are not in the way.
+        let mut degree_test_coeffs: Vec<Vec<Val>> = Vec::with_capacity(batch_size);
+        for coin in 0..batch_size {
+            let (f_poly, g_poly) = &polys[coin];
+            let len = f_poly.len().max(g_poly.len());
+            let mut h: Vec<Val> = Vec::with_capacity(len);
+            for i in 0..len {
+                let f_i = f_poly.get(i).copied().unwrap_or(zero);
+                let g_i = g_poly.get(i).copied().unwrap_or(zero);
+                h.push(*g_i.add(&theta.mul(&f_i)).as_bytes());
+            }
+            degree_test_coeffs.push(h);
+        }
+
+        let mut my_secrets: Vec<Val> = Vec::with_capacity(batch_size);
+        let mut my_nonces: Vec<Val> = Vec::with_capacity(batch_size);
+        let mut my_mps = Vec::with_capacity(batch_size);
+        for coin in 0..batch_size {
+            my_secrets.push(secret_per_node[myid][coin]);
+            my_nonces.push(nonce_per_node[myid][coin]);
+            my_mps.push(mt_vec[coin].gen_proof(myid));
+        }
+
+        let wss = BatchWSSMsg::new(dealer, my_secrets, my_nonces, my_mps);
+        let beacon = BeaconMsg::new_two_field(
+            dealer,
+            round,
+            wss,
+            roots_vec,
+            Vec::new(),
+            degree_test_coeffs,
+            mask_per_node[myid].clone(),
+            None,
+        );
+        let transcript = crypto::hash::do_hash(beacon.serialize_ctrbc().as_slice());
+        (beacon, transcript, q, hc)
+    }
+
+    /// `F = X^(f+1)`, `G = 0`, `h = θ·F`: the pointwise degree-test
+    /// identity holds everywhere, yet `deg(h) > f`. The real inbound
+    /// path must reject on the coefficient count.
+    #[test]
+    fn avss_rejects_over_degree_h_polynomial() {
+        let (n, f, batch_size) = n_f();
+        let profile = gf2_test_profile();
+        let (beacon, transcript, q, hc) = build_byzantine_packet_gf2(
+            profile,
+            0,
+            1,
+            42,
+            batch_size,
+            n,
+            f,
+            Gf2DealerAttack::OverDegreeH,
+        );
+
+        // Confirm the attack's premise: the packet really does carry
+        // f + 2 coefficients and the identity really does hold, so the
+        // rejection below is about the degree bound and nothing else.
+        let coeffs = beacon.degree_test_coeffs.as_ref().unwrap();
+        assert_eq!(
+            coeffs[0].len(),
+            f + 2,
+            "attack setup should produce one coefficient too many"
+        );
+
+        let p = small_prime();
+        let res = avss_local_packet_valid_pure(
+            &beacon,
+            &transcript,
+            0,
+            42,
+            &hc,
+            &p,
+            &q,
+            f,
+            n,
+            batch_size,
+            0,
+            1,
+            Some(profile),
+        );
+        assert_eq!(
+            res,
+            Err("degree-test polynomial violates the deg <= f bound"),
+            "an over-degree h must be rejected on the real receive path"
+        );
+    }
+
+    /// The same degree-bound rejection must apply on the BigUint
+    /// path, which shares the coefficient-count check.
+    #[test]
+    fn avss_rejects_over_degree_h_polynomial_biguint_mode() {
+        let (n, f, batch_size) = n_f();
+        let (mut beacon, _t0, p, q, _theta, hc) =
+            build_honest_packet(0, 1, 42, batch_size, n, f, false);
+        // Append a trailing coefficient: still the same polynomial
+        // mathematically, but no longer the canonical fixed-length
+        // encoding, so the degree bound is no longer pinned.
+        {
+            let coeffs = beacon.degree_test_coeffs.as_mut().unwrap();
+            for c in coeffs.iter_mut() {
+                c.push([0u8; 32]);
+            }
+        }
+        let transcript = crypto::hash::do_hash(beacon.serialize_ctrbc().as_slice());
+        let res = avss_local_packet_valid_pure(
+            &beacon,
+            &transcript,
+            0,
+            42,
+            &hc,
+            &p,
+            &q,
+            f,
+            n,
+            batch_size,
+            0,
+            1,
+            None,
+        );
+        assert_eq!(
+            res,
+            Err("degree-test polynomial violates the deg <= f bound")
+        );
+    }
+
+    /// Shares that are not `GF(2^w_p)` elements must be rejected, not
+    /// masked down. The packet is otherwise impeccable: degree `f`,
+    /// honest Fiat-Shamir θ, committed leaves, valid proofs, and the
+    /// degree test passes.
+    #[test]
+    fn avss_rejects_share_outside_small_field() {
+        let (n, f, batch_size) = n_f();
+        let profile = gf2_test_profile();
+        let (beacon, transcript, q, hc) = build_byzantine_packet_gf2(
+            profile,
+            0,
+            1,
+            42,
+            batch_size,
+            n,
+            f,
+            Gf2DealerAttack::ShareOutsideSmallField,
+        );
+
+        // Premise: the shipped share really does escape GF(2^w_p).
+        let share0 = beacon.wss.as_ref().unwrap().secrets[0];
+        let elem = Gf2Element::from_bytes(profile, share0).unwrap();
+        assert!(
+            !elem.is_in_small_field(),
+            "attack setup failed to produce an out-of-subfield share"
+        );
+        // Premise: the degree bound is respected, so the rejection
+        // below is specifically about subfield membership.
+        assert_eq!(beacon.degree_test_coeffs.as_ref().unwrap()[0].len(), f + 1);
+
+        let p = small_prime();
+        let res = avss_local_packet_valid_pure(
+            &beacon,
+            &transcript,
+            0,
+            42,
+            &hc,
+            &p,
+            &q,
+            f,
+            n,
+            batch_size,
+            0,
+            1,
+            Some(profile),
+        );
+        assert_eq!(
+            res,
+            Err("share is not an element of the small field GF(2^w_p)"),
+            "a share outside GF(2^w_p) must be rejected on the real receive path"
+        );
+    }
+
+    /// The honest GF(2^w) packet must still be accepted after both
+    /// new checks are in place — a guard that rejects everything is
+    /// not a fix.
+    #[test]
+    fn honest_gf2_packet_still_accepted_under_new_checks() {
+        for &(w_p, w_q) in &[(8usize, 64usize), (16, 64), (32, 128), (64, 64), (64, 256)] {
+            let (n, f, batch_size) = n_f();
+            let profile = Gf2Profile::new(w_p, w_q).unwrap();
+            let (beacon, transcript, q, hc) =
+                build_honest_packet_gf2(profile, 0, 1, 42, batch_size, n, f, false);
+            assert_eq!(
+                beacon.degree_test_coeffs.as_ref().unwrap()[0].len(),
+                f + 1,
+                "honest dealer must use the canonical coefficient count"
+            );
+            let p = small_prime();
+            let res = avss_local_packet_valid_pure(
+                &beacon,
+                &transcript,
+                0,
+                42,
+                &hc,
+                &p,
+                &q,
+                f,
+                n,
+                batch_size,
+                0,
+                1,
+                Some(profile),
+            );
+            assert!(
+                res.is_ok(),
+                "honest GF2 packet at ({},{}) must validate: {:?}",
+                w_p,
+                w_q,
+                res
+            );
+        }
     }
 }
