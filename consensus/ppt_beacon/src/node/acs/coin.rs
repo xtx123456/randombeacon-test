@@ -480,7 +480,24 @@ impl Context {
                     if !ok {
                         return false;
                     }
-                    let c_d = lagrange_recover_at_zero(profile, &points);
+                    let c_d = match lagrange_recover_at_zero(profile, &points) {
+                        Ok(elem) => elem,
+                        Err(e) => {
+                            // A rejected provider set means this coin
+                            // secret is not recoverable; report and
+                            // abstain rather than folding a bogus
+                            // value into the common coin.
+                            log::error!(
+                                "[PPT][GF2-COIN] dealer {} acs_round {} aba_round {}: \
+                                 Lagrange recovery rejected the provider set: {}",
+                                d,
+                                acs_round,
+                                aba_round,
+                                e
+                            );
+                            return false;
+                        }
+                    };
                     // Char-2 sum: XOR each coordinate.
                     acc = acc.add(&c_d);
                 }

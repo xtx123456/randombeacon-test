@@ -1328,7 +1328,25 @@ impl Context {
                         if !ok {
                             continue;
                         }
-                        let secret_elem = lagrange_recover_at_zero(profile, &points);
+                        let secret_elem = match lagrange_recover_at_zero(profile, &points) {
+                            Ok(elem) => elem,
+                            Err(e) => {
+                                // Explicit failure, never a silent
+                                // zero: a colliding or out-of-capacity
+                                // provider set means this coin cannot
+                                // be reconstructed and must be
+                                // reported, not papered over.
+                                log::error!(
+                                    "[PPT][GF2-RECOVER] coin {} dealer {} Lagrange recovery \
+                                     rejected provider set {:?}: {}",
+                                    task.coin,
+                                    task.dealer,
+                                    task.eval_points,
+                                    e
+                                );
+                                continue;
+                            }
+                        };
                         // Wrap the GF2 element bytes inside a BigUint so
                         // the existing reconstructed_secrets storage
                         // shape is preserved. Commit 6 will replace this
