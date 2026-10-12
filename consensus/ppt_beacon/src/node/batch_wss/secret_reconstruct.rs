@@ -7,22 +7,18 @@ use std::{
 use async_recursion::async_recursion;
 use num_bigint::BigUint;
 use types::{
-    beacon::{
-        BatchBeaconConstructMsg,
-        BatchWSSReconMsg,
-        CoinMsg,
-        MulticastRecoveredSharesMsg,
-        RecoveredCoinSharesMsg,
-        Val,
-    },
     beacon::Round,
+    beacon::{
+        BatchBeaconConstructMsg, BatchWSSReconMsg, CoinMsg, MulticastRecoveredSharesMsg,
+        RecoveredCoinSharesMsg, Val,
+    },
     Replica,
 };
 
-use crate::node::{Context, CTRBCState};
 use crate::node::ctrbc::state::BlameReason;
 use crate::node::shamir::two_field::BatchExtractor;
 use crate::node::shoup_smart::proof_leaf_index;
+use crate::node::{CTRBCState, Context};
 use crypto::aes_hash::HashState;
 use crypto::hash::Hash;
 use std::time::UNIX_EPOCH;
@@ -106,8 +102,16 @@ pub enum CoinVerifyOutcome {
 /// dealers; this function only computes the evidence.
 pub(crate) fn audit_post_complaint_pure(
     decided: Vec<Replica>,
-    comm_vectors: HashMap<Replica, Vec<crypto::hash::Hash>, nohash_hasher::BuildNoHashHasher<Replica>>,
-    post_packets: HashMap<Replica, MulticastRecoveredSharesMsg, nohash_hasher::BuildNoHashHasher<Replica>>,
+    comm_vectors: HashMap<
+        Replica,
+        Vec<crypto::hash::Hash>,
+        nohash_hasher::BuildNoHashHasher<Replica>,
+    >,
+    post_packets: HashMap<
+        Replica,
+        MulticastRecoveredSharesMsg,
+        nohash_hasher::BuildNoHashHasher<Replica>,
+    >,
     audit_senders: Vec<Replica>,
     batch_size: usize,
     hash_context: &crypto::aes_hash::HashState,
@@ -282,7 +286,9 @@ pub fn verify_recon_shares_pure(
         // Merkle-validation path in this codebase). A single bad proof
         // taints the whole packet from this provider; we simply skip
         // it and rely on the other >= 2f+1 honest providers.
-        if packet.mps.is_empty() || !crypto::aes_hash::Proof::validate_batch(&packet.mps, hash_context) {
+        if packet.mps.is_empty()
+            || !crypto::aes_hash::Proof::validate_batch(&packet.mps, hash_context)
+        {
             continue;
         }
 
@@ -353,10 +359,7 @@ pub fn verify_recon_shares_pure(
 /// Keep only ACS-decided dealers/messages inside a batch reconstruction packet.
 /// This is the key alignment with the PPT requirement:
 /// "We only reconstruct the secret chosen by ACS".
-fn filter_packet_to_decided(
-    packet: &BatchWSSReconMsg,
-    decided: &[Replica],
-) -> BatchWSSReconMsg {
+fn filter_packet_to_decided(packet: &BatchWSSReconMsg, decided: &[Replica]) -> BatchWSSReconMsg {
     let decided_set: HashSet<Replica> = decided.iter().copied().collect();
     let mut filtered = packet.clone();
     filtered.origins.clear();
@@ -378,9 +381,10 @@ fn filter_packet_to_decided(
             filtered.nonces.push(packet.nonces[idx].clone());
             filtered.mps.push(packet.mps[idx].clone());
             filtered.mask_shares.push(packet.mask_shares[idx].clone());
-            if let (Some(src), Some(dst)) =
-                (packet.f_large_shares.as_ref(), filtered_f_large_vec.as_mut())
-            {
+            if let (Some(src), Some(dst)) = (
+                packet.f_large_shares.as_ref(),
+                filtered_f_large_vec.as_mut(),
+            ) {
                 if idx < src.len() {
                     dst.push(src[idx].clone());
                 }
@@ -753,9 +757,11 @@ impl Context {
                     );
                     for entry in recovered.packets.into_iter() {
                         if packet_lengths_ok(&entry.packet) {
-                            rbc_state
-                                .pre_acs_beacon_constructs
-                                .push((entry.packet, sender, entry.coin_num));
+                            rbc_state.pre_acs_beacon_constructs.push((
+                                entry.packet,
+                                sender,
+                                entry.coin_num,
+                            ));
                         }
                     }
                     self.add_benchmark(
@@ -775,8 +781,7 @@ impl Context {
         //     overtook its dealer's AVSS commitment), we buffer the
         //     whole packet in `pending_recon_shares` for replay once
         //     the commitment lands, rather than dropping it.
-        let mut verify_inputs: Vec<CoinVerifyInputs> =
-            Vec::with_capacity(recovered.packets.len());
+        let mut verify_inputs: Vec<CoinVerifyInputs> = Vec::with_capacity(recovered.packets.len());
         let decided_set: HashSet<Replica> = decided.iter().copied().collect();
         {
             let rbc_state = self.round_state.get_mut(&round).unwrap();
@@ -861,7 +866,9 @@ impl Context {
                 log::error!(
                     "[PPT][LEVEL2] bulk share-verify blocking task join error \
                      round {} sender {}: {}",
-                    round, share_sender, e
+                    round,
+                    share_sender,
+                    e
                 );
                 Vec::new()
             });
@@ -1031,7 +1038,7 @@ impl Context {
             rbc_state.pending_recon_shares.extend(still_pending);
         }
     }
-    
+
     /// Public entry: recover every ready coin for `round` and emit
     /// the resulting beacons. **Optimisation B (2026-05): coin-0
     /// fast path.** Coin-0's reconstructed beacon is the source of
@@ -1150,7 +1157,8 @@ impl Context {
         } else {
             // Standard one-shot batch path (e.g. coin-0 already emitted
             // or coin-0 is not in this batch's ready set yet).
-            self.recover_and_emit_coin_set(round, ready_initial, true).await;
+            self.recover_and_emit_coin_set(round, ready_initial, true)
+                .await;
         }
     }
 
@@ -1171,8 +1179,11 @@ impl Context {
                 Some(d) => d,
                 None => return,
             };
-            let mut disclosed: Vec<usize> =
-                rbc_state.multicast_disclosed_coins.iter().copied().collect();
+            let mut disclosed: Vec<usize> = rbc_state
+                .multicast_disclosed_coins
+                .iter()
+                .copied()
+                .collect();
             disclosed.sort_unstable();
             if disclosed.is_empty() {
                 return;
@@ -1196,7 +1207,8 @@ impl Context {
             );
             let coin_msg = CoinMsg::MulticastRecoveredShares(msg.clone(), self.myid, round);
             self.broadcast(coin_msg, round).await;
-            self.process_multicast_recovered_shares(msg, self.myid, round).await;
+            self.process_multicast_recovered_shares(msg, self.myid, round)
+                .await;
         }
     }
 
@@ -1246,8 +1258,7 @@ impl Context {
                 .clone()
                 .expect("ACS decided set missing during ready-coin recovery");
             let threshold = self.num_faults + 1;
-            let tasks =
-                build_dealer_recover_tasks(rbc_state, coin_set.as_slice(), threshold);
+            let tasks = build_dealer_recover_tasks(rbc_state, coin_set.as_slice(), threshold);
             (tasks, decided)
         };
 
@@ -1288,9 +1299,10 @@ impl Context {
                     let mut cache: HashMap<Vec<usize>, BatchExtractor> = HashMap::new();
                     let mut out = Vec::with_capacity(tasks.len());
                     for task in tasks.into_iter() {
-                        let extractor = cache.entry(task.eval_points.clone()).or_insert_with(|| {
-                            BatchExtractor::new(task.eval_points.clone(), secret_domain.clone())
-                        });
+                        let extractor =
+                            cache.entry(task.eval_points.clone()).or_insert_with(|| {
+                                BatchExtractor::new(task.eval_points.clone(), secret_domain.clone())
+                            });
                         let secret = extractor.recover_one(&task.shares);
                         out.push((task.coin, task.dealer, secret));
                     }
@@ -1331,7 +1343,9 @@ impl Context {
                                          (1-based) {} share has dirty bits beyond w_q; \
                                          skipping (this should never happen on a packet \
                                          that already passed AVSS validation)",
-                                        task.coin, task.dealer, task.eval_points[idx]
+                                        task.coin,
+                                        task.dealer,
+                                        task.eval_points[idx]
                                     );
                                     ok = false;
                                     break;
@@ -1376,7 +1390,8 @@ impl Context {
         .unwrap_or_else(|e| {
             log::error!(
                 "[PPT][LEVEL2] batch_recover blocking task join error round {}: {}",
-                round, e
+                round,
+                e
             );
             Vec::new()
         });
@@ -1411,8 +1426,11 @@ impl Context {
                 rbc_state.multicast_disclosed_coins.insert(coin);
             }
 
-            let mut disclosed: Vec<usize> =
-                rbc_state.multicast_disclosed_coins.iter().copied().collect();
+            let mut disclosed: Vec<usize> = rbc_state
+                .multicast_disclosed_coins
+                .iter()
+                .copied()
+                .collect();
             disclosed.sort_unstable();
 
             // Audit multicast is only built when the caller asked
@@ -1459,7 +1477,6 @@ impl Context {
         self.flush_pending_beacon_outputs(round, "ready-coin fast-path")
             .await;
     }
-    
 
     #[async_recursion]
     pub async fn reconstruct_beacon(&mut self, round: Round, _coin_number: usize) {
@@ -1493,7 +1510,8 @@ impl Context {
         if let Some(msg) = maybe_msg {
             let prot_msg = CoinMsg::BatchBeaconConstruct(msg.clone(), self.myid, round);
             self.broadcast(prot_msg, round).await;
-            self.process_batch_secret_shares(msg, self.myid, round).await;
+            self.process_batch_secret_shares(msg, self.myid, round)
+                .await;
         }
 
         self.add_benchmark(
@@ -1521,7 +1539,8 @@ impl Context {
                 packet: recon_shares,
             }],
         };
-        self.process_batch_secret_shares(batch, share_sender, round).await;
+        self.process_batch_secret_shares(batch, share_sender, round)
+            .await;
     }
 
     /// Inbound `MulticastRecoveredShares(round, sender, snapshot)`.
@@ -1635,7 +1654,8 @@ impl Context {
                 return;
             }
 
-            let mut senders: Vec<Replica> = rbc_state.post_complaint_packets.keys().copied().collect();
+            let mut senders: Vec<Replica> =
+                rbc_state.post_complaint_packets.keys().copied().collect();
             senders.sort_unstable();
             senders.truncate(threshold);
 
@@ -1698,7 +1718,8 @@ impl Context {
             .unwrap_or_else(|e| {
                 log::error!(
                     "[PPT][LEVEL2] post-complaint audit blocking task join error round {}: {}",
-                    round, e
+                    round,
+                    e
                 );
                 Vec::new()
             });
@@ -1817,7 +1838,8 @@ impl Context {
             coin_num,
             numbers.len()
         );
-        let is_last_coin = self.round_state
+        let is_last_coin = self
+            .round_state
             .get(&round)
             .map(|state| state.recon_secrets.contains(&(self.batch_size - 1)))
             .unwrap_or(false);
@@ -1870,37 +1892,60 @@ impl Context {
                     .unwrap()
                     .as_millis()
             );
-            log::info!("Number of messages passed between nodes: {}", self.num_messages);
+            log::info!(
+                "Number of messages passed between nodes: {}",
+                self.num_messages
+            );
         }
 
         // Emit each extracted beacon value under its own global index.
+        // Simultaneously, check whether this value is accepted by the
+        // rejection-sampling mapper; if the round has not yet found a
+        // first-match leader, record it in `CTRBCState`.
         for (i, number) in numbers.into_iter().enumerate() {
             let global_index = coin_num * outputs_per_coin + i;
 
-            // PPT pg 30-32 first-match optimisation: report whether this
-            // particular output lies in the rejection-sampling "good
-            // range", so a downstream BFT consumer that wants a uniform
-            // [1,n] beacon can deterministically pick the first matched
-            // value in (coin, sub-output) order.
-            if self.coin_value_matches_uniform_range(number.as_slice()) {
-                log::info!(
-                    "[PPT][FIRST-MATCH] node {} round {} coin {} sub {} (index {}) lies in the uniform-sample range [0, n*floor(p/n))",
-                    self.myid,
-                    round,
-                    coin_num,
-                    i,
-                    global_index
-                );
+            let has_first_match = self
+                .round_state
+                .get(&round)
+                .and_then(|st| st.first_match_leader.as_ref())
+                .is_some();
+
+            if !has_first_match {
+                if let Some(leader) = self.coin_mapper.try_leader(number.as_slice()) {
+                    log::info!(
+                        "[PPT][FIRST-MATCH] node {} round {} coin {} sub {} (index {}) \
+                         => leader {} (uniform in {{1, …, {}}})",
+                        self.myid,
+                        round,
+                        coin_num,
+                        i,
+                        global_index,
+                        leader,
+                        self.coin_mapper.n()
+                    );
+                    if let Some(st) = self.round_state.get_mut(&round) {
+                        st.first_match_leader = Some(crate::node::coin_mapper::FirstMatchLeader {
+                            leader,
+                            coin_index: coin_num,
+                            sub_index: i,
+                            raw_bytes: number.clone(),
+                        });
+                    }
+                }
             }
 
-            let cancel_handler = self.sync_send.send(
-                0,
-                SyncMsg {
-                    sender: self.myid,
-                    state: SyncState::BeaconRecon(round, self.myid, global_index, number),
-                    value: 0,
-                }
-            ).await;
+            let cancel_handler = self
+                .sync_send
+                .send(
+                    0,
+                    SyncMsg {
+                        sender: self.myid,
+                        state: SyncState::BeaconRecon(round, self.myid, global_index, number),
+                        value: 0,
+                    },
+                )
+                .await;
             self.add_cancel_handler(cancel_handler);
         }
     }
@@ -1981,7 +2026,9 @@ mod recon_fix_tests {
             let g_share = pad32(&sampled.mask_shares[i].1);
             let f_large = pad32(&sampled.f_large_shares[i].1);
             let nonce = pad32(&rng.gen_biguint_range(&BigUint::from(0u32), &q));
-            leaf_hashes.push(types::beacon::avss_commit_leaf(&f_share, &g_share, &f_large, &nonce));
+            leaf_hashes.push(types::beacon::avss_commit_leaf(
+                &f_share, &g_share, &f_large, &nonce,
+            ));
             shares.push(f_share);
             masks.push(g_share);
             f_larges.push(f_large);
@@ -2019,11 +2066,7 @@ mod recon_fix_tests {
         }
     }
 
-    fn accept_one(
-        s: &HonestSharing,
-        dealer: Replica,
-        provider: usize,
-    ) -> Vec<CoinVerifyOutcome> {
+    fn accept_one(s: &HonestSharing, dealer: Replica, provider: usize) -> Vec<CoinVerifyOutcome> {
         let mut roots = HashMap::new();
         roots.insert(dealer, s.root);
         let decided = vec![dealer];
@@ -2053,12 +2096,7 @@ mod recon_fix_tests {
 
         // Try several distinct provider subsets of size f+1, including
         // ones that EXCLUDE specific nodes (simulating withholding).
-        let subsets = vec![
-            vec![0usize, 1],
-            vec![1, 2],
-            vec![2, 3],
-            vec![0, 3],
-        ];
+        let subsets = vec![vec![0usize, 1], vec![1, 2], vec![2, 3], vec![0, 3]];
         for subset in subsets {
             assert_eq!(subset.len(), threshold);
             let eval_points: Vec<usize> = subset.iter().map(|p| p + 1).collect();
@@ -2084,7 +2122,12 @@ mod recon_fix_tests {
         let s = build_honest_sharing(n, f, 0xABCD);
         for provider in 0..n {
             let outcomes = accept_one(&s, 0, provider);
-            assert_eq!(outcomes.len(), 1, "provider {} share must be accepted", provider);
+            assert_eq!(
+                outcomes.len(),
+                1,
+                "provider {} share must be accepted",
+                provider
+            );
             match &outcomes[0] {
                 CoinVerifyOutcome::Accepted {
                     coin_num,
@@ -2218,7 +2261,12 @@ mod recon_fix_tests {
         for &provider in &responding {
             let outcomes = accept_one(&s, dealer, provider);
             assert_eq!(outcomes.len(), 1);
-            if let CoinVerifyOutcome::Accepted { provider: pv, share, .. } = &outcomes[0] {
+            if let CoinVerifyOutcome::Accepted {
+                provider: pv,
+                share,
+                ..
+            } = &outcomes[0]
+            {
                 accepted_shares.insert(*pv as usize, BigUint::from_bytes_be(share));
             }
         }
