@@ -412,6 +412,9 @@ pub enum CoinMsg{
     /// phase from O(n^2) to O(n) wire messages per dealer per round.
     /// PQ-safety unchanged (no new primitives).
     AVSSPrivatePayload(Round, Replica, Vec<u8>),
+
+    /// PPTB-only extension. APPEND ONLY: preserve every existing BEA wire tag.
+    PPTBExtension(Vec<u8>),
 }
 
 /// Public AVSS commitment broadcast once per (round, dealer).

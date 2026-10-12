@@ -20,6 +20,8 @@ pub use ctrbc::*;
 
 pub mod acs;
 pub mod coin_mapper;
+pub mod options;
+mod wire;
 pub mod shoup_smart;
 
 mod avss_secmsg;

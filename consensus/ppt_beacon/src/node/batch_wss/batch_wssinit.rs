@@ -480,52 +480,10 @@ impl Context {
         assert_eq!(roots_vec.len(), total_coins);
         assert_eq!(degree_test_batch.len(), total_coins);
 
-        // ============================================================
-        // AVSS share-distribution dispatch.
-        //
-        // Step 1 (common to both transports): broadcast a single
-        // AvssPublicCommitMsg carrying root_vec + degree_test_coeffs
-        // + transcript-binding hash. Same wire payload regardless
-        // of transport; saves (n-1)x bytes vs the historical per-
-        // recipient duplication of these public fields.
-        //
-        // Step 2 (transport-specific): ship the per-recipient
-        // AvssRecipientPayload (secrets, nonces, mask_shares,
-        // f_large_shares, mps) to every other node. Two transports:
-        //
-        //   * AvssTransport::Lite (default): single AVSSPrivatePayload
-        //     unicast per recipient. O(n) wire messages per dealer
-        //     per round. Wire-layer confidentiality is provided by
-        //     the existing WrapperMsg HMAC + (typically) TLS, plus
-        //     the PPT-design observation that the post-ACS
-        //     MulticastRecoveredShares phase reveals these same
-        //     share bytes in cleartext anyway -- so application-
-        //     layer encryption only delays the leak by a few
-        //     hundred milliseconds and does not change any
-        //     adversary's information set in the steady-state PPT
-        //     beacon protocol.
-        //
-        //   * AvssTransport::SecMsg: full Shoup-Smart 2024 Sec 4.3
-        //     Pi_SecMsgDst dispersal (Shamir-shared master key +
-        //     per-recipient hash-chain PRG + RBC-style key &
-        //     cipher channels with Bracha echo / vote). O(n^2)
-        //     wire messages per dealer per round. Suitable for
-        //     paper-compliance benchmarks and for deployments
-        //     that cannot rely on wire-layer confidentiality.
-        //
-        // Step 3 (common): the receiver's try_finalize_avss_secmsg
-        // reconstructs an equivalent-shaped BeaconMsg and feeds it
-        // into the same process_avss_send pipeline the legacy
-        // cleartext AVSSSend path used. Every P0/P1/Level fix
-        // (theta buffering, banned_dealers, spawn_blocking,
-        // audit fire-and-forget, coin-0 fast-path) remains in
-        // force regardless of which transport delivered the bytes.
-        //
-        // appx_con is empty (Vec::new()) on the pure-PPT path
-        // (see vec_round_msgs above) so the BeaconMsg
-        // reconstruction on the receiver side does not need the
-        // dealer to ship appx_con explicitly.
-        // ============================================================
+        // Both share transports require private authenticated channels. Lite
+        // sends recipient bytes directly; SecMsg also commits/disperses encrypted
+        // payloads and high-entropy keys. Disclosure is delayed until the protocol
+        // permits it; later batch auditing never justifies early plaintext leaks.
         let _ = vec_round_msgs;
 
         // ----- Step 1: shared public commit broadcast -----
@@ -623,8 +581,7 @@ impl Context {
                             &sec_key,
                             new_round,
                         );
-                        let cancel = self.net_send.send(recipient, wrapper).await;
-                        self.add_cancel_handler(cancel);
+                        self.send(recipient, wrapper).await;
                     }
                 }
             }

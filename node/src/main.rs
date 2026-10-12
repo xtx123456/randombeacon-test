@@ -115,8 +115,12 @@ async fn main() -> Result<()> {
                     Err(e) => panic!("Invalid --field value '{}': {}", spec, e),
                 },
             };
-            exit_tx = ppt_beacon::node::Context::spawn(
-                config, sleep, batch, frequency, transport, gf2_profile,
+            let options = ppt_beacon::node::options::PptOptions::parse(
+                m.value_of("ppt-channel").unwrap_or("benchmark"),
+                m.value_of("ppt-security").unwrap_or("benchmark"),
+            )?;
+            exit_tx = ppt_beacon::node::Context::spawn_with_options(
+                config, sleep, batch, frequency, transport, gf2_profile, options,
             )
             .unwrap();
         },

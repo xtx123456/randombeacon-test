@@ -87,7 +87,8 @@ impl Context {
     /// state independently from the lazy-create path inside
     /// `get_or_init_avss_secmsg`.
     fn fresh_avss_secmsg_state(&self, dealer: Replica) -> SecMsgDstState {
-        let prime = self.secret_domain.clone();
+        // Transport keys are independent of the optimized beacon-share field.
+        let prime = (num_bigint::BigUint::from(1u8) << 521usize) - num_bigint::BigUint::from(1u8);
         let n = self.num_nodes;
         let t = self.num_faults;
         let myid = self.myid;
@@ -553,8 +554,7 @@ impl Context {
         }
         if let Some(sec_key) = self.sec_key_map.get(&recipient).cloned() {
             let wrapper = types::beacon::WrapperMsg::new(coin_msg, self.myid, &sec_key, round);
-            let cancel_handler = self.net_send.send(recipient, wrapper).await;
-            self.add_cancel_handler(cancel_handler);
+            self.send(recipient, wrapper).await;
         } else {
             log::error!(
                 "[PPT][SECMSG-AVSS] no sec_key for recipient {} -- dropping \

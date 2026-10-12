@@ -464,9 +464,17 @@ impl Context {
     }
 
     pub(crate) async fn process_msg(self: &mut Context, wrapper_msg: WrapperMsg) {
-        log::debug!("Received protocol msg: {:?}", wrapper_msg);
+        log::debug!("[PPT][WIRE] received from {} round {}", wrapper_msg.sender, wrapper_msg.round);
 
         if self.check_proposal(&wrapper_msg) {
+            let mut wrapper_msg = wrapper_msg;
+            if self.options.channel == crate::node::options::PptChannel::Private {
+                let key = match self.sec_key_map.get(&wrapper_msg.sender) { Some(key) => key, None => return };
+                wrapper_msg.protmsg = match crate::node::wire::unprotect(&wrapper_msg, self.myid, key) {
+                    Some(message) => message,
+                    None => { log::warn!("[PPT][WIRE] rejected plaintext or misbound private envelope"); return; }
+                };
+            }
             self.num_messages += 1;
             self.choose_fn(wrapper_msg).await;
         } else {

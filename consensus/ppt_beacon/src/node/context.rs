@@ -89,45 +89,12 @@ pub fn parse_field_spec(s: &str) -> Result<ExportedGf2Profile, String> {
 /// executions.
 pub const PPT_COIN_RESERVE: usize = 12;
 
-/// AVSS transport selector for the PPT random beacon.
-///
-/// The PPT scheme needs to deliver dealer-to-recipient confidential
-/// share material once per round per dealer. Two transports satisfy
-/// this requirement:
-///
-/// * **`Lite`** (default) — direct cleartext per-recipient unicast
-///   of `AvssRecipientPayload` (still HMAC-authenticated via the
-///   existing `WrapperMsg` + `sec_key_map` per-pair shared secret)
-///   plus a single broadcast `AvssPublicCommitMsg` carrying the
-///   public Merkle roots + degree-test coefficients. Wire complexity:
-///   `O(n)` messages per dealer per round.
-///
-///   Trust model: relies on the underlying wire transport (TLS or
-///   trusted LAN) to prevent passive eavesdroppers from reading the
-///   share material between AVSS dispersal and the post-ACS
-///   `MulticastRecoveredShares` broadcast (which reveals the same
-///   share material in cleartext for audit purposes anyway). This
-///   matches every other PPT wire message's threat model.
-///
-/// * **`SecMsg`** — Shoup-Smart 2024 Sec 4.3 Π_SecMsgDst transport:
-///   encrypts every per-recipient payload with a Shamir-shared
-///   master key + per-recipient hash-chain PRG stream, and disperses
-///   both the key shares and the ciphertexts via RBC-style RelMsgDst
-///   channels with full Bracha echo / vote agreement. Wire
-///   complexity: `O(n^2)` messages per dealer per round.
-///
-///   Trust model: tolerates passive wire eavesdroppers (no TLS
-///   required). Useful for paper-compliance testing and for
-///   deployments where the network layer cannot be relied upon for
-///   confidentiality.
-///
-/// Selected once at startup via the CLI `--transport=lite|secmsg`
-/// flag and pushed into `Context::transport`. Every honest node in
-/// a single deployment must agree on the same transport for the
-/// dealer set to converge in ACS (mixed transports would still
-/// converge because both wire variants are accepted on the
-/// receive side, but only one set of variants is ever emitted, so
-/// running mixed in one cluster is unsupported).
+/// PPTB sharing transport. Lite directly unicasts recipient payloads; SecMsg
+/// additionally disperses per-instance keys and committed ciphertexts. BOTH need
+/// private authenticated channels for private share/key fragments. TCP+HMAC alone
+/// provides authentication, never confidentiality. PptOptions selects an encrypted
+/// channel, an explicit external-private-channel assumption, or an insecure
+/// benchmark model. Transport and microbenchmark defaults remain unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AvssTransport {
     /// Default; see enum-level doc.
@@ -278,6 +245,7 @@ pub struct Context {
     /// Shoup-Smart Sec 4.3 Π_SecMsgDst). The dealer path branches on
     /// this; the receive side accepts both wire families.
     pub transport: AvssTransport,
+    pub options: crate::node::options::PptOptions,
 
     // ---- Audit fire-and-forget plumbing (P0-A.1) ----
     //
@@ -430,6 +398,23 @@ impl Context {
         transport: AvssTransport,
         gf2_profile: Option<Gf2Profile>,
     ) -> anyhow::Result<oneshot::Sender<()>> {
+        Self::spawn_with_options(config, sleep, batch, frequency, transport, gf2_profile,
+                                 crate::node::options::PptOptions::default())
+    }
+
+    pub fn spawn_with_options(
+        config: Node, sleep: u128, batch: usize, frequency: Round,
+        transport: AvssTransport, gf2_profile: Option<Gf2Profile>,
+        options: crate::node::options::PptOptions,
+    ) -> anyhow::Result<oneshot::Sender<()>> {
+        options.validate(&config, gf2_profile, transport)?;
+        log::info!("[PPT][ASSUMPTIONS] channel={:?} target128={} adaptive total corruption f={} n={}; randomness remains PR10; no full protocol security claim", options.channel, options.target128, config.num_faults, config.num_nodes);
+        if options.channel == crate::node::options::PptChannel::Benchmark {
+            log::warn!("[PPT][ASSUMPTIONS] plaintext TCP+HMAC: benchmark only; sharing confidentiality is NOT provided");
+        }
+        if options.channel == crate::node::options::PptChannel::ExternalPrivate {
+            log::warn!("[PPT][ASSUMPTIONS] operator asserts an actual private authenticated underlying channel; TCP itself is not private");
+        }
         if batch == 0 {
             return Err(anyhow!("PPT batch size must be positive"));
         }
@@ -587,6 +572,7 @@ impl Context {
                 coin_reveal_pending: HashMap::default(),
 
                 transport,
+                options,
 
                 num_messages: 0,
                 bench: HashMap::default(),
@@ -602,8 +588,7 @@ impl Context {
             log::error!("[PPT][ACS] quorum ACS engine loaded on node {}", c.myid);
             match c.gf2_profile {
                 Some(p) => log::error!(
-                    "[PPT][FIELD] node {} two-field profile = {} (BigUint path remains active; \
-                     migration commits will switch consumers progressively)",
+                    "[PPT][FIELD] node {} binary extension profile = {}",
                     c.myid,
                     p
                 ),
@@ -887,11 +872,10 @@ impl Context {
             let mac = crypto::hash::do_mac(bytes.as_slice(), sec_key.as_slice());
             // The wire format expects an owned `protmsg`; the clone
             // here is the only remaining per-recipient cost.
-            let wrapper = WrapperMsg {
-                protmsg: protmsg.clone(),
-                sender: myid,
-                mac,
-                round,
+            let wrapper = if self.options.channel == crate::node::options::PptChannel::Private {
+                crate::node::wire::protect(protmsg.clone(), myid, *replica, round, sec_key)
+            } else {
+                WrapperMsg { protmsg: protmsg.clone(), sender: myid, mac, round }
             };
             wrappers.push((*replica, wrapper));
         }
@@ -918,6 +902,10 @@ impl Context {
 
     /// Send a message to an individual node
     pub async fn send(&mut self, replica: Replica, wrapper_msg: WrapperMsg) {
+        let wrapper_msg = if self.options.channel == crate::node::options::PptChannel::Private {
+            let key = self.sec_key_map.get(&replica).expect("validated pairwise channel key");
+            crate::node::wire::protect(wrapper_msg.protmsg, self.myid, replica, wrapper_msg.round, key)
+        } else { wrapper_msg };
         let cancel_handler: CancelHandler<Acknowledgement> =
             self.net_send.send(replica, wrapper_msg).await;
         self.add_cancel_handler(cancel_handler);
