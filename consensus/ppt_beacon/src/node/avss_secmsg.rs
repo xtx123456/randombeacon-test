@@ -39,7 +39,6 @@
 //! The underlying SecMsgDst state machine itself is hash-only
 //! (commit 1-5), so no new crypto assumptions are introduced.
 
-use std::collections::hash_map::Entry;
 
 use async_recursion::async_recursion;
 use bincode;
@@ -185,73 +184,13 @@ impl Context {
         msg: AvssPublicCommitMsg,
         wire_sender: Replica,
     ) {
-        if wire_sender != msg.origin {
-            log::warn!(
-                "[PPT][SECMSG-AVSS][PUB-COMMIT] node {} dropping public-commit \
-                 with wire_sender={} != origin={} (round={}) -- attempted dealer \
-                 framing",
-                self.myid, wire_sender, msg.origin, msg.round
-            );
-            return;
-        }
-        if !msg.verify_transcript_root() {
-            log::warn!(
-                "[PPT][SECMSG-AVSS][PUB-COMMIT] node {} rejecting public-commit \
-                 from dealer {} for round {} -- transcript_root mismatch",
-                self.myid, msg.origin, msg.round
-            );
-            return;
-        }
-        let round = msg.round;
-        let dealer = msg.origin;
-        // Phase F2 -- once the AVSS validation cascade has completed
-        // for this (round, dealer), the cached public commit is no
-        // longer needed (the BeaconMsg has already been stored in
-        // `CTRBCState`, and `try_finalize_avss_secmsg` would early-
-        // return on the same `avss_local_valid` check). Without this
-        // guard, a late-arriving duplicate AvssPublicCommit would
-        // re-cache a fresh `AvssPublicCommitMsg` (~tens of KB) in
-        // `avss_secmsg_public` that never gets released until
-        // `maybe_release_round` runs at end-of-round. Banned dealer
-        // already filtered above.
-        if let Some(rs) = self.round_state.get(&round) {
-            if rs.avss_local_valid.contains(&dealer) {
-                log::debug!(
-                    "[PPT][SECMSG-AVSS][PUB-COMMIT] node {} dropping public-commit \
-                     from already-validated dealer {} for round {} (phase F2 guard)",
-                    self.myid, dealer, round
-                );
-                return;
-            }
-        }
-        // Idempotent: first-seen-wins. Byzantine dealer that
-        // re-broadcasts a different commit is silently dropped.
-        let newly_cached = match self.avss_secmsg_public.entry((round, dealer)) {
-            Entry::Occupied(_) => {
-                log::debug!(
-                    "[PPT][SECMSG-AVSS][PUB-COMMIT] node {} dropping duplicate \
-                     public-commit from dealer {} for round {} (already cached)",
-                    self.myid, dealer, round
-                );
-                false
-            }
-            Entry::Vacant(e) => {
-                log::info!(
-                    "[PPT][SECMSG-AVSS][PUB-COMMIT] node {} cached public-commit \
-                     from dealer {} for round {} (#roots={}, #h-coeffs={})",
-                    self.myid,
-                    dealer,
-                    round,
-                    msg.root_vec.len(),
-                    msg.degree_test_coeffs.len(),
-                );
-                e.insert(msg);
-                true
-            }
-        };
-        if newly_cached {
-            self.try_finalize_avss_secmsg(round, dealer).await;
-        }
+        if wire_sender != msg.origin || !msg.verify_transcript_root() { return; }
+        // Ordinary SEND is only an RBC input. Cache public content after delivery.
+        let round = msg.round; let dealer = msg.origin;
+        let payload = bincode::serialize(&crate::node::wire::PublicBundle {
+            public: msg, secmsg_roots: None }).expect("public bundle encoding");
+        self.process_scoped_rbc(crate::node::wire::RbcScope::PublicCommit,
+            round, dealer, crate::node::wire::RbcMessage::Send(payload), wire_sender).await;
     }
 
     // ------- Key channel -------

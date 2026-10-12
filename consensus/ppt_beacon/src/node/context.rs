@@ -214,6 +214,8 @@ pub struct Context {
     pub avss_secmsg_state:
         HashMap<(Round, Replica), crate::node::shoup_smart::sec_msg_dst::SecMsgDstState>,
     pub avss_secmsg_public: HashMap<(Round, Replica), types::beacon::AvssPublicCommitMsg>,
+    pub(crate) avss_public_rbc: HashMap<(Round, Replica), crate::node::acs::rbc::RbcInstanceState>,
+    pub(crate) avss_public_bundles: HashMap<(Round, Replica), crate::node::wire::PublicBundle>,
     pub avss_secmsg_delivered_bytes: HashMap<(Round, Replica), Vec<u8>>,
 
     // ---- ACS unpredictable common coin (PPT problem-1 fix) ----
@@ -563,6 +565,8 @@ impl Context {
 
                 avss_secmsg_state: HashMap::default(),
                 avss_secmsg_public: HashMap::default(),
+                avss_public_rbc: HashMap::default(),
+                avss_public_bundles: HashMap::default(),
                 avss_secmsg_delivered_bytes: HashMap::default(),
 
                 coin_material: HashMap::default(),

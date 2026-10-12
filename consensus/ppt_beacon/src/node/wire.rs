@@ -4,9 +4,26 @@ use types::beacon::{CoinMsg, WrapperMsg};
 use types::{Replica, Round};
 use aes::{Aes256, cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray}};
 use rand::RngCore;
+use crypto::hash::Hash;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum RbcScope { PublicCommit, AcsProposal }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) enum RbcMessage {
+    Send(Vec<u8>), Echo(Hash), Ready(Hash), Request(Hash), Payload(Hash, Vec<u8>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PublicBundle {
+    pub public: types::beacon::AvssPublicCommitMsg,
+    /// Exact roots of the SecMsg key/cipher vectors. None for Lite comparisons.
+    pub secmsg_roots: Option<(Hash, Hash)>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum PptWire {
+    Rbc { scope: RbcScope, round: Round, proposer: Replica, message: RbcMessage },
     Private {
         sender: Replica,
         recipient: Replica,

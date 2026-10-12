@@ -516,6 +516,17 @@ impl Context {
                 self.broadcast(msg, round).await;
                 self.process_acs_rbc_ready_inner(round, proposer, self.myid, payload_hash).await;
             }
+            RbcAction::RequestPayload { payload_hash } => {
+                let message = crate::node::wire::PptWire::Rbc {
+                    scope: crate::node::wire::RbcScope::AcsProposal, round, proposer,
+                    message: crate::node::wire::RbcMessage::Request(payload_hash) };
+                self.broadcast(crate::node::wire::encode(&message), round).await;
+            }
+            RbcAction::SendPayload { recipient, payload_hash, payload } => {
+                self.send_ppt_wire(recipient, round, crate::node::wire::PptWire::Rbc {
+                    scope: crate::node::wire::RbcScope::AcsProposal, round, proposer,
+                    message: crate::node::wire::RbcMessage::Payload(payload_hash, payload) }).await;
+            }
             RbcAction::Delivered { payload } => {
                 self.on_rbc_delivered(round, proposer, payload).await;
             }
@@ -806,6 +817,22 @@ impl Context {
         for a in acts {
             self.dispatch_rbc_action(round, proposer, a).await;
         }
+    }
+
+    #[async_recursion]
+    pub(crate) async fn process_acs_rbc_retrieval(&mut self, round: Round,
+        proposer: Replica, sender: Replica, message: crate::node::wire::RbcMessage) {
+        if proposer >= self.num_nodes || sender >= self.num_nodes { return; }
+        let actions = {
+            let state = &mut self.acs_round_mut(round).rbc[proposer];
+            match message {
+                crate::node::wire::RbcMessage::Request(hash) => state.handle_request(sender, hash),
+                crate::node::wire::RbcMessage::Payload(hash, payload) => state.handle_payload(sender, hash, payload),
+                _ => return,
+            }
+        };
+        for action in actions { self.dispatch_rbc_action(round, proposer, action).await; }
+        self.acs_external_scan_finalize_only(round).await;
     }
 
     #[async_recursion]

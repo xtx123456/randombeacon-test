@@ -45,5 +45,19 @@ channel secrets must never be disclosed as audit data.
 
 ## Validation
 
+## Public delivery
+
+The public sharing transcript (all per-coin commitments and h coefficients) is
+delivered by its own scoped Bracha RBC. Cache/apply it only after a matching
+READY quorum. Public-transcript and ACS-proposal instances have distinct wire
+scopes, and include the round and proposer. Both support hash-checked retrieval
+from honest holders after f+1 READY votes, including a recipient that received
+a conflicting first SEND. Early requests are remembered until content arrives.
+Payload responses do not create votes or bypass delivery thresholds. Existing
+sender/root/index Merkle checks are preserved. Recovery caches needed by slow
+recipients are not expired using a timeout or a local completion assumption.
+
+## Validation status
+
 At the user's request, no build, tests or benchmarks are run by the assistant.
 Source/diff inspection does not establish compilation or runtime correctness.

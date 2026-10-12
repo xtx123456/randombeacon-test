@@ -22,6 +22,7 @@ pub mod acs;
 pub mod coin_mapper;
 pub mod options;
 mod wire;
+mod public_rbc;
 pub mod shoup_smart;
 
 mod avss_secmsg;
