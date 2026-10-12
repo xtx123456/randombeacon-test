@@ -493,20 +493,6 @@ impl Context {
             roots_vec.clone(),
             degree_test_batch.clone(),
         );
-        let public_commit_for_self = public_commit.clone();
-        self.broadcast(
-            CoinMsg::AVSSSecMsgPublicCommit(public_commit),
-            new_round,
-        )
-        .await;
-        // Broadcast skips self; deliver our own commit synchronously.
-        // wire_sender on the self-deliver path equals self.myid
-        // (== public_commit.origin), so the sender-binding check
-        // inside `process_avss_secmsg_public_commit` passes.
-        let myid = self.myid;
-        self.process_avss_secmsg_public_commit(public_commit_for_self, myid)
-            .await;
-
         // ----- Step 2: build per-recipient AvssRecipientPayload byte vectors -----
         // The ordering matches the SecMsgDst recipient_idx convention
         // (recipient j in [0, n) -> payload[j]) so both transports
@@ -541,6 +527,8 @@ impl Context {
         // ----- Step 3: transport-specific dispatch -----
         match self.transport {
             crate::node::context::AvssTransport::Lite => {
+                self.start_public_rbc(crate::node::wire::PublicBundle {
+                    public: public_commit.clone(), secmsg_roots: None }).await;
                 log::info!(
                     "[PPT][AVSS-LITE] node {} dispatching {} per-recipient \
                      AVSSPrivatePayload unicasts for round {} (transport=lite)",
@@ -604,8 +592,11 @@ impl Context {
                              (only fails on degenerate prime/n/t configs)",
                         )
                 };
-                self.dispatch_avss_secmsg_actions(new_round, self.myid, actions)
-                    .await;
+                let roots = self.avss_secmsg_state.get(&(new_round, self.myid))
+                    .and_then(|state| state.commitment_roots()).expect("sender committed both SecMsg vectors");
+                self.start_public_rbc(crate::node::wire::PublicBundle {
+                    public: public_commit, secmsg_roots: Some(roots) }).await;
+                self.dispatch_avss_secmsg_actions(new_round, self.myid, actions).await;
             }
         }
 

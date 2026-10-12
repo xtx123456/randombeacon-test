@@ -14,6 +14,9 @@ pub(crate) enum RbcMessage {
     Send(Vec<u8>), Echo(Hash), Ready(Hash), Request(Hash), Payload(Hash, Vec<u8>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(crate) enum ForwardTag { Complaint, Assist, Report }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PublicBundle {
     pub public: types::beacon::AvssPublicCommitMsg,
@@ -24,6 +27,14 @@ pub(crate) struct PublicBundle {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum PptWire {
     Rbc { scope: RbcScope, round: Round, proposer: Replica, message: RbcMessage },
+    AwssRequest { round: Round, dealer: Replica, root: Hash, recipient: Replica },
+    AwssRecovered { round: Round, dealer: Replica, root: Hash },
+    AwssForward { round: Round, dealer: Replica, root: Hash, source: Replica,
+        recipient: Replica, tag: ForwardTag,
+        proof: super::shoup_smart::sec_msg_dst::ForwardMessagePayload },
+    AwssChannelForward { round: Round, dealer: Replica, root: Hash, source: Replica,
+        recipient: Replica, channel: super::shoup_smart::sec_msg_dst::SecMsgChannel,
+        proof: super::shoup_smart::rel_msg_dst::ForwardPayload },
     Private {
         sender: Replica,
         recipient: Replica,

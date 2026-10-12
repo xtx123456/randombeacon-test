@@ -30,6 +30,10 @@ impl Context {
             PptWire::Rbc { scope, round, proposer, message } => {
                 self.process_scoped_rbc(scope, round, proposer, message, sender).await;
             }
+            message @ PptWire::AwssRequest { .. }
+            | message @ PptWire::AwssRecovered { .. }
+            | message @ PptWire::AwssForward { .. }
+            | message @ PptWire::AwssChannelForward { .. } => self.process_awss_wire(message, sender).await,
             PptWire::Private { .. } => {
                 // Network private envelopes are consumed before the dispatcher.
                 log::warn!("[PPT][WIRE] unexpected private envelope after authentication");
@@ -42,8 +46,9 @@ impl Context {
         let round = bundle.public.round;
         let proposer = bundle.public.origin;
         let payload = bincode::serialize(&bundle).expect("public AWSS bundle encoding");
+        let myid = self.myid; let n = self.num_nodes; let f = self.num_faults;
         let actions = self.avss_public_rbc.entry((round, proposer)).or_insert_with(||
-            RbcInstanceState::new(self.myid, proposer, self.num_nodes, self.num_faults))
+            RbcInstanceState::new(myid, proposer, n, f))
             .proposer_send(payload);
         self.dispatch_public_rbc(round, proposer, actions).await;
     }
@@ -57,6 +62,8 @@ impl Context {
             self.process_acs_rbc_retrieval(round, proposer, sender, message).await;
             return;
         }
+        if self.round_state.get(&round).map(|state| state.cleared).unwrap_or(false)
+            && !self.avss_public_rbc.contains_key(&(round, proposer)) { return; }
         // Requests can still be served after local batch cleanup. A slow honest
         // recipient must not depend on the Byzantine proposer sending again.
         let myid = self.myid; let n = self.num_nodes; let f = self.num_faults;
@@ -118,14 +125,27 @@ impl Context {
             return;
         }
         if self.round_state.get(&round).map(|state| state.cleared).unwrap_or(false) { return; }
+        if self.transport == super::context::AvssTransport::SecMsg && bundle.secmsg_roots.is_none() {
+            log::warn!("[PPT][PUBLIC-RBC] SecMsg transcript lacks key/cipher commitments"); return;
+        }
+        let roots = bundle.secmsg_roots;
         let header = transcript(public);
         let root = crypto::hash::do_hash(&header.serialize_ctrbc());
-        let state = self.round_state.entry(round).or_insert_with(|| CTRBCState::new(self.secret_domain.clone(), self.num_nodes));
+        let domain = self.secret_domain.clone(); let n = self.num_nodes;
+        let state = self.round_state.entry(round).or_insert_with(|| CTRBCState::new(domain, n));
         state.comm_vectors.insert(dealer, public.root_vec.clone());
         state.degree_test_coeffs.insert(dealer, public.degree_test_coeffs.clone());
         state.avss_transcript_roots.insert(dealer, root);
         self.avss_secmsg_public.insert((round, dealer), public.clone());
         self.avss_public_bundles.insert((round, dealer), bundle);
+        if let Some((key, cipher)) = roots {
+            if !self.get_or_init_avss_secmsg(round, dealer).bind_roots(key, cipher) { return; }
+            let pending = self.avss_secmsg_pending.remove(&(round, dealer)).unwrap_or_default();
+            for (message, sender) in pending { self.dispatch_self_avss_secmsg(message, sender).await; }
+        }
         self.try_finalize_avss_secmsg(round, dealer).await;
+        self.refresh_awss_prepared(round, dealer).await;
+        self.drive_awss_recovery(round, dealer).await;
+        self.maybe_recover_ready_coins(round).await;
     }
 }

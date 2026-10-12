@@ -87,6 +87,7 @@
 //! check. That is commit 6.
 
 use std::fmt;
+use serde::{Serialize, Deserialize};
 use std::sync::Arc;
 
 use crypto::aes_hash::HashState;
@@ -181,7 +182,7 @@ pub fn decrypt_with_share(prime: &BigUint, k_j: &BigUint, ciphertext: &[u8]) -> 
 /// Which sub-protocol a particular wire action belongs to. The
 /// driver routes Key actions to the SecKeyDst channel and Cipher
 /// actions to the public RelMsgDst channel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SecMsgChannel {
     Key,
     Cipher,
@@ -189,7 +190,7 @@ pub enum SecMsgChannel {
 
 /// Wire-level forwarding payload carrying both sub-protocols'
 /// proofs so the receiver can decrypt `m_j` independently.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForwardMessagePayload {
     pub key_forward: ForwardPayload,
     pub cipher_forward: ForwardPayload,
@@ -394,6 +395,34 @@ impl SecMsgDstState {
         })
     }
 
+    pub fn bind_roots(&mut self, key: Hash, cipher: Hash) -> bool {
+        self.sec_key.bind_root(key) && self.cipher.bind_root(cipher)
+    }
+    pub fn commitment_roots(&self) -> Option<(Hash, Hash)> {
+        Some((self.sec_key.commitment_root()?, self.cipher.commitment_root()?))
+    }
+    pub fn replay_for_recipient(&self, recipient: Replica) -> Vec<SecMsgDstAction> {
+        let mut out = Vec::new();
+        if let Some(super::sec_key_dst::SecKeyDstAction::SendEcho { recipient_idx, echo }) = self.sec_key.replay_echo_for(recipient) {
+            out.push(SecMsgDstAction::SendEcho { channel: SecMsgChannel::Key, recipient_idx, echo });
+        }
+        if let Some(RelMsgDstAction::SendEcho { recipient_idx, echo }) = self.cipher.replay_echo_for(recipient) {
+            out.push(SecMsgDstAction::SendEcho { channel: SecMsgChannel::Cipher, recipient_idx, echo });
+        }
+        out
+    }
+    pub fn check_message_forward(&self, source: Replica, payload: &ForwardMessagePayload)
+        -> Result<Option<Vec<u8>>, SecMsgForwardReject> {
+        let key = self.sec_key.check_forward(source, &payload.key_forward)
+            .map_err(SecMsgForwardReject::KeyChannelRejected)?;
+        let cipher = self.cipher.check_forward(source, &payload.cipher_forward)
+            .map_err(SecMsgForwardReject::CipherChannelRejected)?;
+        match (key, cipher) {
+            (Some(key), Some(cipher)) => Ok(decrypt_with_share(&self.prime, &key, &cipher)),
+            _ => Ok(None),
+        }
+    }
+
     pub fn delivered(&self) -> bool {
         self.delivered_message.is_some()
     }
@@ -535,78 +564,11 @@ impl SecMsgDstState {
         wire_sender: Replica,
         payload: ForwardMessagePayload,
     ) -> Vec<SecMsgDstAction> {
-        // Run the key channel forward; expect a single
-        // ForwardDeliveredShare or ForwardRejected.
-        let key_acts = self.sec_key.handle_forward(wire_sender, payload.key_forward);
-        let mut k_j: Option<BigUint> = None;
-        for a in key_acts {
-            match a {
-                super::sec_key_dst::SecKeyDstAction::ForwardDeliveredShare { share, .. } => {
-                    k_j = Some(share);
-                }
-                super::sec_key_dst::SecKeyDstAction::ForwardRejected { source, reason } => {
-                    return vec![SecMsgDstAction::ForwardRejected {
-                        source,
-                        reason: SecMsgForwardReject::KeyChannelRejected(reason),
-                    }];
-                }
-                _ => {}
-            }
+        match self.check_message_forward(wire_sender, &payload) {
+            Ok(Some(message)) => vec![SecMsgDstAction::ForwardDeliveredMessage { source: wire_sender, message }],
+            Ok(None) => vec![SecMsgDstAction::DeliveryFailedDecrypt { reason: DecryptFailReason::InvalidKey }],
+            Err(reason) => vec![SecMsgDstAction::ForwardRejected { source: wire_sender, reason }],
         }
-        let k_j = match k_j {
-            Some(k) => k,
-            None => {
-                return vec![SecMsgDstAction::ForwardRejected {
-                    source: wire_sender,
-                    reason: SecMsgForwardReject::KeyChannelRejected(
-                        ForwardReject::DecodeFailed("no ForwardDeliveredShare emitted".into()),
-                    ),
-                }]
-            }
-        };
-
-        // Cipher channel forward.
-        let cipher_acts = self.cipher.handle_forward(wire_sender, payload.cipher_forward);
-        let mut c_j: Option<Vec<u8>> = None;
-        for a in cipher_acts {
-            match a {
-                RelMsgDstAction::ForwardDelivered { message, .. } => {
-                    c_j = Some(message);
-                }
-                RelMsgDstAction::ForwardRejected { source, reason } => {
-                    return vec![SecMsgDstAction::ForwardRejected {
-                        source,
-                        reason: SecMsgForwardReject::CipherChannelRejected(reason),
-                    }];
-                }
-                _ => {}
-            }
-        }
-        let c_j = match c_j {
-            Some(c) => c,
-            None => {
-                return vec![SecMsgDstAction::ForwardRejected {
-                    source: wire_sender,
-                    reason: SecMsgForwardReject::CipherChannelRejected(
-                        ForwardReject::DecodeFailed("no ForwardDelivered emitted".into()),
-                    ),
-                }]
-            }
-        };
-
-        // Both channels delivered — decrypt.
-        let plaintext = match decrypt_with_share(&self.prime, &k_j, &c_j) {
-            Some(m) => m,
-            None => {
-                return vec![SecMsgDstAction::DeliveryFailedDecrypt {
-                    reason: DecryptFailReason::InvalidKey,
-                }]
-            }
-        };
-        vec![SecMsgDstAction::ForwardDeliveredMessage {
-            source: wire_sender,
-            message: plaintext,
-        }]
     }
 
     /// Build a `SendMessageForward` carrying our own delivered
@@ -617,9 +579,6 @@ impl SecMsgDstState {
     ) -> Result<SecMsgDstAction, SecMsgDstError> {
         if recipient == self.myid {
             return Err(SecMsgDstError::SelfForwardRequest);
-        }
-        if self.delivered_message.is_none() {
-            return Err(SecMsgDstError::NotYetDelivered);
         }
         // Inner sub-protocol forwards (panics-free by construction
         // since we are delivered → both inner channels are too).

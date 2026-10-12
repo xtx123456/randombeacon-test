@@ -139,17 +139,10 @@ pub struct Context {
     pub secret_domain: BigUint,
     pub nonce_domain: BigUint,
 
-    /// Optional `GF(2^w_p) ⊂ GF(2^w_q)` two-field profile selected by
-    /// the `--field "GF2(w_p,w_q)"` CLI flag. `None` (the default)
-    /// leaves the entire AVSS / degree-test stack on the legacy
-    /// `BigUint` prime-field path driven by `secret_domain` /
-    /// `nonce_domain` above; `Some(profile)` is wired through to
-    /// downstream consumers (`batch_wssinit`, `secret_reconstruct`,
-    /// `process::avss_local_packet_valid_pure`, …) in subsequent
-    /// commits as each call site is migrated.
-    ///
-    /// This commit only carries the value; no behaviour change is
-    /// observable when the flag is set.
+    /// True binary-extension profile for beacon shares/masks/degree tests.
+    /// None retains the legacy different-prime-fields comparison implementation.
+    /// Configuration validity, target field size and protocol security claims are
+    /// distinct checks; PptOptions never upgrades the PR10 randomness proof.
     pub gf2_profile: Option<Gf2Profile>,
 
     /// Rejection-sampling mapper from raw coin values to uniform
@@ -215,6 +208,8 @@ pub struct Context {
         HashMap<(Round, Replica), crate::node::shoup_smart::sec_msg_dst::SecMsgDstState>,
     pub avss_secmsg_public: HashMap<(Round, Replica), types::beacon::AvssPublicCommitMsg>,
     pub(crate) avss_public_rbc: HashMap<(Round, Replica), crate::node::acs::rbc::RbcInstanceState>,
+    pub(crate) avss_secmsg_pending: HashMap<(Round, Replica), Vec<(CoinMsg, Replica)>>,
+    pub(crate) awss_recovery: HashMap<(Round, Replica), crate::node::awss_recovery::AwssRecoveryState>,
     pub(crate) avss_public_bundles: HashMap<(Round, Replica), crate::node::wire::PublicBundle>,
     pub avss_secmsg_delivered_bytes: HashMap<(Round, Replica), Vec<u8>>,
 
@@ -567,6 +562,8 @@ impl Context {
                 avss_secmsg_public: HashMap::default(),
                 avss_public_rbc: HashMap::default(),
                 avss_public_bundles: HashMap::default(),
+                avss_secmsg_pending: HashMap::default(),
+                awss_recovery: HashMap::default(),
                 avss_secmsg_delivered_bytes: HashMap::default(),
 
                 coin_material: HashMap::default(),

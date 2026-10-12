@@ -822,57 +822,37 @@ impl Context {
 
     fn maybe_mark_dealer_completed(&mut self, round: Round, dealer: Replica) -> bool {
         let threshold = self.num_nodes - self.num_faults;
-        let rbc_state = match self.round_state.get_mut(&round) {
-            Some(rbc_state) => rbc_state,
-            None => return false,
-        };
-
-        if rbc_state.avss_completed_dealers.contains(&dealer) {
-            return false;
-        }
-
-        if !rbc_state.avss_local_valid.contains(&dealer) {
-            return false;
-        }
-
-        if rbc_state.matching_avss_complete_count(dealer) < threshold {
-            return false;
-        }
-
-        rbc_state.avss_completed_dealers.insert(dealer);
-        true
+        let state = match self.round_state.get_mut(&round) { Some(state) => state, None => return false };
+        if state.cleared || !state.avss_transcript_roots.contains_key(&dealer)
+            || state.avss_completed_dealers.contains(&dealer)
+            || state.matching_avss_complete_count(dealer) < threshold { return false; }
+        // Public one-sided-vote completion, independent of this recipient's
+        // private delivery. It certifies at least f+1 honest happy holders.
+        state.avss_completed_dealers.insert(dealer); true
     }
 
-    fn maybe_prepare_avss_complete(
-        &mut self,
-        round: Round,
-        dealer: Replica,
-    ) -> Option<crypto::hash::Hash> {
+    fn maybe_prepare_avss_complete(&mut self, round: Round, dealer: Replica) -> Option<Hash> {
         let threshold = self.num_nodes - self.num_faults;
-        let rbc_state = match self.round_state.get_mut(&round) {
-            Some(rbc_state) => rbc_state,
-            None => return None,
-        };
+        let state = self.round_state.get_mut(&round)?;
+        if state.cleared || state.avss_complete_sent.contains(&dealer) { return None; }
+        let root = *state.avss_transcript_roots.get(&dealer)?;
+        if state.matching_avss_ready_count(dealer) < threshold
+            && state.matching_avss_complete_count(dealer) < self.num_faults+1 { return None; }
+        state.avss_complete_sent.insert(dealer); Some(root)
+    }
 
-        if !rbc_state.avss_local_valid.contains(&dealer) {
-            return None;
+    #[async_recursion]
+    pub(crate) async fn refresh_awss_prepared(&mut self, round: Round, dealer: Replica) {
+        if let Some(root) = self.maybe_prepare_avss_complete(round, dealer) {
+            if let Some(state) = self.round_state.get_mut(&round) {
+                state.add_avss_complete_vote(dealer, self.myid, root);
+            }
+            self.broadcast(CoinMsg::AVSSComplete(dealer, root, self.myid, round), round).await;
         }
-
-        if rbc_state.avss_complete_sent.contains(&dealer) {
-            return None;
+        if self.maybe_mark_dealer_completed(round, dealer) {
+            log::info!("[PPT][AWSS-PREPARED] round={} dealer={} public completion; private share availability tracked separately", round, dealer);
+            self.maybe_broadcast_acs_init_from_avss(round).await;
         }
-
-        if rbc_state.matching_avss_ready_count(dealer) < threshold {
-            return None;
-        }
-
-        let transcript_root = match rbc_state.avss_transcript_roots.get(&dealer) {
-            Some(root) => *root,
-            None => return None,
-        };
-
-        rbc_state.avss_complete_sent.insert(dealer);
-        Some(transcript_root)
     }
 
     /// Inbound AVSS packet entry point. **Phase D fire-and-forget**:
@@ -1035,12 +1015,9 @@ impl Context {
         match result {
             Ok(()) => {}
             Err(reason) => {
-                log::error!(
-                    "[PPT][AVSS-BAN] banning dealer {} for invalid AVSS packet \
-                     round {} reason={}",
-                    dealer, round, reason
-                );
-                self.ban_dealer_global(dealer);
+                log::warn!("[PPT][AWSS-UNHAPPY] dealer={} round={} reason={}; complaint waits for ACS selection", dealer, round, reason);
+                self.suspected_dealers.insert(dealer);
+                self.drive_awss_recovery(round, dealer).await;
                 return;
             }
         }
@@ -1072,17 +1049,13 @@ impl Context {
         let ready_msg = CoinMsg::AVSSReady(dealer, transcript_root, self.myid, round);
         self.broadcast(ready_msg, round).await;
 
-        if let Some(complete_root) = self.maybe_prepare_avss_complete(round, dealer) {
-            let complete_msg =
-                CoinMsg::AVSSComplete(dealer, complete_root, self.myid, round);
-            self.broadcast(complete_msg, round).await;
-            self.process_avss_complete(dealer, complete_root, self.myid, round)
-                .await;
+        self.refresh_awss_prepared(round, dealer).await;
+        if let Some(decided) = self.round_state.get(&round).and_then(|state| state.acs_decided_set.clone()) {
+            self.stash_coin_material(round, &decided);
+            // A late honest payload is still an ORIGINAL authenticated share.
+            self.reconstruct_beacon(round, 0).await;
         }
-
-        if self.maybe_mark_dealer_completed(round, dealer) {
-            self.maybe_broadcast_acs_init_from_avss(round).await;
-        }
+        self.drive_awss_recovery(round, dealer).await;
 
         // This dealer's commitment vector (`comm_vectors`) is now
         // stored locally. If reconstruction for this round is already
@@ -1120,11 +1093,7 @@ impl Context {
             rbc_state.add_avss_ready_vote(dealer, sender, transcript_root);
         }
 
-        if let Some(complete_root) = self.maybe_prepare_avss_complete(round, dealer) {
-            let complete_msg = CoinMsg::AVSSComplete(dealer, complete_root, self.myid, round);
-            self.broadcast(complete_msg, round).await;
-            self.process_avss_complete(dealer, complete_root, self.myid, round).await;
-        }
+        self.refresh_awss_prepared(round, dealer).await;
     }
 
     #[async_recursion]
@@ -1154,15 +1123,7 @@ impl Context {
             rbc_state.add_avss_complete_vote(dealer, sender, transcript_root);
         }
 
-        if self.maybe_mark_dealer_completed(round, dealer) {
-            log::info!(
-                "[PPT][AVSS-COMPLETE] node {} round {} dealer {} marked completed",
-                self.myid,
-                round,
-                dealer
-            );
-            self.maybe_broadcast_acs_init_from_avss(round).await;
-        }
+        self.refresh_awss_prepared(round, dealer).await;
     }
 }
 
@@ -1338,6 +1299,7 @@ impl Context {
         //     stable, agreed dealer set (= this round's decided set);
         //   - drop the coin state for this round and the material it
         //     consumed (round-1), now that this round's ACS is done.
+        self.start_selected_awss_recovery(round, decided_vec.as_slice()).await;
         self.stash_coin_material(round, decided_vec.as_slice());
         self.cleanup_coin_state(round);
 

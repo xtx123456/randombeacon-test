@@ -581,40 +581,33 @@ impl Context {
             state.clear();
         }
 
-        // Commit-7 cutover added three per-(round, dealer) maps on
-        // Context that hold the Shoup-Smart 2024 SecMsgDst transport
-        // state (SecMsgDstState containing two RelMsgDstStates' worth
-        // of caches + the cached AvssPublicCommitMsg + the decrypted
-        // AvssRecipientPayload bytes). The previous version of this
-        // function only called `state.clear()` on the CTRBCState and
-        // left these three maps growing unboundedly with each round.
-        //
-        // Long-running beacons (max_rounds = 20000) would accumulate
-        // ~20000 * n entries per map, eventually OOM-ing the
-        // consensus node. Once `state.clear()` fires, every honest
-        // round-r AVSS path has fully completed -- the SecMsgDst
-        // transport caches for round r will never be referenced
-        // again. Drop them.
-        //
-        // We use `retain` rather than `remove` because each map keys
-        // by `(Round, Replica)` and may contain entries for several
-        // dealers at the same round; we want to drop all entries
-        // for *this* round in one pass without touching other
-        // (still-active) rounds.
+        // Selected instances must remain available for slow honest recipients.
+        // All-participant ACKs are required; n-f ACKs would still allow an honest
+        // recipient to be left behind. No timer substitutes for delivery.
+        let selected: HashSet<Replica> = self.awss_recovery.iter()
+            .filter(|((r, _), state)| *r == round && state.selected && state.recovered_peers.len() < self.num_nodes)
+            .map(|((_, dealer), _)| *dealer).collect();
+        let released: Vec<Replica> = self.awss_recovery.iter()
+            .filter(|((r, _), state)| *r == round && state.selected && state.recovered_peers.len() == self.num_nodes)
+            .map(|((_, dealer), _)| *dealer).collect();
+        for dealer in released { self.release_awss_serving_if_safe(round, dealer); }
+        self.avss_secmsg_pending.retain(|(r, _), _| *r != round);
+        self.avss_public_rbc.retain(|(r, d), _| *r != round || selected.contains(d));
+        self.avss_public_bundles.retain(|(r, d), _| *r != round || selected.contains(d));
         let removed_state = {
             let before = self.avss_secmsg_state.len();
-            self.avss_secmsg_state.retain(|(r, _), _| *r != round);
+            self.avss_secmsg_state.retain(|(r, d), _| *r != round || selected.contains(d));
             before - self.avss_secmsg_state.len()
         };
         let removed_public = {
             let before = self.avss_secmsg_public.len();
-            self.avss_secmsg_public.retain(|(r, _), _| *r != round);
+            self.avss_secmsg_public.retain(|(r, d), _| *r != round || selected.contains(d));
             before - self.avss_secmsg_public.len()
         };
         let removed_delivered = {
             let before = self.avss_secmsg_delivered_bytes.len();
             self.avss_secmsg_delivered_bytes
-                .retain(|(r, _), _| *r != round);
+                .retain(|(r, d), _| *r != round || selected.contains(d));
             before - self.avss_secmsg_delivered_bytes.len()
         };
         if removed_state + removed_public + removed_delivered > 0 {

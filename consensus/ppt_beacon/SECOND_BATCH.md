@@ -43,8 +43,6 @@ and canonical encoding remain available through recovery and batch audit.
 Per-instance SecMsg keys may later be disclosed by audit; long-term pairwise
 channel secrets must never be disclosed as audit data.
 
-## Validation
-
 ## Public delivery
 
 The public sharing transcript (all per-coin commitments and h coefficients) is
@@ -56,6 +54,54 @@ a conflicting first SEND. Early requests are remembered until content arrives.
 Payload responses do not create votes or bypass delivery thresholds. Existing
 sender/root/index Merkle checks are preserved. Recovery caches needed by slow
 recipients are not expired using a timeout or a local completion assumption.
+
+## AWSS preparation and selected recovery
+
+The normal share-generation/degree-check path is retained. Only happy holders
+send AVSSReady. With n=3f+1, n-f matching Ready votes imply at least f+1 honest
+happy holders. AVSSComplete is a one-sided-vote relay: send after n-f Ready or
+f+1 Complete; public preparation finishes after n-f Complete. This public state
+no longer requires the local recipient to have private materials. Public RBC
+must have delivered before the preparation certificate is applied.
+
+SecMsg's public bundle binds both key/cipher meta-roots, in addition to the
+original share commitments and h. Reordered key/cipher messages wait for this
+bundle. Delivery/forwarding verifies recipient and fragment indices, Merkle
+depth/positions and the agreed root, then reconstructs/re-encodes the ORIGINAL
+RS codeword. A valid proof of a malformed original codeword is kept as bottom
+evidence. Bad relay proofs do not establish dealer guilt.
+
+After ACS, only selected instances can activate recovery. A missing-data request
+causes providers to replay fragments for the REQUESTER's key/ciphertext, privately
+to that requester. It never asks providers to reveal their own share plaintext.
+An unhappy recipient forwards its committed message (or bottom evidence) as a
+complaint. Before accepting it, receivers verify both committed channels and run
+the existing share/degree check at the complaint's original recipient index.
+Only a verified unhappy message triggers assists from happy holders. Relays
+include the original complaint as a report, so assist/report message reordering
+does not lose the evidence. This follows the complaint/assist mechanism in
+Shoup-Smart, Journal of Cryptology 2024, Section 5.1, adapted to PPTB's post-ACS
+selection: https://doi.org/10.1007/s00145-024-09505-6.
+
+With f+1 validated happy assists, interpolate the local recipient's f/g shares
+using a single coefficient vector per provider set, check them against h, and
+keep their original certificates. GF2 coefficients remain in the small field;
+large mask shares use mul_small. These derived local shares have no original
+Merkle paths. Until the subsequent matrix/OEC change, PR10 reconstruction imports
+only the certified original points at their original provider indices.
+
+Lite is retained as a private-channel performance comparison. It lacks the
+transferable key/cipher evidence needed by this SecMsg complaint implementation,
+so target128 rejects Lite. No default transport is switched. The later complete
+audit/OEC changes are still needed for the final PPTB path, particularly the
+bad-case audit of recovered local shares. This PR does not claim all second-batch
+requirements or Byzantine/adaptive end-to-end termination are already proved.
+
+Selected serving evidence is released only after local batch audit and ACKs from
+ALL participants. n-f ACKs could omit an honest delayed recipient. A Byzantine
+can withhold its ACK and keep historical transport evidence in memory; safe
+bounded garbage collection/reconfiguration is a separate unresolved requirement.
+No network delay bound or timeout is introduced to hide that limitation.
 
 ## Validation status
 

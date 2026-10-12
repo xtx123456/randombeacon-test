@@ -23,6 +23,7 @@ pub mod coin_mapper;
 pub mod options;
 mod wire;
 mod public_rbc;
+mod awss_recovery;
 pub mod shoup_smart;
 
 mod avss_secmsg;

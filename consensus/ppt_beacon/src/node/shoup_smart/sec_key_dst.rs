@@ -397,6 +397,19 @@ impl SecKeyDstState {
         })
     }
 
+    pub fn bind_root(&mut self, root: Hash) -> bool { self.rmd.bind_root(root) }
+    pub fn commitment_root(&self) -> Option<Hash> { self.rmd.commitment_root() }
+    pub fn replay_echo_for(&self, recipient: Replica) -> Option<SecKeyDstAction> {
+        match self.rmd.replay_echo_for(recipient)? {
+            RelMsgDstAction::SendEcho { recipient_idx, echo } => Some(SecKeyDstAction::SendEcho { recipient_idx, echo }),
+            _ => None,
+        }
+    }
+    pub fn check_forward(&self, source: Replica, forward: &ForwardPayload)
+        -> Result<Option<BigUint>, ForwardReject> {
+        Ok(self.rmd.check_forward(source, forward)?.and_then(|bytes| parse_share(&self.prime, &bytes)))
+    }
+
     pub fn delivered(&self) -> bool {
         self.delivered_share.is_some()
     }
@@ -519,9 +532,6 @@ impl SecKeyDstState {
     ) -> Result<SecKeyDstAction, SecKeyDstError> {
         if recipient == self.myid {
             return Err(SecKeyDstError::SelfForwardRequest);
-        }
-        if self.delivered_share.is_none() {
-            return Err(SecKeyDstError::NotYetDelivered);
         }
         let action = self
             .rmd
