@@ -202,13 +202,11 @@ pub struct Context {
     // ---- ACS state ----
     pub acs_state: std::collections::HashMap<Round, crate::node::acs::state::AcsRound>,
 
-    /// Globally banned dealers (across rounds). A dealer is banned
-    /// the moment any honest node detects a protocol-level violation
-    /// (invalid AVSS packet, equivocating ACS proposal,
-    /// Merkle/commitment mismatch in the post-ACS audit). Once
-    /// banned, the dealer is rejected from every future round's
-    /// AVSS, ACS, and reconstruction paths.
+    /// Legacy field retained for compatibility, kept empty until an agreed
+    /// exclusion protocol exists. Do not insert local suspicions here.
     pub banned_dealers: HashSet<Replica>,
+    /// Local suspicion is diagnostic only, never a consensus membership rule.
+    pub suspected_dealers: HashSet<Replica>,
 
     /// Round → previous-round beacon bytes used to seed the new
     /// ACS common-coin derivation. Pattern is identical to
@@ -370,13 +368,13 @@ pub struct Context {
 }
 
 /// Result of one detached `process_multicast_recovered_shares` audit
-/// run. The detached task computes `blame_events` from the spawn_blocking
-/// audit and sends this struct back to the main loop, which then
-/// performs the blame / ban writes on `Context` (single-threaded).
+/// run. The worker distinguishes complete evidence, invalid provider records,
+/// and task failure; only the main loop may mark the audit complete.
 #[derive(Debug)]
 pub struct AuditCompletion {
     pub round: Round,
-    pub blame_events: Vec<(Replica, crate::node::ctrbc::state::BlameReason)>,
+    pub evidence_version: u64,
+    pub result: Result<crate::node::batch_wss::secret_reconstruct::AuditResult, String>,
 }
 
 /// Result of one detached `avss_local_packet_valid_pure` run, used
@@ -432,6 +430,33 @@ impl Context {
         transport: AvssTransport,
         gf2_profile: Option<Gf2Profile>,
     ) -> anyhow::Result<oneshot::Sender<()>> {
+        if batch == 0 {
+            return Err(anyhow!("PPT batch size must be positive"));
+        }
+        let expected_nodes = config.num_faults.checked_mul(3)
+            .and_then(|v| v.checked_add(1))
+            .ok_or_else(|| anyhow!("PPT fault bound overflows node count"))?;
+        // Several SS transport thresholds and share arrays use exact 3f+1.
+        // Reject unsupported configurations rather than indexing shorter arrays.
+        if config.num_nodes != expected_nodes || config.num_faults == 0
+            || config.id >= config.num_nodes
+        {
+            return Err(anyhow!("PPT currently requires n=3f+1, f>=1 and id<n"));
+        }
+        batch.checked_add(PPT_COIN_RESERVE)
+            .ok_or_else(|| anyhow!("PPT total coin count overflows"))?;
+        let max_outputs = config.num_nodes - config.num_faults;
+        batch.checked_mul(max_outputs)
+            .ok_or_else(|| anyhow!("PPT output indices overflow"))?;
+        if let Some(profile) = gf2_profile {
+            let points = config.num_nodes.checked_add(max_outputs)
+                .ok_or_else(|| anyhow!("PPT extraction point count overflows"))?;
+            if profile.w_p < usize::BITS as usize
+                && points > (1usize << profile.w_p) - 1
+            {
+                return Err(anyhow!("GF2 small field cannot hold sharing and extraction points"));
+            }
+        }
         let prot_payload = &config.prot_payload;
         let v: Vec<&str> = prot_payload.split(',').collect();
 
@@ -542,6 +567,7 @@ impl Context {
 
                 acs_state: std::collections::HashMap::new(),
                 banned_dealers: HashSet::new(),
+                suspected_dealers: HashSet::new(),
                 audit_tx,
                 audit_rx,
                 avss_validation_tx,
@@ -606,35 +632,34 @@ impl Context {
         }
     }
 
-    /// Mark a dealer as banned and propagate to every live ACS
-    /// instance.
+    /// Compatibility hook: record suspicion only. Public exclusion requires
+    /// an agreed evidence protocol, which is outside this first-batch change.
     pub fn ban_dealer_global(&mut self, dealer: Replica) {
-        if self.banned_dealers.insert(dealer) {
-            log::error!(
-                "[PPT][BAN] node {} permanently banning dealer {}",
+        if dealer >= self.num_nodes {
+            return;
+        }
+        // No agreed exclusion protocol exists yet. Local observations cannot
+        // change an ACS decision or future public membership.
+        if self.suspected_dealers.insert(dealer) {
+            log::warn!(
+                "[PPT][SUSPECT] node {} recorded local suspicion of dealer {} (no global exclusion)",
                 self.myid,
                 dealer
             );
-            for st in self.acs_state.values_mut() {
-                st.ban_dealer(dealer);
-            }
         }
     }
 
     pub fn permanently_banned_dealers(&self) -> HashSet<Replica> {
-        self.banned_dealers.clone()
+        HashSet::new()
     }
 
-    /// Locally AVSS-completed dealers for `round`, with banned
-    /// dealers filtered out.
+    /// Locally AVSS-completed dealers, without local membership filtering.
     pub fn local_completed_dealers(&self, round: Round) -> HashSet<Replica> {
-        let banned = &self.banned_dealers;
         match self.round_state.get(&round) {
             Some(rbc_state) => rbc_state
                 .avss_completed_dealers
                 .iter()
                 .copied()
-                .filter(|d| !banned.contains(d))
                 .collect(),
             None => HashSet::new(),
         }
@@ -664,6 +689,11 @@ impl Context {
         self.round_state
             .get(&round)
             .and_then(|st| st.first_match_leader.as_ref())
+    }
+
+    /// Distinguishes pending selection from an exhausted, all-rejected batch.
+    pub fn first_match_complete_for_round(&self, round: Round) -> bool {
+        self.round_state.get(&round).map(|st| st.first_match_complete).unwrap_or(false)
     }
 
     /// Fiat-Shamir degree-test challenge θ for a dealer's AVSS
@@ -793,10 +823,7 @@ impl Context {
     /// `small_byte_len()` bytes as a little-endian integer in
     /// `[0, 2^w_p)` and apply the same `v < cutoff` test.
     ///
-    /// When `w_p >= 64` the domain is at least `2^64`, which dwarfs
-    /// any realistic `num_nodes`, so the cutoff equals `2^w_p` (no
-    /// rejection); we short-circuit to `true` to avoid 128-bit
-    /// modular arithmetic.
+    /// Uses the same exact cutoff at every supported width, including 128.
     pub(crate) fn coin_value_matches_uniform_range_with_gf2(
         coin_bytes: &[u8],
         profile: crypto::gf2::Gf2Profile,
@@ -805,36 +832,8 @@ impl Context {
         if num_nodes == 0 {
             return false;
         }
-        let small_len = profile.small_byte_len();
-        if small_len == 0 {
-            return false;
-        }
-        // The coin output from Gf2SuperInvExtractor is a small-field
-        // element; only its low w_p bits are meaningful. For w_p >= 64
-        // the rejection probability is at most n / 2^64, negligible
-        // for any realistic n — every output is uniformly usable.
-        if profile.w_p >= 64 {
-            return true;
-        }
-        let n = num_nodes as u128;
-        let domain: u128 = 1u128 << profile.w_p;
-        if n > domain {
-            // Trivially not satisfiable: more nodes than small-field
-            // elements. The dealer constructor would have rejected
-            // this configuration already, but be defensive.
-            return false;
-        }
-        let cutoff: u128 = (domain / n) * n;
-        // Read the low `small_len` bytes as a little-endian integer.
-        let n_read = small_len.min(16);
-        let mut buf = [0u8; 16];
-        buf[..n_read].copy_from_slice(&coin_bytes[..n_read]);
-        let v_full = u128::from_le_bytes(buf);
-        // Mask to exactly w_p bits — the high `8*small_len - w_p`
-        // bits of the boundary byte must already be zero in a
-        // canonical Gf2Element, but be defensive.
-        let v = v_full & (domain - 1);
-        v < cutoff
+        crate::node::coin_mapper::CoinMapper::for_gf2(profile, num_nodes)
+            .map(|mapper| mapper.is_accepted(coin_bytes)).unwrap_or(false)
     }
 
     /// Broadcast a message to all nodes.

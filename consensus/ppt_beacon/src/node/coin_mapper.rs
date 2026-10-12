@@ -7,7 +7,7 @@
 //! whenever the domain size is not divisible by `n`:
 //!
 //! ```text
-//!     bias = max_k |Pr[output = k] − 1/n|  =  (domain mod n) / (n · domain)
+//!     naive modulo mapping has unequal preimage counts unless n divides domain
 //! ```
 //!
 //! **First-match rejection sampling** eliminates this bias entirely.
@@ -48,9 +48,9 @@ pub struct CoinMapper {
 
 enum Inner {
     /// Domain = `2^w_p`. Values live in `[0, 2^w_p)`.
-    Gf2 { w_p: usize, small_byte_len: usize },
+    Gf2 { w_p: usize, small_byte_len: usize, cutoff: Option<u128> },
     /// Domain = prime `p`. Values live in `[0, p)`.
-    Prime { p: BigUint },
+    Prime { p: BigUint, cutoff: BigUint },
 }
 
 /// The result of the first-match scan over a batch of coin outputs.
@@ -90,6 +90,7 @@ impl CoinMapper {
             inner: Inner::Gf2 {
                 w_p: profile.w_p,
                 small_byte_len: profile.small_byte_len(),
+                cutoff: gf2_cutoff(profile.w_p, n),
             },
         })
     }
@@ -111,6 +112,7 @@ impl CoinMapper {
             n,
             inner: Inner::Prime {
                 p: secret_domain.clone(),
+                cutoff: (secret_domain / BigUint::from(n as u64)) * BigUint::from(n as u64),
             },
         })
     }
@@ -122,20 +124,14 @@ impl CoinMapper {
     /// Upper bound on the rejection probability per coin for leader
     /// election with this mapper's `n`.
     ///
-    /// For `GF(2^w_p)` with `w_p ≥ 64`, the bound is `< n / 2^64`
-    /// which we report as `0.0` (below `f64` resolution for any
-    /// realistic `n`).
+    /// A small nonzero probability is still reported as nonzero.
     pub fn rejection_bound(&self) -> f64 {
         match &self.inner {
             Inner::Gf2 { w_p, .. } => {
-                if *w_p >= 64 {
-                    return 0.0;
-                }
-                let domain = 1u128 << w_p;
-                let remainder = domain % (self.n as u128);
-                (remainder as f64) / (domain as f64)
+                let remainder = pow2_remainder(*w_p, self.n);
+                (remainder as f64) / 2.0f64.powi(*w_p as i32)
             }
-            Inner::Prime { p } => {
+            Inner::Prime { p, .. } => {
                 let n = BigUint::from(self.n as u64);
                 let remainder = p % &n;
                 // remainder / p — approximate with f64 for reporting.
@@ -162,13 +158,22 @@ impl CoinMapper {
             Inner::Gf2 {
                 w_p,
                 small_byte_len,
+                cutoff,
             } => {
                 let v = read_le_u128(coin_bytes, *small_byte_len, *w_p);
-                gf2_try_map(v, *w_p, self.n).map(|k| k + 1)
+                if cutoff.map(|bound| v >= bound).unwrap_or(false) {
+                    None
+                } else {
+                    Some((v % self.n as u128) as usize + 1)
+                }
             }
-            Inner::Prime { p } => {
+            Inner::Prime { p, cutoff } => {
                 let v = BigUint::from_bytes_be(coin_bytes) % p;
-                prime_try_map(&v, p, self.n).map(|k| k + 1)
+                if &v >= cutoff {
+                    None
+                } else {
+                    prime_try_map(&v, p, self.n).map(|k| k + 1)
+                }
             }
         }
     }
@@ -186,11 +191,12 @@ impl CoinMapper {
             Inner::Gf2 {
                 w_p,
                 small_byte_len,
+                ..
             } => {
                 let v = read_le_u128(coin_bytes, *small_byte_len, *w_p);
                 gf2_try_map(v, *w_p, 2).map(|k| k == 1)
             }
-            Inner::Prime { p } => {
+            Inner::Prime { p, .. } => {
                 let v = BigUint::from_bytes_be(coin_bytes) % p;
                 prime_try_map(&v, p, 2).map(|k| k == 1)
             }
@@ -249,23 +255,36 @@ fn read_le_u128(coin_bytes: &[u8], small_byte_len: usize, w_p: usize) -> u128 {
 /// GF(2^w_p) rejection-sampling map: returns `Some(k)` in `{0, …, n-1}`
 /// when accepted, `None` when rejected.
 fn gf2_try_map(v: u128, w_p: usize, n: usize) -> Option<usize> {
-    debug_assert!(n >= 1);
-    if n == 1 {
-        return Some(0);
+    if n == 0 || w_p == 0 || w_p > 128 {
+        return None;
     }
-    let n128 = n as u128;
-    // For w_p >= 64 the domain is at least 2^64 which dwarfs any
-    // realistic n; the rejection probability is < n / 2^64 ≈ 0,
-    // and computing `1u128 << w_p` would overflow when w_p == 128.
-    if w_p >= 64 {
-        return Some((v % n128) as usize);
+    if w_p < 128 && (n as u128 > (1u128 << w_p) || v >= (1u128 << w_p)) {
+        return None;
     }
-    let domain = 1u128 << w_p;
-    let cutoff = (domain / n128) * n128;
-    if v < cutoff {
-        Some((v % n128) as usize)
-    } else {
+    if gf2_cutoff(w_p, n).map(|bound| v >= bound).unwrap_or(false) {
+        return None;
+    }
+    Some((v % n as u128) as usize)
+}
+
+fn pow2_remainder(w_p: usize, n: usize) -> u128 {
+    let modulus = n as u128;
+    let mut remainder = 1 % modulus;
+    for _ in 0..w_p {
+        remainder = (remainder * 2) % modulus;
+    }
+    remainder
+}
+
+/// None denotes the full domain. This also handles 2^128 without overflow.
+fn gf2_cutoff(w_p: usize, n: usize) -> Option<u128> {
+    let remainder = pow2_remainder(w_p, n);
+    if remainder == 0 {
         None
+    } else if w_p == 128 {
+        Some(u128::MAX - (remainder - 1))
+    } else {
+        Some((1u128 << w_p) - remainder)
     }
 }
 
@@ -523,10 +542,10 @@ mod tests {
     }
 
     #[test]
-    fn rejection_bound_wide_field_is_zero() {
+    fn rejection_bound_wide_field_is_nonzero() {
         let profile = Gf2Profile::new(64, 256).unwrap();
         let mapper = CoinMapper::for_gf2(profile, 100).unwrap();
-        assert_eq!(mapper.rejection_bound(), 0.0);
+        assert!(mapper.rejection_bound() > 0.0);
     }
 
     // --- first_match scan ---
@@ -649,14 +668,14 @@ mod tests {
     }
 
     #[test]
-    fn wide_small_field_always_accepts() {
+    fn wide_small_field_rejects_the_tail() {
         for &(w_p, w_q) in &[(64usize, 128usize), (64, 256), (128, 256), (128, 128)] {
             let profile = Gf2Profile::new(w_p, w_q).unwrap();
             let mapper = CoinMapper::for_gf2(profile, 100).unwrap();
-            assert_eq!(mapper.rejection_bound(), 0.0);
-            // A max-value coin should be accepted.
+            assert!(mapper.rejection_bound() > 0.0);
+            // 100 does not divide 2^w_p: the maximum value is rejected.
             let bytes = coin_bytes_from_u128(u128::MAX);
-            assert!(mapper.try_leader(&bytes).is_some());
+            assert!(mapper.try_leader(&bytes).is_none());
         }
     }
 }

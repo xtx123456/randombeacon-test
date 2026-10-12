@@ -56,6 +56,13 @@ pub(crate) fn avss_local_packet_valid_pure(
     // sealed ACS-coin secrets; all are committed + degree-tested
     // uniformly, so every length / loop below ranges over the total.
     let batch_size = batch_size + coin_reserve;
+    let wss = beacon_msg.wss.as_ref().ok_or("missing WSS payload")?;
+    if myid >= num_nodes || wss.secrets.len() != batch_size
+        || wss.nonces.len() != batch_size || wss.mps.len() != batch_size
+        || wss.mps.iter().any(|proof| !proof.matches_leaf(myid, num_nodes))
+    {
+        return Err("invalid WSS lengths or Merkle leaf position/depth");
+    }
     let public_root = crypto::hash::do_hash(beacon_msg.serialize_ctrbc().as_slice());
     if public_root != *transcript_root {
         log::warn!(
@@ -437,12 +444,15 @@ impl Context {
     /// pre-clone alone was ~4.5 MB per message; eliminating it
     /// saves tens of MB of memory bandwidth per round per node.
     pub fn check_proposal(self: &Context, wrapper_msg: &WrapperMsg) -> bool {
+        if wrapper_msg.sender >= self.num_nodes {
+            return false;
+        }
         let byte_val =
             bincode::serialize(&wrapper_msg.protmsg).expect("Failed to serialize object");
 
         let sec_key = match self.sec_key_map.get(&wrapper_msg.sender) {
             Some(val) => val,
-            None => panic!("Secret key not available, this shouldn't happen"),
+            None => return false,
         };
 
         if !verf_mac(&byte_val, sec_key.as_slice(), &wrapper_msg.mac) {
@@ -495,9 +505,15 @@ impl Context {
                 );
             }
             CoinMsg::AVSSReady(dealer, transcript_root, sender, round) => {
+                if sender != wire_sender || dealer >= self.num_nodes {
+                    return;
+                }
                 self.process_avss_ready(dealer, transcript_root, sender, round).await;
             }
             CoinMsg::AVSSComplete(dealer, transcript_root, sender, round) => {
+                if sender != wire_sender || dealer >= self.num_nodes {
+                    return;
+                }
                 self.process_avss_complete(dealer, transcript_root, sender, round).await;
             }
             CoinMsg::CTRBCInit(_, ctr) => {
@@ -549,6 +565,9 @@ impl Context {
             }
 
             CoinMsg::BatchBeaconConstruct(msg, share_sender, round) => {
+                if share_sender != wire_sender {
+                    return;
+                }
                 log::debug!(
                     "[PPT][BATCH-BEACON-CONSTRUCT] received batched BeaconConstruct from node {} with {} coin-packets in round {}",
                     share_sender,
@@ -559,6 +578,9 @@ impl Context {
             }
 
             CoinMsg::MulticastRecoveredShares(msg, sender, round) => {
+                if sender != wire_sender {
+                    return;
+                }
                 log::info!(
                     "[PPT][MULTICAST-DISPATCH] node {} dispatching recovered-share multicast from {} for round {}",
                     self.myid,
@@ -1023,7 +1045,7 @@ impl Context {
         // first, skip.
         {
             let rbc_state = self.round_state.get_mut(&round).unwrap();
-            if rbc_state.avss_local_valid.contains(&dealer) {
+            if rbc_state.cleared || rbc_state.avss_local_valid.contains(&dealer) {
                 return;
             }
             rbc_state.store_avss_packet(dealer, beacon_msg, transcript_root);
@@ -1185,11 +1207,23 @@ impl Context {
     #[async_recursion]
     pub async fn finalize_acs_round(&mut self, round: Round, mut decided_vec: Vec<Replica>) {
         decided_vec.sort_unstable();
-        decided_vec.retain(|d| !self.banned_dealers.contains(d));
+        if decided_vec.windows(2).any(|pair| pair[0] == pair[1])
+            || decided_vec.iter().any(|d| *d >= self.num_nodes)
+            || decided_vec.len() < self.num_nodes - self.num_faults
+        {
+            log::error!("[PPT][ACS-DECIDE] invalid decided dealer set for round {}", round);
+            return;
+        }
+        if let Some(existing) = self.round_state.get(&round).and_then(|st| st.acs_decided_set.as_ref()) {
+            if existing != &decided_vec {
+                log::error!("[PPT][ACS-DECIDE] conflicting duplicate decision for round {}", round);
+            }
+            return;
+        }
 
         if decided_vec.is_empty() {
             log::error!(
-                "[PPT][ACS-DECIDE] node {} round {} ACS decided an empty dealer set after ban filter; aborting round",
+                "[PPT][ACS-DECIDE] node {} round {} ACS decided an empty dealer set; aborting round",
                 self.myid,
                 round
             );
@@ -1213,11 +1247,17 @@ impl Context {
             rbc_state.batch_reconstruction_complete = false;
             rbc_state.recovered_shares_multicast_sent = false;
             rbc_state.post_complaint_complete = false;
-            rbc_state.post_complaint_packets.clear();
+            rbc_state.audit_in_progress = false;
+            rbc_state.post_complaint_version = 0;
+            // Complete audit snapshots may race ahead of the local ACS decision.
+            // Preserve them for validation against the now-frozen decided set.
             rbc_state.pending_beacon_outputs.clear();
             rbc_state.recovered_coins.clear();
             rbc_state.multicast_disclosed_coins.clear();
             rbc_state.emitted_beacon_coins.clear();
+            rbc_state.next_output_coin = 0;
+            rbc_state.first_match_leader = None;
+            rbc_state.first_match_complete = false;
             rbc_state.ppt_round_finished = false;
 
             // PPT reconstruction is no longer pinned to a fixed

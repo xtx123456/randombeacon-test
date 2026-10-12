@@ -112,19 +112,16 @@ impl AcsRound {
     }
 
     /// Compute final ACS dealer set: `{ j : ABA(j) decided 1 }`,
-    /// filtered against the global banned-dealer list (passed in by
-    /// the caller, since `AcsRound` doesn't directly own
-    /// `Context::banned_dealers`). Returns `None` until every
-    /// instance has decided.
+    /// Returns `None` until every instance has decided. Local suspicions
+    /// never remove entries from the agreed output.
     pub fn compute_decided_dealers(
         &self,
-        banned: &HashSet<Replica>,
+        _banned: &HashSet<Replica>,
     ) -> Option<Vec<Replica>> {
         let bset = self.aba.maybe_compute_acs_output()?;
         let mut out: Vec<Replica> = bset
             .into_iter()
             .map(|j| j as Replica)
-            .filter(|d| !banned.contains(d))
             .collect();
         out.sort_unstable();
         Some(out)

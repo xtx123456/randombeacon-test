@@ -15,7 +15,6 @@ use types::{
     Replica,
 };
 
-use crate::node::ctrbc::state::BlameReason;
 use crate::node::shamir::two_field::BatchExtractor;
 use crate::node::shoup_smart::proof_leaf_index;
 use crate::node::{CTRBCState, Context};
@@ -31,11 +30,55 @@ fn packet_lengths_ok(packet: &BatchWSSReconMsg) -> bool {
         Some(fl) => fl.len() == l,
         None => true, // GF2 mode (commit 7): f_large derived locally
     };
-    packet.secrets.len() == l
+    l > 0
+        && packet.origins.iter().copied().collect::<HashSet<_>>().len() == l
+        && packet.mps.iter().all(|proof| proof.has_valid_shape())
+        && packet.secrets.len() == l
         && packet.nonces.len() == l
         && packet.mps.len() == l
         && packet.mask_shares.len() == l
         && f_large_ok
+}
+
+fn snapshot_covers_batch(
+    snapshot: &MulticastRecoveredSharesMsg,
+    decided: &[Replica],
+    batch_size: usize,
+) -> bool {
+    snapshot.packets.len() == batch_size
+        && snapshot.packets.iter().enumerate().all(|(coin, entry)| {
+            entry.coin_num == coin && packet_lengths_ok(&entry.packet)
+                && entry.packet.origins.as_slice() == decided
+        })
+}
+
+#[derive(Debug)]
+pub struct AuditResult {
+    pub complete: bool,
+    pub rejected_providers: HashSet<Replica>,
+}
+
+fn recon_fields_ok(
+    packet: &BatchWSSReconMsg,
+    profile: Option<crypto::gf2::Gf2Profile>,
+    secret_domain: &BigUint,
+) -> bool {
+    if let Some(profile) = profile {
+        packet.f_large_shares.is_none()
+            && packet.secrets.iter().all(|bytes| {
+                crypto::gf2::Gf2Element::from_bytes(profile, *bytes)
+                    .map(|element| element.is_in_small_field()).unwrap_or(false)
+            })
+            && packet.mask_shares.iter().all(|bytes| {
+                crypto::gf2::Gf2Element::from_bytes(profile, *bytes).is_ok()
+            })
+    } else {
+        packet.f_large_shares.as_ref().map(|large| {
+            packet.secrets.iter().zip(large).all(|(share, lifted)| {
+                BigUint::from_bytes_be(share) == BigUint::from_bytes_be(lifted) % secret_domain
+            })
+        }).unwrap_or(false)
+    }
 }
 
 /// One coin-packet's pre-verified inputs, ready to be moved into
@@ -95,11 +138,9 @@ pub enum CoinVerifyOutcome {
 /// audit runs on the blocking pool in parallel with the consensus
 /// task continuing to handle other messages.
 ///
-/// **Contract identical to the previous inline audit body**:
-/// returns the same `Vec<(Replica, BlameReason)>` blame events
-/// the old code produced. The caller is responsible for actually
-/// calling `blame_dealer` and `ban_dealer_global` on the blamed
-/// dealers; this function only computes the evidence.
+/// First-batch audit contract: authenticate enough provider records for every
+/// selected dealer/coin. Bad relayed records identify a provider, not a dealer.
+/// This is NOT the PPT OEC/whole-tree audit (scheduled for the second batch).
 pub(crate) fn audit_post_complaint_pure(
     decided: Vec<Replica>,
     comm_vectors: HashMap<
@@ -109,128 +150,63 @@ pub(crate) fn audit_post_complaint_pure(
     >,
     post_packets: HashMap<
         Replica,
-        MulticastRecoveredSharesMsg,
+        Arc<MulticastRecoveredSharesMsg>,
         nohash_hasher::BuildNoHashHasher<Replica>,
     >,
     audit_senders: Vec<Replica>,
     batch_size: usize,
     hash_context: &crypto::aes_hash::HashState,
-) -> Vec<(Replica, BlameReason)> {
-    let mut blame_events: Vec<(Replica, BlameReason)> = Vec::new();
-
-    for dealer in decided.into_iter() {
-        let root_vec = match comm_vectors.get(&dealer) {
-            Some(root_vec) => root_vec,
-            None => {
-                blame_events.push((dealer, BlameReason::MissingCommitmentVector));
-                continue;
-            }
+    num_nodes: usize,
+    threshold: usize,
+    gf2_profile: Option<crypto::gf2::Gf2Profile>,
+) -> AuditResult {
+    let mut result = AuditResult { complete: false, rejected_providers: HashSet::new() };
+    if decided.is_empty() || decided.iter().any(|d| {
+        comm_vectors.get(d).map(|roots| roots.len() < batch_size).unwrap_or(true)
+    }) {
+        return result; // Missing local evidence is not dealer misconduct.
+    }
+    let mut valid_counts = vec![vec![0usize; decided.len()]; batch_size];
+    for provider in audit_senders.into_iter().collect::<HashSet<_>>() {
+        let snapshot = match post_packets.get(&provider) {
+            Some(snapshot) if provider < num_nodes
+                && snapshot_covers_batch(snapshot, &decided, batch_size) => snapshot,
+            _ => { result.rejected_providers.insert(provider); continue; }
         };
-
-        for coin_num in 0..batch_size {
-            if coin_num >= root_vec.len() {
+        for entry in &snapshot.packets {
+            let packet = &entry.packet;
+            if !crypto::aes_hash::Proof::validate_batch(&packet.mps, hash_context) {
+                result.rejected_providers.insert(provider);
                 continue;
             }
-            let expected_root = root_vec[coin_num];
-            let mut complete = true;
-
-            for share_owner in audit_senders.iter().copied() {
-                let packet_bundle = match post_packets.get(&share_owner) {
-                    Some(b) => b,
-                    None => {
-                        complete = false;
-                        break;
-                    }
-                };
-
-                let packet = match packet_bundle
-                    .packets
-                    .iter()
-                    .find(|entry| entry.coin_num == coin_num)
-                    .map(|entry| &entry.packet)
-                {
-                    Some(packet) => packet,
-                    None => {
-                        complete = false;
-                        break;
-                    }
-                };
-
-                if !crypto::aes_hash::Proof::validate_batch(&packet.mps, hash_context) {
-                    complete = false;
-                    break;
-                }
-
-                let idx = match packet.origins.iter().position(|origin| *origin == dealer) {
-                    Some(idx) => idx,
-                    None => {
-                        complete = false;
-                        break;
-                    }
-                };
-
-                let share = packet.secrets[idx];
-                let nonce = packet.nonces[idx];
+            for (idx, dealer) in decided.iter().enumerate() {
                 let proof = &packet.mps[idx];
-
-                // Recompute the committed leaf binding f_share, g_share
-                // (mask), f_large (BigUint only) and nonce. GF(2^w)
-                // mode (commit 7): f_large channel dropped — the
-                // 3-field `avss_commit_leaf_gf2` matches what the
-                // dealer hashed.
-                if idx >= packet.mask_shares.len() {
-                    complete = false;
-                    break;
-                }
-                let f_large_ref = match packet.f_large_shares.as_ref() {
-                    Some(fl) if idx < fl.len() => Some(&fl[idx]),
-                    Some(_) => {
-                        complete = false;
-                        break;
-                    }
-                    None => None,
-                };
-                let item = types::beacon::avss_commit_leaf_auto(
-                    &share,
-                    &packet.mask_shares[idx],
-                    f_large_ref,
-                    &nonce,
+                let mode_ok = packet.f_large_shares.is_none() == gf2_profile.is_some();
+                let field_ok = gf2_profile.map(|profile| {
+                    crypto::gf2::Gf2Element::from_bytes(profile, packet.secrets[idx])
+                        .map(|share| share.is_in_small_field()).unwrap_or(false)
+                        && crypto::gf2::Gf2Element::from_bytes(profile, packet.mask_shares[idx]).is_ok()
+                }).unwrap_or(true);
+                let f_large = packet.f_large_shares.as_ref().map(|v| &v[idx]);
+                let leaf = types::beacon::avss_commit_leaf_auto(
+                    &packet.secrets[idx], &packet.mask_shares[idx], f_large, &packet.nonces[idx],
                 );
-
-                if item != proof.item() {
-                    blame_events.push((
-                        dealer,
-                        BlameReason::CommitmentMismatch {
-                            coin_num,
-                            expected_root,
-                            got_item: item,
-                        },
-                    ));
-                    complete = false;
-                    break;
+                if mode_ok && field_ok && proof.matches_leaf(provider, num_nodes)
+                    && proof.root() == comm_vectors[dealer][entry.coin_num]
+                    && proof.item() == leaf
+                {
+                    valid_counts[entry.coin_num][idx] += 1;
+                } else {
+                    // This record was supplied by the provider, not by the dealer.
+                    result.rejected_providers.insert(provider);
                 }
-
-                if proof.root() != expected_root {
-                    blame_events.push((
-                        dealer,
-                        BlameReason::MerkleRootMismatch {
-                            coin_num,
-                            expected_root,
-                            got_root: proof.root(),
-                        },
-                    ));
-                    complete = false;
-                    break;
-                }
-            }
-
-            if !complete {
-                continue;
             }
         }
     }
-
-    blame_events
+    // n-f received full snapshots contain >= n-2f = f+1 honest
+    // providers. No Byzantine provider's cooperation is required.
+    result.complete = valid_counts.iter().all(|counts| counts.iter().all(|n| *n >= threshold));
+    result
 }
 
 /// CPU-heavy bulk verifier for a whole batch of coin-packets. The
@@ -286,7 +262,7 @@ pub fn verify_recon_shares_pure(
         // Merkle-validation path in this codebase). A single bad proof
         // taints the whole packet from this provider; we simply skip
         // it and rely on the other >= 2f+1 honest providers.
-        if packet.mps.is_empty()
+        if !packet_lengths_ok(&packet)
             || !crypto::aes_hash::Proof::validate_batch(&packet.mps, hash_context)
         {
             continue;
@@ -580,8 +556,14 @@ impl Context {
     pub(crate) fn maybe_release_round(&mut self, round: Round) {
         let should_release = match self.round_state.get(&round) {
             Some(state) => {
-                state.recon_secrets.contains(&(self.batch_size - 1))
+                state.batch_reconstruction_complete
+                    && state.recovered_coins.len() == self.batch_size
+                    && state.emitted_beacon_coins.len() == self.batch_size
+                    && state.next_output_coin == self.batch_size
+                    && state.pending_beacon_outputs.is_empty()
+                    && state.first_match_complete
                     && state.post_complaint_complete
+                    && !state.audit_in_progress
                     && !state.cleared
             }
             None => false,
@@ -650,15 +632,19 @@ impl Context {
 
     #[async_recursion]
     async fn flush_pending_beacon_outputs(&mut self, round: Round, reason: &'static str) {
-        let pending = {
-            let rbc_state = match self.round_state.get_mut(&round) {
-                Some(rbc_state) => rbc_state,
-                None => return,
+        loop {
+            let next = {
+                let state = match self.round_state.get_mut(&round) {
+                    Some(state) if !state.cleared => state,
+                    _ => return,
+                };
+                let coin = state.next_output_coin;
+                state.pending_beacon_outputs.remove(&coin).map(|values| (coin, values))
             };
-            std::mem::take(&mut rbc_state.pending_beacon_outputs)
-        };
-
-        for (coin_num, beacon) in pending.into_iter() {
+            let (coin_num, beacon) = match next {
+                Some(next) => next,
+                None => break, // Earlier coin is pending: no timeout, no blocked task.
+            };
             // Per-coin flush log demoted to debug: at batch=1000
             // this fires ~1000 times per round per node. Kept as
             // debug for forensics. The aggregate [STAGE][BEACON-OUT]
@@ -673,6 +659,7 @@ impl Context {
             );
             self.self_coin_check_transmit(round, coin_num, beacon).await;
         }
+        self.maybe_release_round(round);
     }
 
     /// Level 2 multi-core hot path. The previous version walked the
@@ -714,6 +701,15 @@ impl Context {
         round: Round,
     ) {
         let now = SystemTime::now();
+        if sender >= self.num_nodes || recovered.origin != sender || recovered.round != round {
+            return;
+        }
+        if recovered.packets.len() > self.batch_size
+            || recovered.packets.iter().map(|entry| entry.coin_num).collect::<HashSet<_>>().len()
+                != recovered.packets.len()
+        {
+            return;
+        }
         log::info!(
             "[PPT][BATCH-RECV] node {} got batched BeaconConstruct from {} for round {} with {} coin-packets",
             self.myid,
@@ -756,7 +752,11 @@ impl Context {
                         round
                     );
                     for entry in recovered.packets.into_iter() {
-                        if packet_lengths_ok(&entry.packet) {
+                        if entry.coin_num < self.batch_size && packet_lengths_ok(&entry.packet)
+                            && recon_fields_ok(&entry.packet, self.gf2_profile, &self.secret_domain)
+                            && entry.packet.origins.iter().all(|d| *d < self.num_nodes)
+                            && entry.packet.mps.iter().all(|p| p.matches_leaf(sender, self.num_nodes))
+                        {
                             rbc_state.pre_acs_beacon_constructs.push((
                                 entry.packet,
                                 sender,
@@ -796,6 +796,13 @@ impl Context {
                     continue;
                 }
                 let coin_num = entry.coin_num;
+                if coin_num >= self.batch_size
+                    || entry.packet.origins.iter().any(|d| *d >= self.num_nodes)
+                    || !recon_fields_ok(&entry.packet, self.gf2_profile, &self.secret_domain)
+                    || entry.packet.mps.iter().any(|p| !p.matches_leaf(sender, self.num_nodes))
+                {
+                    continue;
+                }
                 let packet = entry.packet;
 
                 let mut roots_for_dealer: HashMap<Replica, Hash> = HashMap::new();
@@ -1088,6 +1095,11 @@ impl Context {
         // First, retry any reconstruction packets that were buffered
         // because a decided dealer's commitment had not yet arrived.
         self.drain_pending_recon_shares(round);
+        if self.round_state.get(&round).map(|s| s.batch_reconstruction_complete).unwrap_or(false) {
+            self.send_audit_multicast_snapshot(round).await;
+            self.maybe_start_post_audit(round).await;
+            return;
+        }
 
         let threshold = self.num_faults + 1;
         let ready_initial = {
@@ -1143,12 +1155,8 @@ impl Context {
             };
 
             if remaining.is_empty() {
-                // Edge case: only coin-0 was in the ready set. We
-                // never sent the audit multicast in the fast-path
-                // call (because we deferred it), so emit a
-                // coin-0-only multicast now, matching what the
-                // pre-fast-path code would have produced for a
-                // batch_size = 1 round.
+                // Send only if B=1 is now a complete batch. For B>1
+                // keep waiting asynchronously; never disclose a prefix as final.
                 self.send_audit_multicast_snapshot(round).await;
                 return;
             }
@@ -1171,10 +1179,15 @@ impl Context {
     #[async_recursion]
     async fn send_audit_multicast_snapshot(&mut self, round: Round) {
         let (multicast_msg, decided_dbg) = {
-            let rbc_state = match self.round_state.get(&round) {
+            let rbc_state = match self.round_state.get_mut(&round) {
                 Some(s) => s,
                 None => return,
             };
+            if !rbc_state.batch_reconstruction_complete || rbc_state.cleared
+                || rbc_state.recovered_shares_multicast_sent
+            {
+                return;
+            }
             let decided = match rbc_state.acs_decided_set.clone() {
                 Some(d) => d,
                 None => return,
@@ -1195,6 +1208,10 @@ impl Context {
                 decided.as_slice(),
                 disclosed.as_slice(),
             );
+            if !snapshot_covers_batch(&msg, &decided, self.batch_size) {
+                return;
+            }
+            rbc_state.recovered_shares_multicast_sent = true;
             (Some(msg), decided)
         };
 
@@ -1414,16 +1431,16 @@ impl Context {
 
             let mut outputs = Vec::new();
             for coin in coin_set.iter().copied() {
-                rbc_state.recovered_coins.insert(coin);
-
-                if !rbc_state.emitted_beacon_coins.contains(&coin) {
-                    if let Some(random) = rbc_state.coin_check(round, coin, self.num_nodes).await {
+                if rbc_state.recovered_coins.contains(&coin) {
+                    continue;
+                }
+                if let Some(random) = rbc_state.coin_check(round, coin, self.num_nodes).await {
+                    if !random.is_empty() {
+                        rbc_state.recovered_coins.insert(coin);
+                        rbc_state.multicast_disclosed_coins.insert(coin);
                         outputs.push((coin, random));
                     }
-                    rbc_state.emitted_beacon_coins.insert(coin);
                 }
-
-                rbc_state.multicast_disclosed_coins.insert(coin);
             }
 
             let mut disclosed: Vec<usize> = rbc_state
@@ -1441,16 +1458,24 @@ impl Context {
             // full disclosure and ensures the post-ACS audit sees
             // every coin's commitment data, exactly as the
             // pre-fast-path one-shot code did.
-            let multicast_msg = if !emit_audit_multicast || disclosed.is_empty() {
+            let multicast_msg = if !emit_audit_multicast || disclosed.len() != self.batch_size
+                || rbc_state.recovered_shares_multicast_sent
+            {
                 None
             } else {
-                Some(build_local_multicast_snapshot(
+                let msg = build_local_multicast_snapshot(
                     rbc_state,
                     round,
                     self.myid,
                     decided.as_slice(),
                     disclosed.as_slice(),
-                ))
+                );
+                if snapshot_covers_batch(&msg, &decided, self.batch_size) {
+                    rbc_state.recovered_shares_multicast_sent = true;
+                    Some(msg)
+                } else {
+                    None
+                }
             };
 
             if rbc_state.recovered_coins.len() >= self.batch_size {
@@ -1476,6 +1501,7 @@ impl Context {
 
         self.flush_pending_beacon_outputs(round, "ready-coin fast-path")
             .await;
+        self.maybe_start_post_audit(round).await;
     }
 
     #[async_recursion]
@@ -1586,60 +1612,65 @@ impl Context {
         sender: Replica,
         round: Round,
     ) {
+        if sender >= self.num_nodes || recovered.origin != sender || recovered.round != round
+            || recovered.packets.len() != self.batch_size
+            || recovered.packets.iter().enumerate().any(|(coin, entry)| {
+                entry.coin_num != coin || !packet_lengths_ok(&entry.packet)
+                    || entry.packet.origins.iter().any(|d| *d >= self.num_nodes)
+                    || !recon_fields_ok(&entry.packet, self.gf2_profile, &self.secret_domain)
+                    || entry.packet.mps.iter().any(|proof| !proof.matches_leaf(sender, self.num_nodes))
+            })
+        {
+            return;
+        }
+        let state = self.round_state.entry(round)
+            .or_insert_with(|| CTRBCState::new(self.secret_domain.clone(), self.num_nodes));
+        if state.cleared || state.post_complaint_complete {
+            return;
+        }
+        // Keep a full snapshot even when it races ahead of local ACS. A later
+        // malformed prefix cannot overwrite it; transport duplicates are ignored.
+        if state.post_complaint_packets.get(&sender).map(|snapshot| snapshot.as_ref()) == Some(&recovered) {
+            return;
+        }
+        state.post_complaint_packets.insert(sender, Arc::new(recovered));
+        state.post_complaint_version = state.post_complaint_version.wrapping_add(1);
+        self.maybe_start_post_audit(round).await;
+    }
+
+    async fn maybe_start_post_audit(&mut self, round: Round) {
         if !self.round_state.contains_key(&round) {
-            log::warn!(
-                "[PPT][POST-COMPLAINT-DROP] node {} round {} missing round_state for sender {}",
-                self.myid,
-                round,
-                sender
-            );
             return;
         }
 
         let threshold = self.num_nodes - self.num_faults;
 
-        log::info!(
-            "[PPT][POST-COMPLAINT-RECV] node {} round {} got recovered-share multicast from {}",
-            self.myid,
-            round,
-            sender
-        );
-
         let detach_inputs = {
             let rbc_state = self.round_state.get_mut(&round).unwrap();
 
-            if rbc_state.cleared {
-                log::warn!(
-                    "[PPT][POST-COMPLAINT-DROP] node {} round {} already cleared; dropping sender {}",
-                    self.myid,
-                    round,
-                    sender
-                );
+            if rbc_state.cleared || rbc_state.audit_in_progress {
                 return;
             }
 
-            // Phase F1 -- guard against late-arriving MulticastRecoveredShares:
-            // once the audit task has fired (post_complaint_complete=true), any
-            // additional inbound multicast for this round is unused (the audit's
-            // n-f quorum already cleared, and audit_post_complaint_pure was
-            // already invoked with the snapshot at that time). Pre-Phase-F1 we
-            // would still `.insert(sender, recovered)` here, accumulating
-            // ~4.5 MB per late arrival in a map that nobody consumes -- a
-            // direct OOM contributor at batch=1000 / n=16 (~67 MB per round
-            // just from stale insertions).
+            // Completion is set only after a successful full-evidence result.
             if rbc_state.post_complaint_complete {
                 log::debug!(
-                    "[PPT][POST-COMPLAINT-SKIP] node {} round {} already completed; \
-                     dropping late multicast from sender {}",
+                    "[PPT][POST-COMPLAINT-SKIP] node {} round {} already completed",
                     self.myid,
-                    round,
-                    sender
+                    round
                 );
                 return;
             }
 
-            // Latest snapshot from this sender overwrites previous one.
-            rbc_state.post_complaint_packets.insert(sender, recovered);
+            let decided = match rbc_state.acs_decided_set.as_ref() {
+                Some(decided) if !decided.is_empty() => decided,
+                _ => return,
+            };
+            if decided.iter().any(|d| rbc_state.comm_vectors.get(d)
+                .map(|roots| roots.len() < self.batch_size).unwrap_or(true))
+            {
+                return;
+            }
 
             log::info!(
                 "[PPT][POST-COMPLAINT-COUNT] node {} round {} now has {}/{} recovered-share multicasts (async threshold)",
@@ -1655,40 +1686,28 @@ impl Context {
             }
 
             let mut senders: Vec<Replica> =
-                rbc_state.post_complaint_packets.keys().copied().collect();
+                rbc_state.post_complaint_packets.iter()
+                    .filter(|(_, snapshot)| snapshot_covers_batch(snapshot, decided, self.batch_size))
+                    .map(|(sender, _)| *sender).collect();
             senders.sort_unstable();
-            senders.truncate(threshold);
+            if senders.len() < threshold {
+                return;
+            }
 
-            rbc_state.post_complaint_complete = true;
+            rbc_state.audit_in_progress = true;
 
-            // Phase F1 -- MOVE (not clone) `comm_vectors` and
-            // `post_complaint_packets` into the detached audit task. The
-            // only consumer of either map for this round is
-            // `audit_post_complaint_pure` inside the detached task; cloning
-            // here used to double the in-flight memory footprint by ~67 MB
-            // per round at batch=1000 / n=16, and the original copies in
-            // `rbc_state` were never read again before
-            // `maybe_release_round` cleared them. Using `mem::take` drops
-            // the rbc_state copies the moment the audit task takes
-            // ownership.
-            //
-            // Late-arriving AVSS validations that fire after this point
-            // would call `store_avss_packet`, which writes into the
-            // (now-empty) `comm_vectors` map. That is harmless: audit has
-            // already used the pre-take snapshot, and the new entries are
-            // small (one Hash per coin per dealer) and get cleared by
-            // `maybe_release_round` at round end. Safety / correctness:
-            // verified that no other code path reads either of these maps
-            // for `round` after the audit fires.
+            // Snapshot immutable evidence for the worker. Keep the live roots
+            // and disclosures until BOTH reconstruction and applied audit finish.
             Some((
                 rbc_state.acs_decided_set.clone().unwrap_or_default(),
-                std::mem::take(&mut rbc_state.comm_vectors),
-                std::mem::take(&mut rbc_state.post_complaint_packets),
+                rbc_state.comm_vectors.clone(),
+                rbc_state.post_complaint_packets.clone(),
                 senders,
+                rbc_state.post_complaint_version,
             ))
         };
 
-        let (decided, comm_vectors, post_packets, audit_senders) = match detach_inputs {
+        let (decided, comm_vectors, post_packets, audit_senders, evidence_version) = match detach_inputs {
             Some(v) => v,
             None => return,
         };
@@ -1700,11 +1719,13 @@ impl Context {
         // spawn_blocking audit synchronously.
         let hash_context = std::sync::Arc::clone(&self.hash_context);
         let batch_size = self.batch_size;
-        let myid = self.myid;
         let audit_tx = self.audit_tx.clone();
+        let num_nodes = self.num_nodes;
+        let recovery_threshold = self.num_faults + 1;
+        let gf2_profile = self.gf2_profile;
 
         tokio::spawn(async move {
-            let blame_events = tokio::task::spawn_blocking(move || {
+            let result = tokio::task::spawn_blocking(move || {
                 audit_post_complaint_pure(
                     decided,
                     comm_vectors,
@@ -1712,33 +1733,23 @@ impl Context {
                     audit_senders,
                     batch_size,
                     &hash_context,
+                    num_nodes,
+                    recovery_threshold,
+                    gf2_profile,
                 )
             })
             .await
-            .unwrap_or_else(|e| {
-                log::error!(
-                    "[PPT][LEVEL2] post-complaint audit blocking task join error round {}: {}",
-                    round,
-                    e
-                );
-                Vec::new()
-            });
-
-            log::info!(
-                "[PPT][POST-COMPLAINT] node {} round {} async audit produced {} blame events; publishing to main loop",
-                myid,
-                round,
-                blame_events.len()
-            );
+            .map_err(|e| format!("post-complaint audit task failed: {}", e));
 
             let _ = audit_tx.send(crate::node::context::AuditCompletion {
                 round,
-                blame_events,
+                evidence_version,
+                result,
             });
         });
     }
 
-    /// Apply the blame / ban / release writes from a completed
+    /// Apply the evidence-completion / release writes from a completed
     /// fire-and-forget audit. Called from the main loop's
     /// `tokio::select!` arm on `audit_rx.recv()`.
     pub async fn finalize_audit_completion(
@@ -1746,49 +1757,31 @@ impl Context {
         completion: crate::node::context::AuditCompletion,
     ) {
         let round = completion.round;
-        let blame_events = completion.blame_events;
-        let threshold = self.num_nodes - self.num_faults;
-
-        if blame_events.is_empty() {
-            log::info!(
-                "[PPT][POST-COMPLAINT] node {} round {} async audit completed (n-f threshold {}) with no blame events",
-                self.myid,
-                round,
-                threshold
-            );
-            // The audit just transitioned to complete; if every
-            // coin was already emitted before audit completion,
-            // release the round's transient state now.
-            self.maybe_release_round(round);
-            return;
-        }
-
-        let mut to_ban: HashSet<Replica> = HashSet::new();
-        {
-            let rbc_state = match self.round_state.get_mut(&round) {
-                Some(rbc_state) => rbc_state,
-                None => {
-                    // round_state already released between the audit
-                    // task spawning and finishing -- nothing to do.
-                    return;
-                }
+        let retry = {
+            let state = match self.round_state.get_mut(&round) {
+                Some(state) if !state.cleared && state.audit_in_progress => state,
+                _ => return,
             };
-            for (dealer, reason) in blame_events.into_iter() {
-                log::error!(
-                    "[PPT][POST-BLAME] node {} round {} blaming dealer {}: {:?}",
-                    self.myid,
-                    round,
-                    dealer,
-                    reason
-                );
-                rbc_state.blame_dealer(dealer, round, reason);
-                to_ban.insert(dealer);
+            state.audit_in_progress = false;
+            match completion.result {
+                Ok(result) => {
+                    for provider in result.rejected_providers {
+                        log::warn!("[PPT][AUDIT-PROVIDER] rejected provider {} evidence in round {}; no dealer blame", provider, round);
+                    }
+                    state.post_complaint_complete = result.complete;
+                }
+                Err(error) => {
+                    log::error!("[PPT][AUDIT-ERROR] round {}: {}", round, error);
+                    state.post_complaint_complete = false;
+                }
             }
-        }
-        for dealer in to_ban.into_iter() {
-            self.ban_dealer_global(dealer);
-        }
+            !state.post_complaint_complete
+                && state.post_complaint_version != completion.evidence_version
+        };
         self.maybe_release_round(round);
+        if retry {
+            self.maybe_start_post_audit(round).await;
+        }
     }
 
     /**
@@ -1813,6 +1806,19 @@ impl Context {
         coin_num: usize,
         numbers: Vec<Vec<u8>>,
     ) {
+        let state = match self.round_state.get_mut(&round) {
+            Some(state) if !state.cleared => state,
+            _ => return,
+        };
+        if coin_num >= self.batch_size || numbers.is_empty()
+            || state.emitted_beacon_coins.contains(&coin_num)
+        {
+            return;
+        }
+        if coin_num != state.next_output_coin {
+            state.pending_beacon_outputs.entry(coin_num).or_insert(numbers);
+            return;
+        }
         // `numbers` is the super-invertible extraction output for this
         // coin column: `R = |decided| - f` independent beacon values.
         // Each is emitted to the syncer under a distinct global index
@@ -1838,20 +1844,13 @@ impl Context {
             coin_num,
             numbers.len()
         );
-        let is_last_coin = self
-            .round_state
-            .get(&round)
-            .map(|state| state.recon_secrets.contains(&(self.batch_size - 1)))
-            .unwrap_or(false);
+        let is_last_coin = coin_num + 1 == self.batch_size;
 
         // Memory-bound: once every coin in the round has been emitted
         // AND the post-ACS audit quorum (n-f recovered-share
         // multicasts) has fired, this round is fully done. Wipe the
         // round's transient state in place so a long-running beacon
         // doesn't accumulate unbounded round_state entries.
-        if is_last_coin {
-            self.maybe_release_round(round);
-        }
 
         if coin_num == 0 {
             // ACS common-coin fallback seed: the previous-round beacon
@@ -1931,6 +1930,7 @@ impl Context {
                             sub_index: i,
                             raw_bytes: number.clone(),
                         });
+                        st.first_match_complete = true;
                     }
                 }
             }
@@ -1947,6 +1947,14 @@ impl Context {
                 )
                 .await;
             self.add_cancel_handler(cancel_handler);
+        }
+        if let Some(state) = self.round_state.get_mut(&round) {
+            state.emitted_beacon_coins.insert(coin_num);
+            state.next_output_coin = coin_num + 1;
+            if is_last_coin {
+                state.first_match_complete = true; // Includes all-rejected batches.
+                state.ppt_round_finished = true;
+            }
         }
     }
 }

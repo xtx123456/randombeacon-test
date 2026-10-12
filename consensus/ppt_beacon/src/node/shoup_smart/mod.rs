@@ -77,6 +77,9 @@ use crypto::aes_hash::Proof;
 /// but the cheap distribution-phase `handle_dispersal` /
 /// `handle_echo` checks must enforce it directly.)
 pub(crate) fn proof_leaf_index(proof: &Proof) -> usize {
+    if !proof.has_valid_shape() {
+        return usize::MAX;
+    }
     let mut idx: usize = 0;
     for (i, &b) in proof.path().iter().enumerate() {
         if !b {

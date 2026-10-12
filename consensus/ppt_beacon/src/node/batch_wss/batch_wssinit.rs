@@ -304,15 +304,9 @@ impl Context {
                 // anymore -- the dealer set comes directly from
                 // Context (filtered against banned_dealers).
                 st.ppt_round_started = true;
-                st.ppt_round_finished = false;
-                st.acs_decided_set = None;
-                st.batch_extractor = None;
-                st.recovered_shares_multicast_sent = false;
-                st.batch_reconstruction_complete = false;
-                st.post_complaint_complete = false;
-                st.post_complaint_packets.clear();
-                st.pending_beacon_outputs.clear();
-                st.blame_log.clear();
+                // Fresh state was initialized by CTRBCState::new. In an
+                // asynchronous run, peer AVSS/ACS may precede our dealer launch;
+                // never reset a decision, outputs or audit evidence already present.
                 false
             }
         };

@@ -160,17 +160,19 @@ pub struct CTRBCState {
 
     // ---- Post-ACS audit / accountability ----
     pub post_complaint_packets:
-        HashMap<Replica, MulticastRecoveredSharesMsg, nohash_hasher::BuildNoHashHasher<Replica>>,
+        HashMap<Replica, std::sync::Arc<MulticastRecoveredSharesMsg>, nohash_hasher::BuildNoHashHasher<Replica>>,
     pub recovered_shares_multicast_sent: bool,
     pub batch_reconstruction_complete: bool,
     pub post_complaint_complete: bool,
+    pub audit_in_progress: bool,
+    pub post_complaint_version: u64,
     pub blame_log: Vec<BlameEvidence>,
 
     /// Coins already batch-recovered.
     pub recovered_coins: HashSet<usize, nohash_hasher::BuildNoHashHasher<usize>>,
     /// Coins already exposed in our post-ACS multicast snapshot.
     pub multicast_disclosed_coins: HashSet<usize, nohash_hasher::BuildNoHashHasher<usize>>,
-    /// Coins whose beacon output has already been emitted upstream.
+    /// Coins whose beacon output has already been handed to the upstream sender.
     pub emitted_beacon_coins: HashSet<usize, nohash_hasher::BuildNoHashHasher<usize>>,
     /// Beacon outputs computed by batch recovery, held until the
     /// post-complaint audit is allowed to release them. Each coin
@@ -183,10 +185,14 @@ pub struct CTRBCState {
     // ---- First-match leader election ----
     /// The first accepted leader from the rejection-sampling scan
     /// across all `(coin, sub_output)` pairs in batch order.
-    /// Set once by `self_coin_check_transmit` when the first value
-    /// passes `CoinMapper::try_leader`; subsequent coins are still
-    /// emitted to the syncer but do not overwrite this.
+    /// Set only while advancing the canonical output prefix. This final
+    /// application result survives clearing transient share material.
     pub first_match_leader: Option<FirstMatchLeader>,
+    /// Canonical output prefix; later ready coins stay buffered without
+    /// blocking network processing or imposing a synchrony bound.
+    pub next_output_coin: usize,
+    /// True after a match is found, or every candidate has been rejected.
+    pub first_match_complete: bool,
 
     // ---- Round bootstrap flags ----
     /// Pure-PPT mode dealer-launch idempotency flag.
@@ -233,6 +239,8 @@ impl CTRBCState {
             recovered_shares_multicast_sent: false,
             batch_reconstruction_complete: false,
             post_complaint_complete: false,
+            audit_in_progress: false,
+            post_complaint_version: 0,
             blame_log: Vec::new(),
 
             recovered_coins: HashSet::default(),
@@ -241,6 +249,8 @@ impl CTRBCState {
             pending_beacon_outputs: HashMap::default(),
 
             first_match_leader: None,
+            next_output_coin: 0,
+            first_match_complete: false,
 
             ppt_round_started: false,
             ppt_round_finished: false,
@@ -606,7 +616,10 @@ impl CTRBCState {
             }
         };
 
-        // Mark and clean up this coin's transient recovery state.
+        if outputs.is_empty() {
+            return None;
+        }
+        // Mark computational recovery; upstream emission is tracked separately.
         self.recon_secrets.insert(coin_number);
         self.secret_shares.remove(&coin_number);
         self.reconstructed_secrets.remove(&coin_number);
@@ -655,7 +668,8 @@ impl CTRBCState {
         self.emitted_beacon_coins.clear();
         self.pending_beacon_outputs.clear();
 
-        self.first_match_leader = None;
+        // Final application result and output-prefix bookkeeping survive
+        // release; late messages must not erase or recreate the result.
 
         self.ppt_round_started = false;
         self.ppt_round_finished = false;
