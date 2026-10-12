@@ -218,6 +218,86 @@ pub fn inv_u256(profile: &Gf2Profile, a: (u128, u128)) -> (u128, u128) {
     (new_lo, new_hi)
 }
 
+/// Multiply a full `GF(2^level_w)` element by a **base-field** scalar
+/// `b_small ∈ GF(2^w_p)`, bypassing the Karatsuba recursion.
+///
+/// Why this is a strictly cheaper, equal-valued path
+/// -------------------------------------------------
+///
+/// `L = GF(2^level_w)` is a vector space over `K = GF(2^w_p)` of
+/// dimension `e = level_w / w_p`. The quadratic-tower encoding lays an
+/// element out as exactly `e` consecutive `w_p`-bit chunks, and those
+/// chunks ARE the coordinates with respect to a `K`-basis of `L`
+/// (recursively, the products of the per-level `y` generators). For a
+/// scalar `b ∈ K`, `K`-linearity gives
+///
+/// ```text
+///     a · b  =  (Σ_k a_k · B_k) · b  =  Σ_k (a_k · b) · B_k
+/// ```
+///
+/// so the product is obtained by scaling each coordinate
+/// independently — the cross terms that general multiplication has to
+/// fold back through `y² ≡ y + α` never arise, because `b` has no
+/// component outside `K`.
+///
+/// Cost: `e` base-field multiplies instead of the `e^log2(3)`
+/// (≈ `e^1.585`) that Karatsuba needs, e.g. 8 vs 27 at `(32, 256)` and
+/// 32 vs 243 at `(8, 256)`.
+///
+/// # Precondition
+///
+/// `b_small` MUST lie in the low `w_p` bits. This is a correctness
+/// precondition, not a hint: if `b_small` has a component outside the
+/// base field the coordinate-wise formula silently computes the wrong
+/// product. Callers must have established the invariant by
+/// construction or by an explicit membership check — never by
+/// assumption about unvalidated input. The control flow here depends
+/// only on the public widths `w_p` and `level_w`, so routing a value
+/// through this path leaks nothing about it that the general path
+/// would not.
+pub fn mul_by_small_u128(profile: &Gf2Profile, level_w: usize, a: u128, b_small: u128) -> u128 {
+    debug_assert!(level_w <= 128);
+    debug_assert_eq!(
+        b_small & !mask_low(profile.w_p),
+        0,
+        "mul_by_small: scalar must lie in the base field GF(2^w_p)"
+    );
+    let w_p = profile.w_p;
+    let m_p = profile::base_irreducible(w_p).expect("profile invariant: registered base");
+    if level_w == w_p {
+        return poly::gf_mul(a, b_small, w_p, m_p);
+    }
+    let chunk_mask = mask_low(w_p);
+    let chunks = level_w / w_p;
+    let mut out: u128 = 0;
+    for k in 0..chunks {
+        let shift = k * w_p;
+        let coord = (a >> shift) & chunk_mask;
+        // No `coord == 0` shortcut: skipping would make the trip count
+        // depend on the operand's bit pattern for no real saving.
+        out |= poly::gf_mul(coord, b_small, w_p, m_p) << shift;
+    }
+    out
+}
+
+/// `mul_by_small_u128` for the `w_q == 256` envelope. The 256-bit flat
+/// encoding is `256 / w_p` chunks of `w_p` bits, so scaling each
+/// `u128` half independently scales every coordinate exactly once.
+///
+/// Same base-field precondition on `b_small` as `mul_by_small_u128`.
+pub fn mul_by_small_u256(profile: &Gf2Profile, a: (u128, u128), b_small: u128) -> (u128, u128) {
+    debug_assert_eq!(profile.w_q, 256);
+    debug_assert_eq!(
+        128 % profile.w_p,
+        0,
+        "w_p must divide 128 for the 256-bit envelope to split evenly"
+    );
+    (
+        mul_by_small_u128(profile, 128, a.0, b_small),
+        mul_by_small_u128(profile, 128, a.1, b_small),
+    )
+}
+
 /// Absolute trace `Tr_{GF(2^level_w)/F_2}(a) = a + a² + a⁴ + … +
 /// a^(2^(level_w − 1))`, computed **from the definition** using this
 /// module's own tower squaring.
@@ -709,6 +789,106 @@ mod tests {
                     cur, a,
                     "a^(2^{}) ≠ a at ({},{}) a={:#x} — level is not GF(2^{})",
                     w_q, w_p, w_q, a, w_q
+                );
+            }
+        }
+    }
+
+    /// The `mul_by_small` fast path must agree with the general
+    /// (fixed) tower multiplication **exactly**, for every supported
+    /// profile, on zero, one, the base-field generator, and random
+    /// values. If these ever diverge, the optimisation is changing
+    /// results rather than just saving work.
+    #[test]
+    fn mul_by_small_matches_general_mul_across_all_profiles() {
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x5ca1ab1e);
+        for (w_p, w_q) in all_supported_profiles() {
+            let p = Gf2Profile::new(w_p, w_q).unwrap();
+            let small_mask = mask_low(w_p);
+
+            // Deterministic edge cases plus random draws.
+            let mut small_vals: Vec<u128> = vec![0, 1, small_mask];
+            if w_p >= 2 {
+                small_vals.push(2);
+            }
+            for _ in 0..8 {
+                small_vals.push(rng.gen::<u128>() & small_mask);
+            }
+
+            for &b in &small_vals {
+                if w_q <= 128 {
+                    let mut a_vals: Vec<u128> = vec![0, 1, mask_low(w_q)];
+                    for _ in 0..8 {
+                        a_vals.push(rand_in_w(&mut rng, w_q));
+                    }
+                    for &a in &a_vals {
+                        assert_eq!(
+                            mul_by_small_u128(&p, w_q, a, b),
+                            mul_u128(&p, w_q, a, b),
+                            "mul_by_small ≠ mul at ({},{}) a={:#x} b={:#x}",
+                            w_p,
+                            w_q,
+                            a,
+                            b
+                        );
+                    }
+                } else {
+                    let mut a_vals: Vec<(u128, u128)> =
+                        vec![(0, 0), (1, 0), (u128::MAX, u128::MAX)];
+                    for _ in 0..6 {
+                        a_vals.push(rand_in_w_q_256(&mut rng));
+                    }
+                    let b_elem = (b, 0u128);
+                    for &a in &a_vals {
+                        assert_eq!(
+                            mul_by_small_u256(&p, a, b),
+                            mul_u256(&p, a, b_elem),
+                            "mul_by_small ≠ mul at ({},{}) a={:?} b={:#x}",
+                            w_p,
+                            w_q,
+                            a,
+                            b
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// `mul_by_small` must still obey the algebra it claims: it is
+    /// `K`-linear in the large operand and multiplicative in the
+    /// scalar.
+    #[test]
+    fn mul_by_small_is_linear_and_multiplicative() {
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xb1_11ea4);
+        for &(w_p, w_q) in &[(8usize, 64usize), (16, 64), (32, 128), (64, 128)] {
+            let p = Gf2Profile::new(w_p, w_q).unwrap();
+            let m_p = profile::base_irreducible(w_p).unwrap();
+            let small_mask = mask_low(w_p);
+            for _ in 0..16 {
+                let a1 = rand_in_w(&mut rng, w_q);
+                let a2 = rand_in_w(&mut rng, w_q);
+                let b1 = rng.gen::<u128>() & small_mask;
+                let b2 = rng.gen::<u128>() & small_mask;
+
+                // Linear in the large operand: (a1 + a2)·b = a1·b + a2·b
+                assert_eq!(
+                    mul_by_small_u128(&p, w_q, a1 ^ a2, b1),
+                    mul_by_small_u128(&p, w_q, a1, b1) ^ mul_by_small_u128(&p, w_q, a2, b1),
+                    "not additive at ({},{})",
+                    w_p,
+                    w_q
+                );
+                // Multiplicative in the scalar: a·(b1·b2) = (a·b1)·b2
+                let b_prod = poly::gf_mul(b1, b2, w_p, m_p);
+                assert_eq!(
+                    mul_by_small_u128(&p, w_q, a1, b_prod),
+                    mul_by_small_u128(&p, w_q, mul_by_small_u128(&p, w_q, a1, b1), b2),
+                    "scalar action not associative at ({},{})",
+                    w_p,
+                    w_q
                 );
             }
         }
