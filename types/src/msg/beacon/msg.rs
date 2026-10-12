@@ -182,6 +182,12 @@ impl BeaconMsg {
     pub fn verify_proofs(&self,hf:&HashState) -> bool{
         if self.wss.is_some(){
             let wssmsg = self.wss.as_ref().unwrap();
+            if wssmsg.secrets.is_empty()
+                || wssmsg.mps.len() != wssmsg.secrets.len()
+                || wssmsg.nonces.len() != wssmsg.secrets.len()
+            {
+                return false;
+            }
             let mps = Proof::validate_batch(&wssmsg.mps, hf);
             if !mps{
                 log::error!("Merkle proof verification failed for wssmsg sent by {}",wssmsg.origin);
@@ -558,7 +564,7 @@ impl BatchWSSMsg {
     }
 }
 
-#[derive(Debug,Serialize,Deserialize,Clone)]
+#[derive(Debug,Serialize,Deserialize,Clone,PartialEq,Eq)]
 pub struct BatchWSSReconMsg{
     pub origin: Replica,
     pub secrets: Vec<Val>,
@@ -600,7 +606,7 @@ impl BatchWSSReconMsg {
     }
 }
 
-#[derive(Debug,Serialize,Deserialize,Clone)]
+#[derive(Debug,Serialize,Deserialize,Clone,PartialEq,Eq)]
 pub struct RecoveredCoinSharesMsg {
     pub coin_num: usize,
     pub packet: BatchWSSReconMsg,
@@ -614,7 +620,7 @@ pub struct BatchBeaconConstructMsg {
 }
 
 
-#[derive(Debug,Serialize,Deserialize,Clone)]
+#[derive(Debug,Serialize,Deserialize,Clone,PartialEq,Eq)]
 pub struct MulticastRecoveredSharesMsg {
     pub origin: Replica,
     pub round: Round,

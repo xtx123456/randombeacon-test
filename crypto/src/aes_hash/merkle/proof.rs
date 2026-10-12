@@ -31,18 +31,39 @@ impl Proof {
 
     /// Return proof target leaf
     pub fn item(&self) -> Hash {
-        self.lemma.first().unwrap().clone()
+        // Malformed network proofs are rejected by validate/validate_batch;
+        // preliminary leaf comparisons must not panic before that rejection.
+        self.lemma.first().copied().unwrap_or([0u8; 32])
     }
 
     /// Return tree root
     pub fn root(&self) -> Hash {
-        self.lemma.last().unwrap().clone()
+        self.lemma.last().copied().unwrap_or([0u8; 32])
+    }
+
+    /// Validate untrusted layout before any indexing or leaf extraction.
+    pub fn has_valid_shape(&self) -> bool {
+        self.lemma.len() >= 2
+            && self.path.len() == self.lemma.len() - 2
+            && self.path.len() < usize::BITS as usize
+    }
+
+    /// Bind a proof to the expected leaf and the actual tree depth.
+    pub fn matches_leaf(&self, index: usize, leaf_count: usize) -> bool {
+        if !self.has_valid_shape() || leaf_count == 0 || index >= leaf_count {
+            return false;
+        }
+        let depth = (usize::BITS - (leaf_count - 1).leading_zeros()) as usize;
+        self.path.len() == depth
+            && self.path.iter().enumerate().all(|(bit, left)| {
+                *left == ((index >> bit) & 1 == 0)
+            })
     }
 
     /// Verifies MT inclusion proof
     pub fn validate(&self,hc: &HashState) -> bool {
         let size = self.lemma.len();
-        if size < 2 {
+        if !self.has_valid_shape() {
             return false;
         }
 
@@ -64,12 +85,20 @@ impl Proof {
     }
 
     pub fn validate_batch(pfs:&Vec<Proof>, hc: &HashState) -> bool{
+        if pfs.is_empty() || pfs.iter().any(|p| !p.has_valid_shape()) {
+            return false;
+        }
+        let size_each = pfs[0].lemma.len();
+        // Batch hashing requires equal depth. Mixed trees are still checked
+        // individually, never indexed using another proof's depth.
+        if pfs.iter().any(|p| p.lemma.len() != size_each) {
+            return pfs.iter().all(|p| p.validate(hc));
+        }
         let mut init_hash_vec:Vec<Hash> = Vec::new();
         for p in pfs{
             init_hash_vec.push(p.item());
         }
         let size = init_hash_vec.len();
-        let size_each = pfs[0].lemma.len();
         if size_each < 2 {
             return false;
         }
