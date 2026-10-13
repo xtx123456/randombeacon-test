@@ -1207,6 +1207,8 @@ mod tests {
             _ => panic!("expected SendMessageForward"),
         };
         let mut q = make_state(99, n, t, 0, p.clone());
+        let (key_root, cipher_root) = nodes[1].commitment_roots().expect("node 1 delivered");
+        q.bind_roots(key_root, cipher_root);
         let result = q.handle_message_forward(1, fwd_payload);
         let delivered = result
             .iter()
@@ -1392,6 +1394,8 @@ mod tests {
         // Tamper: truncate cipher forward fragments below n-2t.
         payload.cipher_forward.fragments.truncate(1);
         let mut q = make_state(99, n, t, 0, p.clone());
+        let (key_root, cipher_root) = nodes[1].commitment_roots().expect("node 1 delivered");
+        q.bind_roots(key_root, cipher_root);
         let result = q.handle_message_forward(1, payload);
         let rejected = result.iter().any(|a| {
             matches!(
@@ -1413,7 +1417,12 @@ mod tests {
         let p = small_prime();
         let node = make_state(1, 4, 1, 0, p);
         let res = node.prepare_message_forward_for(2);
-        assert!(matches!(res, Err(SecMsgDstError::NotYetDelivered)));
+        assert!(matches!(
+            res,
+            Err(SecMsgDstError::SecKeyUnderlying(SecKeyDstError::Underlying(
+                RelMsgDstError::NotYetDelivered
+            )))
+        ));
     }
 
     #[test]

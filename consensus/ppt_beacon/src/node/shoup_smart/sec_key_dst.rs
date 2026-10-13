@@ -1012,8 +1012,9 @@ mod tests {
             _ => panic!("expected SendForward"),
         };
         let mut q = make_state(99, n, t, 0, p.clone());
+        let root = nodes[1].commitment_root().expect("node 1 delivered");
+        q.bind_root(root);
         let result = q.handle_forward(1, fwd);
-        // Find the ForwardDeliveredShare action.
         let delivered_share = result.iter().find_map(|a| match a {
             SecKeyDstAction::ForwardDeliveredShare { source, share } => Some((*source, share.clone())),
             _ => None,
