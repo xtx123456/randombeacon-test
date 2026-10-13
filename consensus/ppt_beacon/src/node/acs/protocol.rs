@@ -94,6 +94,7 @@ impl Context {
     /// follow-up ABA / RBC actions.
     #[async_recursion]
     pub async fn acs_note_local_change(&mut self, round: Round) {
+        if round>self.max_rounds||!self.acs_audit_ready(round){return;}
         // Apply the global ban list to the per-round ACS state.
         let banned: HashSet<Replica> = self.permanently_banned_dealers();
         {

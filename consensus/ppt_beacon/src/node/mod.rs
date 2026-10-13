@@ -24,6 +24,10 @@ pub mod options;
 mod wire;
 mod public_rbc;
 mod awss_recovery;
+mod oec;
+mod share_pipeline;
+mod full_audit;
+mod reserve_transport;
 pub mod shoup_smart;
 
 mod avss_secmsg;

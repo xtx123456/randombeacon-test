@@ -486,6 +486,7 @@ impl Context {
     }
 
     pub(crate) async fn choose_fn(self: &mut Context, wrapper_msg: WrapperMsg) {
+        if self.defer_acs_for_audit(&wrapper_msg){return;}
         // Destructure WrapperMsg by ownership rather than cloning
         // `protmsg` just to match on it. The old `wrapper_msg.clone()
         // .protmsg` pattern cloned the entire inbound payload --
@@ -577,30 +578,12 @@ impl Context {
                 );
             }
 
-            CoinMsg::BatchBeaconConstruct(msg, share_sender, round) => {
-                if share_sender != wire_sender {
-                    return;
-                }
-                log::debug!(
-                    "[PPT][BATCH-BEACON-CONSTRUCT] received batched BeaconConstruct from node {} with {} coin-packets in round {}",
-                    share_sender,
-                    msg.packets.len(),
-                    round
-                );
-                self.process_batch_secret_shares(msg, share_sender, round).await;
+            CoinMsg::BatchBeaconConstruct(_, _, round) => {
+                log::debug!("[PPT][COMPARISON-DROP] legacy dealer-first reconstruction packet round={}",round);
             }
 
-            CoinMsg::MulticastRecoveredShares(msg, sender, round) => {
-                if sender != wire_sender {
-                    return;
-                }
-                log::info!(
-                    "[PPT][MULTICAST-DISPATCH] node {} dispatching recovered-share multicast from {} for round {}",
-                    self.myid,
-                    sender,
-                    round
-                );
-                self.process_multicast_recovered_shares(msg, sender, round).await;
+            CoinMsg::MulticastRecoveredShares(_, _, round) => {
+                log::debug!("[PPT][COMPARISON-DROP] legacy proof-only audit packet round={}",round);
             }
             CoinMsg::GatherEcho(_, sender, round) => {
                 log::debug!(
@@ -1053,7 +1036,7 @@ impl Context {
         if let Some(decided) = self.round_state.get(&round).and_then(|state| state.acs_decided_set.clone()) {
             self.stash_coin_material(round, &decided);
             // A late honest payload is still an ORIGINAL authenticated share.
-            self.reconstruct_beacon(round, 0).await;
+            self.try_send_local_transform(round).await;
         }
         self.drive_awss_recovery(round, dealer).await;
 
@@ -1151,7 +1134,8 @@ impl Context {
             round
         );
 
-        self.reconstruct_beacon(round, 0).await;
+        self.try_send_local_transform(round).await;
+        self.try_decode_transformed(round).await;
     }
 
     /// Called by the ACS driver once an `ACSInstanceState` has
@@ -1302,6 +1286,9 @@ impl Context {
         self.start_selected_awss_recovery(round, decided_vec.as_slice()).await;
         self.stash_coin_material(round, decided_vec.as_slice());
         self.cleanup_coin_state(round);
+        if round>0 {
+            for dealer in 0..self.num_nodes { self.release_reserve_if_safe(round-1,dealer); }
+        }
 
         self.start_reconstruction_after_acs(round, decided_vec.as_slice())
             .await;

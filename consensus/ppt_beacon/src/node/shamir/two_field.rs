@@ -411,6 +411,13 @@ pub struct SuperInvExtractor {
 }
 
 impl SuperInvExtractor {
+    /// Share-level matrix application for the legacy prime-field comparison.
+    pub fn transform_shares(&self, inputs: &[BigUint]) -> Result<Vec<BigUint>, String> {
+        if inputs.len()!=self.num_inputs || inputs.iter().any(|v|v>=&self.prime) {
+            return Err("matrix input length/domain mismatch".into());
+        }
+        Ok(self.extract(inputs))
+    }
     /// Build the extractor for input evaluation points `alpha_points`
     /// (e.g. the sorted decided dealers' ids + 1) and `num_outputs`
     /// extracted values per column. The output points are chosen

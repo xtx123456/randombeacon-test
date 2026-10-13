@@ -401,6 +401,10 @@ impl SecMsgDstState {
     pub fn commitment_roots(&self) -> Option<(Hash, Hash)> {
         Some((self.sec_key.commitment_root()?, self.cipher.commitment_root()?))
     }
+    pub fn audit_material(&self) -> (Option<Vec<u8>>, Vec<EchoPayload>, Vec<EchoPayload>) {
+        (self.delivered_key.as_ref().and_then(|key| serialize_share(&self.prime, key)),
+         self.sec_key.audit_row(), self.cipher.audit_row())
+    }
     pub fn replay_for_recipient(&self, recipient: Replica) -> Vec<SecMsgDstAction> {
         let mut out = Vec::new();
         if let Some(super::sec_key_dst::SecKeyDstAction::SendEcho { recipient_idx, echo }) = self.sec_key.replay_echo_for(recipient) {

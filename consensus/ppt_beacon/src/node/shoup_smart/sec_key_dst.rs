@@ -399,6 +399,7 @@ impl SecKeyDstState {
 
     pub fn bind_root(&mut self, root: Hash) -> bool { self.rmd.bind_root(root) }
     pub fn commitment_root(&self) -> Option<Hash> { self.rmd.commitment_root() }
+    pub fn audit_row(&self) -> Vec<super::rel_msg_dst::EchoPayload> { self.rmd.audit_row() }
     pub fn replay_echo_for(&self, recipient: Replica) -> Option<SecKeyDstAction> {
         match self.rmd.replay_echo_for(recipient)? {
             RelMsgDstAction::SendEcho { recipient_idx, echo } => Some(SecKeyDstAction::SendEcho { recipient_idx, echo }),

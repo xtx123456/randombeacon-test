@@ -136,7 +136,7 @@ impl Context {
         // Ordinary SEND is only an RBC input. Cache public content after delivery.
         let round = msg.round; let dealer = msg.origin;
         let payload = bincode::serialize(&crate::node::wire::PublicBundle {
-            public: msg, secmsg_roots: None }).expect("public bundle encoding");
+            public: msg, secmsg_roots: None, reserve_roots: None }).expect("public bundle encoding");
         self.process_scoped_rbc(crate::node::wire::RbcScope::PublicCommit,
             round, dealer, crate::node::wire::RbcMessage::Send(payload), wire_sender).await;
     }
@@ -631,15 +631,11 @@ impl Context {
         // Idempotent: first-seen-wins. SecMsgDst delivery is
         // already idempotent at the state-machine level (latches
         // on first XOR), but defensive guard here costs nothing.
-        if self
-            .avss_secmsg_delivered_bytes
-            .contains_key(&(round, dealer))
-        {
-            return;
-        }
-        self.avss_secmsg_delivered_bytes
-            .insert((round, dealer), plaintext);
-        self.try_finalize_avss_secmsg(round, dealer).await;
+        if self.avss_beacon_bytes.contains_key(&(round,dealer)){return;}
+        self.avss_beacon_bytes.insert((round,dealer),plaintext);
+        self.join_secmsg_parts(round,dealer).await;
+        self.drive_awss_recovery(round,dealer).await;
+        self.try_send_local_transform(round).await;
     }
 
     /// Once both the public-commit broadcast and the SecMsgDst

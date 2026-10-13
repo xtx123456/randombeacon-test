@@ -841,6 +841,14 @@ impl RelMsgDstState {
                 frag_path: frag_path.clone(), fragment: fragment.clone(), frag_idx: self.myid } })
     }
 
+    /// Original provider row, including both proof levels. Release only after
+    /// the beacon batch has opened; it contains fragments of every message.
+    pub fn audit_row(&self) -> Vec<EchoPayload> {
+        (0..self.n).filter_map(|recipient| match self.replay_echo_for(recipient) {
+            Some(RelMsgDstAction::SendEcho { echo, .. }) => Some(echo), _ => None,
+        }).collect()
+    }
+
     /// Ok(None) is a provably invalid ORIGINAL codeword, after verifying all
     /// proofs/positions under the agreed root. Err identifies bad forwarding
     /// evidence and must never trigger disclosure or dealer exclusion.

@@ -528,7 +528,7 @@ impl Context {
         match self.transport {
             crate::node::context::AvssTransport::Lite => {
                 self.start_public_rbc(crate::node::wire::PublicBundle {
-                    public: public_commit.clone(), secmsg_roots: None }).await;
+                    public: public_commit.clone(), secmsg_roots: None, reserve_roots: None }).await;
                 log::info!(
                     "[PPT][AVSS-LITE] node {} dispatching {} per-recipient \
                      AVSSPrivatePayload unicasts for round {} (transport=lite)",
@@ -580,12 +580,21 @@ impl Context {
                     self.myid,
                     new_round
                 );
+                // Audit opens the beacon key vector. A separate SecMsg instance
+                // keeps next-round coin reserves sealed under independent keys.
+                let mut beacon_payloads=Vec::with_capacity(n);
+                let mut reserve_payloads=Vec::with_capacity(n);
+                for bytes in recipient_payload_bytes {
+                    let payload=types::beacon::AvssRecipientPayload::deserialize_bytes(&bytes).expect("dealer's canonical payload");
+                    beacon_payloads.push(crate::node::share_pipeline::slice_payload(&payload,0,batch_size).expect("beacon slice").serialize_bytes());
+                    reserve_payloads.push(crate::node::share_pipeline::slice_payload(&payload,batch_size,crate::node::context::PPT_COIN_RESERVE).expect("reserve slice").serialize_bytes());
+                }
                 let actions = {
                     let secmsg_state =
                         self.get_or_init_avss_secmsg(new_round, self.myid);
                     let mut rng = rand::thread_rng();
                     secmsg_state
-                        .set_input_as_sender(recipient_payload_bytes, &mut rng)
+                        .set_input_as_sender(beacon_payloads, &mut rng)
                         .expect(
                             "[PPT][SECMSG-AVSS] dealer set_input_as_sender failed -- \
                              this should be impossible on the live path \
@@ -594,9 +603,15 @@ impl Context {
                 };
                 let roots = self.avss_secmsg_state.get(&(new_round, self.myid))
                     .and_then(|state| state.commitment_roots()).expect("sender committed both SecMsg vectors");
+                let reserve_actions={
+                    let state=self.get_or_init_reserve(new_round,self.myid);
+                    state.set_input_as_sender(reserve_payloads,&mut rand::thread_rng()).expect("reserve SecMsg input")
+                };
+                let reserve_roots=self.reserve_state.get(&(new_round,self.myid)).and_then(|s|s.commitment_roots()).expect("reserve commitments");
                 self.start_public_rbc(crate::node::wire::PublicBundle {
-                    public: public_commit, secmsg_roots: Some(roots) }).await;
+                    public: public_commit, secmsg_roots: Some(roots), reserve_roots: Some(reserve_roots) }).await;
                 self.dispatch_avss_secmsg_actions(new_round, self.myid, actions).await;
+                self.dispatch_reserve_actions(new_round,self.myid,reserve_actions).await;
             }
         }
 

@@ -918,6 +918,15 @@ pub struct Gf2SuperInvExtractor {
 }
 
 impl Gf2SuperInvExtractor {
+    /// Apply the agreed matrix to LOCAL dealer shares, before reconstruction.
+    /// Exact input ordering/length and base-field membership are mandatory.
+    pub fn transform_shares(&self, inputs: &[Gf2Element]) -> Result<Vec<Gf2Element>, String> {
+        if inputs.len() != self.num_inputs || inputs.iter().any(|v|
+            Gf2Element::from_bytes(self.small_profile, *v.as_bytes()).is_err()) {
+            return Err("matrix input must contain exactly the selected dealers' small-field shares".into());
+        }
+        Ok(self.extract(inputs))
+    }
     /// Build the extractor. `alpha_points` are 1-based integer node
     /// ids (sorted decided dealers' ids + 1, matching the BigUint
     /// path). `num_outputs` is the number of extracted beacon values

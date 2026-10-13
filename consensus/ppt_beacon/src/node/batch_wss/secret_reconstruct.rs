@@ -1,3 +1,7 @@
+//! The live PPT path uses share_pipeline (local matrix -> polynomial OEC) and
+//! full_audit (full polynomial/encoding/tree reconstruction). Dealer-first
+//! recovery and per-provider-proof audit helpers below are retained solely as
+//! legacy comparison code; the network dispatcher rejects their wire messages.
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -584,14 +588,16 @@ impl Context {
         // Selected instances must remain available for slow honest recipients.
         // All-participant ACKs are required; n-f ACKs would still allow an honest
         // recipient to be left behind. No timer substitutes for delivery.
-        let selected: HashSet<Replica> = self.awss_recovery.iter()
+        let mut selected: HashSet<Replica> = self.awss_recovery.iter()
             .filter(|((r, _), state)| *r == round && state.selected && state.recovered_peers.len() < self.num_nodes)
             .map(|((_, dealer), _)| *dealer).collect();
+        selected.extend(self.reserve_state.keys().filter(|(r,_)|*r==round).map(|(_,d)|*d));
         let released: Vec<Replica> = self.awss_recovery.iter()
             .filter(|((r, _), state)| *r == round && state.selected && state.recovered_peers.len() == self.num_nodes)
             .map(|((_, dealer), _)| *dealer).collect();
         for dealer in released { self.release_awss_serving_if_safe(round, dealer); }
         self.avss_secmsg_pending.retain(|(r, _), _| *r != round);
+        self.avss_beacon_bytes.retain(|(r,d),_|*r!=round||selected.contains(d));
         self.avss_public_rbc.retain(|(r, d), _| *r != round || selected.contains(d));
         self.avss_public_bundles.retain(|(r, d), _| *r != round || selected.contains(d));
         let removed_state = {
@@ -624,7 +630,7 @@ impl Context {
     }
 
     #[async_recursion]
-    async fn flush_pending_beacon_outputs(&mut self, round: Round, reason: &'static str) {
+    pub(crate) async fn flush_pending_beacon_outputs(&mut self, round: Round, reason: &'static str) {
         loop {
             let next = {
                 let state = match self.round_state.get_mut(&round) {
@@ -1085,82 +1091,9 @@ impl Context {
     /// ACS three-property and PQ-safety are unchanged.
     #[async_recursion]
     pub(crate) async fn maybe_recover_ready_coins(&mut self, round: Round) {
-        // First, retry any reconstruction packets that were buffered
-        // because a decided dealer's commitment had not yet arrived.
-        self.drain_pending_recon_shares(round);
-        if self.round_state.get(&round).map(|s| s.batch_reconstruction_complete).unwrap_or(false) {
-            self.send_audit_multicast_snapshot(round).await;
-            self.maybe_start_post_audit(round).await;
-            return;
-        }
-
-        let threshold = self.num_faults + 1;
-        let ready_initial = {
-            let rbc_state = match self.round_state.get(&round) {
-                Some(rbc_state) => rbc_state,
-                None => return,
-            };
-            if rbc_state.batch_reconstruction_complete {
-                return;
-            }
-            ready_coins(rbc_state, self.batch_size, threshold)
-        };
-
-        if ready_initial.is_empty() {
-            return;
-        }
-
-        // Optimisation B coin-0 fast path: if coin-0 is ready and
-        // not yet emitted, recover and emit it FIRST (small,
-        // single-coin spawn_blocking call). This unblocks the
-        // round-r+1 AVSS dealer launch ~2 seconds earlier than
-        // the previous one-shot batch_recover did, which is the
-        // single biggest win for cross-round pipelining.
-        let coin0_pending = ready_initial.contains(&0)
-            && !self
-                .round_state
-                .get(&round)
-                .map(|s| s.emitted_beacon_coins.contains(&0))
-                .unwrap_or(true);
-
-        if coin0_pending {
-            log::info!(
-                "[PPT][COIN0-FAST] node {} round {} prioritising coin-0 recovery to unblock next-round AVSS pipeline",
-                self.myid,
-                round
-            );
-            // emit_audit_multicast = false: defer the audit
-            // multicast to the second pass so it carries the full
-            // batch of disclosures, not just coin-0. See doc above.
-            self.recover_and_emit_coin_set(round, vec![0], false).await;
-
-            // Re-snapshot ready set: coin-0 is now in recovered_coins,
-            // ready_coins() will skip it on its next call.
-            let remaining = {
-                let rbc_state = match self.round_state.get(&round) {
-                    Some(rbc_state) => rbc_state,
-                    None => return,
-                };
-                if rbc_state.batch_reconstruction_complete {
-                    return;
-                }
-                ready_coins(rbc_state, self.batch_size, threshold)
-            };
-
-            if remaining.is_empty() {
-                // Send only if B=1 is now a complete batch. For B>1
-                // keep waiting asynchronously; never disclose a prefix as final.
-                self.send_audit_multicast_snapshot(round).await;
-                return;
-            }
-
-            self.recover_and_emit_coin_set(round, remaining, true).await;
-        } else {
-            // Standard one-shot batch path (e.g. coin-0 already emitted
-            // or coin-0 is not in this batch's ready set yet).
-            self.recover_and_emit_coin_set(round, ready_initial, true)
-                .await;
-        }
+        self.try_send_local_transform(round).await;
+        self.try_decode_transformed(round).await;
+        self.try_start_full_audit(round).await;
     }
 
     /// Stand-alone audit-multicast send used by the coin-0 fast

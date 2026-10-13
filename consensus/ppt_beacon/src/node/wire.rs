@@ -22,10 +22,26 @@ pub(crate) struct PublicBundle {
     pub public: types::beacon::AvssPublicCommitMsg,
     /// Exact roots of the SecMsg key/cipher vectors. None for Lite comparisons.
     pub secmsg_roots: Option<(Hash, Hash)>,
+    /// Independent sealed-reserve keys: never disclosed by the batch audit.
+    pub reserve_roots: Option<(Hash, Hash)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) enum RmdPacket {
+    Dispersal(Vec<super::shoup_smart::rel_msg_dst::DispersalEntry>),
+    Echo(super::shoup_smart::rel_msg_dst::EchoPayload),
+    Vote(Hash),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum PptWire {
+    TransformedShares { round: Round, dealers: Vec<Replica>, values: Vec<types::beacon::Val> },
+    AuditDisclosure { round: Round, dealers: Vec<Replica>, entries: Vec<super::full_audit::DealerDisclosure> },
+    AuditCertificate { round: Round, dealers: Vec<Replica>, rows: Vec<(Replica, Vec<super::full_audit::DealerDisclosure>)> },
+    AuditRecovered { round: Round },
+    ReserveTransport { round: Round, dealer: Replica, channel: super::shoup_smart::sec_msg_dst::SecMsgChannel, packet: RmdPacket },
+    ReserveRequest { round: Round, dealer: Replica, recipient: Replica },
+    ReserveRecovered { round: Round, dealer: Replica },
     Rbc { scope: RbcScope, round: Round, proposer: Replica, message: RbcMessage },
     AwssRequest { round: Round, dealer: Replica, root: Hash, recipient: Replica },
     AwssRecovered { round: Round, dealer: Replica, root: Hash },

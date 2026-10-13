@@ -9,8 +9,8 @@ use crypto::gf2::{Gf2Element, Gf2Profile};
 use num_bigint::BigUint;
 use num_traits::{One, Zero};
 use types::{Replica, Round};
-use types::beacon::{AvssRecipientPayload, BatchWSSMsg, BeaconMsg, CoinMsg};
-use super::{Context, process::avss_local_packet_valid_pure};
+use types::beacon::{AvssRecipientPayload, CoinMsg};
+use super::Context;
 use super::shoup_smart::sec_msg_dst::{ForwardMessagePayload, SecMsgChannel, SecMsgDstAction};
 use super::wire::{PptWire, ForwardTag};
 
@@ -18,6 +18,7 @@ use super::wire::{PptWire, ForwardTag};
 pub(crate) struct RecoveredAwssShares {
     pub secrets: Vec<types::beacon::Val>,
     pub masks: Vec<types::beacon::Val>,
+    pub nonces: Vec<types::beacon::Val>,
     pub f_large: Option<Vec<types::beacon::Val>>,
     pub providers: Vec<Replica>,
     // The original assist payloads and key/cipher certificates are retained in
@@ -65,20 +66,11 @@ impl Context {
         let public = self.avss_secmsg_public.get(&(round, dealer))?;
         Some(crypto::hash::do_hash(&super::public_rbc::transcript(public).serialize_ctrbc()))
     }
-    pub(crate) fn awss_message(&self, round: Round, dealer: Replica, bytes: &[u8]) -> Option<BeaconMsg> {
-        let payload = AvssRecipientPayload::deserialize_bytes(bytes)?;
-        let public = self.avss_secmsg_public.get(&(round, dealer))?;
-        Some(BeaconMsg::new_two_field(dealer, round,
-            BatchWSSMsg::new(dealer, payload.secrets, payload.nonces, payload.mps),
-            public.root_vec.clone(), Vec::new(), public.degree_test_coeffs.clone(),
-            payload.mask_shares, payload.f_large_shares))
-    }
     fn awss_happy(&self, round: Round, dealer: Replica, source: Replica, bytes: &[u8]) -> bool {
-        let message = match self.awss_message(round, dealer, bytes) { Some(message) => message, None => return false };
-        let root = match self.awss_root(round, dealer) { Some(root) => root, None => return false };
-        avss_local_packet_valid_pure(&message, &root, dealer, round, &self.hash_context,
-            &self.secret_domain, &self.nonce_domain, self.num_faults, self.num_nodes,
-            self.batch_size, super::context::PPT_COIN_RESERVE, source, self.gf2_profile).is_ok()
+        let payload=match AvssRecipientPayload::deserialize_bytes(bytes){Some(p)=>p,None=>return false};
+        let public=match self.avss_secmsg_public.get(&(round,dealer)){Some(p)=>p,None=>return false};
+        super::share_pipeline::validate_original(public,&payload,0,self.batch_size,source,self.num_nodes,self.num_faults,
+            &self.secret_domain,&self.nonce_domain,self.gf2_profile,&self.hash_context)
     }
 
     /// Out-of-order subprotocol data is processed only after public RBC fixed
@@ -100,6 +92,7 @@ impl Context {
         for &dealer in dealers {
             self.awss_recovery.entry((round, dealer)).or_default().selected = true;
             self.drive_awss_recovery(round, dealer).await;
+            self.request_selected_reserve(round,dealer).await;
         }
     }
 
@@ -107,8 +100,7 @@ impl Context {
     pub(crate) async fn drive_awss_recovery(&mut self, round: Round, dealer: Replica) {
         if !self.awss_selected(round, dealer) { return; }
         let root = match self.awss_root(round, dealer) { Some(root) => root, None => return };
-        let have_original = self.round_state.get(&round)
-            .map(|state| state.avss_local_valid.contains(&dealer)).unwrap_or(false);
+        let have_original = self.original_beacon_payload(round,dealer).is_some();
         let have_recovered = self.awss_recovery.get(&(round, dealer)).and_then(|state| state.local_shares.as_ref()).is_some();
         let already_owned = self.awss_recovery.get(&(round, dealer)).unwrap().ack_sent;
         if have_original || have_recovered || already_owned {
@@ -291,10 +283,12 @@ impl Context {
             .map(|state| state.recovered_peers.len() == self.num_nodes).unwrap_or(false);
         if cleared && acknowledged {
             self.avss_secmsg_state.remove(&(round, dealer));
-            self.avss_secmsg_public.remove(&(round, dealer));
-            self.avss_secmsg_delivered_bytes.remove(&(round, dealer));
-            self.avss_public_bundles.remove(&(round, dealer));
-            self.avss_public_rbc.remove(&(round, dealer));
+            self.avss_beacon_bytes.remove(&(round,dealer));
+            if !self.reserve_state.contains_key(&(round,dealer)) {
+                self.avss_secmsg_public.remove(&(round,dealer));
+                self.avss_secmsg_delivered_bytes.remove(&(round,dealer));
+                self.avss_public_bundles.remove(&(round,dealer));self.avss_public_rbc.remove(&(round,dealer));
+            }
             // Preserve the selected/ack tombstone; release private evidence.
             if let Some(state) = self.awss_recovery.get_mut(&(round, dealer)) {
                 state.assists.clear(); state.certificates.clear(); state.local_shares = None;
@@ -370,12 +364,16 @@ impl Context {
         };
         let secret_weights = if self.gf2_profile.is_none() { prime_weights(&providers, self.myid, &self.secret_domain) } else { Vec::new() };
         let mask_weights = if self.gf2_profile.is_none() { prime_weights(&providers, self.myid, &self.nonce_domain) } else { Vec::new() };
-        let total = self.batch_size + super::context::PPT_COIN_RESERVE;
+        let total = self.batch_size;
         let mut secrets = Vec::with_capacity(total); let mut masks = Vec::with_capacity(total);
+        let nonce_weights=prime_weights(&providers,self.myid,&self.nonce_domain);
+        let mut nonces=Vec::with_capacity(total);
         let mut f_large = self.gf2_profile.is_none().then(|| Vec::with_capacity(total));
         for coin in 0..total {
             let secret_points: Vec<_> = chosen.iter().map(|(_, payload)| payload.secrets[coin]).collect();
             let mask_points: Vec<_> = chosen.iter().map(|(_, payload)| payload.mask_shares[coin]).collect();
+            let nonce_points:Vec<_>=chosen.iter().map(|(_,p)|p.nonces[coin]).collect();
+            nonces.push(prime_apply(&nonce_weights,&nonce_points,&self.nonce_domain));
             match self.gf2_profile {
                 Some(profile) => {
                     let secret = match gf2_apply(profile, binary_weights.as_ref().unwrap(), &secret_points) { Ok(value) => value, Err(_) => return };
@@ -419,21 +417,10 @@ impl Context {
             }
         }
         self.awss_recovery.get_mut(&(round, dealer)).unwrap().local_shares = Some(RecoveredAwssShares {
-            secrets, masks, f_large, providers: chosen.iter().map(|(provider, _)| *provider).collect() });
+            secrets, masks, nonces, f_large, providers: chosen.iter().map(|(provider, _)| *provider).collect() });
         log::info!("[PPT][AWSS-RECOVERED] node={} round={} dealer={} certified providers={:?}", self.myid, round, dealer,
             chosen.iter().map(|(provider, _)| *provider).collect::<Vec<_>>());
-        // Preserve PR10 reconstruction: import certified ORIGINAL points with
-        // their original indices/proofs. Never forge a path for a derived share.
-        for (provider, payload) in chosen {
-            let packets = (0..self.batch_size).map(|coin_num| types::beacon::RecoveredCoinSharesMsg {
-                coin_num, packet: types::beacon::BatchWSSReconMsg {
-                    origin: provider, origins: vec![dealer], secrets: vec![payload.secrets[coin_num]],
-                    nonces: vec![payload.nonces[coin_num]], mps: vec![payload.mps[coin_num].clone()],
-                    mask_shares: vec![payload.mask_shares[coin_num]],
-                    f_large_shares: payload.f_large_shares.as_ref().map(|values| vec![values[coin_num]]), empty: false } }).collect();
-            let packet = types::beacon::BatchBeaconConstructMsg { round, origin: provider, packets };
-            self.process_batch_secret_shares(packet, provider, round).await;
-        }
+        self.try_send_local_transform(round).await;
         self.drive_awss_recovery(round, dealer).await;
     }
 }

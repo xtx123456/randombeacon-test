@@ -27,6 +27,11 @@ impl Context {
     #[async_recursion]
     pub(crate) async fn process_ppt_wire(&mut self, message: PptWire, sender: Replica) {
         match message {
+            PptWire::TransformedShares{round,dealers,values}=>self.process_transformed_shares(round,dealers,values,sender).await,
+            PptWire::AuditDisclosure{round,dealers,entries}=>self.process_full_audit_disclosure(round,dealers,entries,sender).await,
+            PptWire::AuditCertificate{round,dealers,rows}=>self.process_audit_certificate(round,dealers,rows,sender).await,
+            PptWire::AuditRecovered{round}=>self.note_audit_ack(round,sender),
+            message @ PptWire::ReserveTransport{..}|message @ PptWire::ReserveRequest{..}|message @ PptWire::ReserveRecovered{..}=>self.process_reserve_wire(message,sender).await,
             PptWire::Rbc { scope, round, proposer, message } => {
                 self.process_scoped_rbc(scope, round, proposer, message, sender).await;
             }
@@ -125,10 +130,11 @@ impl Context {
             return;
         }
         if self.round_state.get(&round).map(|state| state.cleared).unwrap_or(false) { return; }
-        if self.transport == super::context::AvssTransport::SecMsg && bundle.secmsg_roots.is_none() {
+        if self.transport == super::context::AvssTransport::SecMsg && (bundle.secmsg_roots.is_none()||bundle.reserve_roots.is_none()) {
             log::warn!("[PPT][PUBLIC-RBC] SecMsg transcript lacks key/cipher commitments"); return;
         }
         let roots = bundle.secmsg_roots;
+        let reserve_roots=bundle.reserve_roots;
         let header = transcript(public);
         let root = crypto::hash::do_hash(&header.serialize_ctrbc());
         let domain = self.secret_domain.clone(); let n = self.num_nodes;
@@ -142,6 +148,11 @@ impl Context {
             if !self.get_or_init_avss_secmsg(round, dealer).bind_roots(key, cipher) { return; }
             let pending = self.avss_secmsg_pending.remove(&(round, dealer)).unwrap_or_default();
             for (message, sender) in pending { self.dispatch_self_avss_secmsg(message, sender).await; }
+        }
+        if let Some((key,cipher))=reserve_roots {
+            if !self.get_or_init_reserve(round,dealer).bind_roots(key,cipher){return;}
+            let pending=self.reserve_pending.remove(&(round,dealer)).unwrap_or_default();
+            for (message,sender) in pending{self.process_reserve_wire(message,sender).await;}
         }
         self.try_finalize_avss_secmsg(round, dealer).await;
         self.refresh_awss_prepared(round, dealer).await;

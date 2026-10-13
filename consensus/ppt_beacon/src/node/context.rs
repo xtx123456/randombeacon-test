@@ -212,6 +212,18 @@ pub struct Context {
     pub(crate) awss_recovery: HashMap<(Round, Replica), crate::node::awss_recovery::AwssRecoveryState>,
     pub(crate) avss_public_bundles: HashMap<(Round, Replica), crate::node::wire::PublicBundle>,
     pub avss_secmsg_delivered_bytes: HashMap<(Round, Replica), Vec<u8>>,
+    pub(crate) avss_beacon_bytes: HashMap<(Round, Replica), Vec<u8>>,
+    pub(crate) reserve_state: HashMap<(Round, Replica), crate::node::shoup_smart::sec_msg_dst::SecMsgDstState>,
+    pub(crate) reserve_bytes: HashMap<(Round, Replica), Vec<u8>>,
+    pub(crate) reserve_pending: HashMap<(Round, Replica), Vec<(crate::node::wire::PptWire, Replica)>>,
+    pub(crate) reserve_serving: HashMap<(Round, Replica), crate::node::reserve_transport::ReserveServing>,
+    pub(crate) share_pipeline: HashMap<Round, crate::node::share_pipeline::SharePipeline>,
+    pub(crate) share_tx: mpsc::UnboundedSender<crate::node::share_pipeline::ShareCompletion>,
+    pub(crate) share_rx: mpsc::UnboundedReceiver<crate::node::share_pipeline::ShareCompletion>,
+    pub(crate) full_audit: HashMap<Round, crate::node::full_audit::FullAuditState>,
+    pub(crate) full_audit_tx: mpsc::UnboundedSender<crate::node::full_audit::FullAuditCompletion>,
+    pub(crate) full_audit_rx: mpsc::UnboundedReceiver<crate::node::full_audit::FullAuditCompletion>,
+    pub(crate) audit_acs_pending: HashMap<Round, Vec<WrapperMsg>>,
 
     // ---- ACS unpredictable common coin (PPT problem-1 fix) ----
     //
@@ -512,6 +524,8 @@ impl Context {
             let (avss_validation_tx, avss_validation_rx) =
                 mpsc::unbounded_channel::<AvssValidationCompletion>();
             let (recon_tx, recon_rx) = mpsc::unbounded_channel::<ReconCompletion>();
+            let (share_tx, share_rx) = mpsc::unbounded_channel();
+            let (full_audit_tx, full_audit_rx) = mpsc::unbounded_channel();
 
             let mut c = Context {
                 net_send: consensus_net,
@@ -565,6 +579,12 @@ impl Context {
                 avss_secmsg_pending: HashMap::default(),
                 awss_recovery: HashMap::default(),
                 avss_secmsg_delivered_bytes: HashMap::default(),
+                avss_beacon_bytes: HashMap::default(),
+                reserve_state: HashMap::default(), reserve_bytes: HashMap::default(),
+                reserve_pending: HashMap::default(), reserve_serving: HashMap::default(),
+                share_pipeline: HashMap::default(), share_tx, share_rx,
+                full_audit: HashMap::default(), full_audit_tx, full_audit_rx,
+                audit_acs_pending: HashMap::default(),
 
                 coin_material: HashMap::default(),
                 coin_shares: HashMap::default(),
@@ -636,7 +656,7 @@ impl Context {
     }
 
     pub fn permanently_banned_dealers(&self) -> HashSet<Replica> {
-        HashSet::new()
+        self.banned_dealers.clone()
     }
 
     /// Locally AVSS-completed dealers, without local membership filtering.
@@ -646,6 +666,7 @@ impl Context {
                 .avss_completed_dealers
                 .iter()
                 .copied()
+                .filter(|dealer| !self.banned_dealers.contains(dealer))
                 .collect(),
             None => HashSet::new(),
         }
@@ -960,6 +981,12 @@ impl Context {
                     // single-threaded-serialised, with no need for
                     // Mutex-style locking on the hot path.
                     self.finalize_audit_completion(audit_completion).await;
+                }
+                Some(completion) = self.share_rx.recv() => {
+                    self.finalize_share_completion(completion).await;
+                }
+                Some(completion) = self.full_audit_rx.recv() => {
+                    self.finalize_full_audit(completion).await;
                 }
                 Some(avss_completion) = self.avss_validation_rx.recv() => {
                     // Phase D fire-and-forget for AVSS validation:
