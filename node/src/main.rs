@@ -118,6 +118,7 @@ async fn main() -> Result<()> {
             let options = ppt_beacon::node::options::PptOptions::parse(
                 m.value_of("ppt-channel").unwrap_or("benchmark"),
                 m.value_of("ppt-security").unwrap_or("benchmark"),
+                m.value_of("ppt-grind-budget").unwrap_or("matched"),
             )?;
             exit_tx = ppt_beacon::node::Context::spawn_with_options(
                 config, sleep, batch, frequency, transport, gf2_profile, options,

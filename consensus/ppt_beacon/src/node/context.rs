@@ -416,7 +416,7 @@ impl Context {
         transport: AvssTransport, gf2_profile: Option<Gf2Profile>,
         options: crate::node::options::PptOptions,
     ) -> anyhow::Result<oneshot::Sender<()>> {
-        options.validate(&config, gf2_profile, transport)?;
+        options.validate(&config, gf2_profile, transport, batch)?;
         log::info!("[PPT][ASSUMPTIONS] channel={:?} target128={} adaptive total corruption f={} n={}; randomness remains PR10; no full protocol security claim", options.channel, options.target128, config.num_faults, config.num_nodes);
         log::info!("[PPT][PATH] local-share matrix -> polynomial OEC (degree={}, matching points={}) -> complete batch commitment audit; PPTB SHA-256 Merkle",config.num_faults,2*config.num_faults+1);
         if options.channel == crate::node::options::PptChannel::Benchmark {
@@ -709,11 +709,18 @@ impl Context {
     /// OWN commitment (`root_vec`, the per-coin Merkle roots that bind
     /// every recipient's f-share, g-share and f_large via
     /// `avss_commit_leaf`), so the dealer must commit f and g BEFORE θ
-    /// is determined. A Byzantine dealer can therefore no longer pick
-    /// the mask `g` to cancel a high-degree `f` (it would need a hash
-    /// collision), making the two-field degree test sound with error
-    /// 1/|q|. Replaces the old θ = H(previous PUBLIC beacon), which
-    /// the dealer could predict and bypass.
+    /// is determined. Replaces the old θ = H(previous PUBLIC beacon),
+    /// which the dealer could predict and bypass.
+    ///
+    /// Deriving θ this way is Shoup-Smart 2024 §7.1's `Π_Dst3move`, so
+    /// the applicable bound is Theorem 7.1's `Q · 2^n · χ(A,B,Θ)^R` and
+    /// NOT the external-beacon bound `2^n · χ^R` of Theorem 5.1. The
+    /// obstacle for a Byzantine dealer is grinding (repeatedly
+    /// perturbing a committed leaf to resample θ), not finding a hash
+    /// collision, and `Q` counts those attempts — see
+    /// `options::degree_test_soundness_bits`, which is what decides
+    /// whether a given `(w_q, R, n, coins)` actually reaches its
+    /// claimed security level.
     ///
     /// θ is per-(round, dealer); every honest verifier recomputes the
     /// identical value from the same committed `root_vec`, so the
