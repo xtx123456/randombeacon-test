@@ -162,14 +162,19 @@ impl Context {
                         roots.insert(d, rv[batch_size..total].to_vec());
                     }
                 }
-                // This node's own (f_share, g_share, f_large, nonce,
-                // proof) for each sealed coin index — all four
-                // committed values are needed to recompute the
-                // combined `avss_commit_leaf` when revealing.
+                // GF2 omits the redundant f_large wire channel: the
+                // embedded small-field share has the same canonical bytes.
                 let wss = state.node_secrets.get(&d);
                 let masks = state.mask_shares.get(&d);
-                let f_larges = state.f_large_shares.get(&d);
-                if let (Some(wss), Some(masks), Some(f_larges)) = (wss, masks, f_larges) {
+                if let (Some(wss), Some(masks)) = (wss, masks) {
+                    let f_larges = if self.gf2_profile.is_some() {
+                        &wss.secrets
+                    } else {
+                        match state.f_large_shares.get(&d) {
+                            Some(shares) => shares,
+                            None => continue,
+                        }
+                    };
                     if wss.secrets.len() >= total
                         && wss.nonces.len() >= total
                         && wss.mps.len() >= total
@@ -193,22 +198,45 @@ impl Context {
             }
         }
 
+        // Late AVSS validation must preserve shares already installed
+        // from the independently delivered reserve transport.
+        let material = self.coin_material.entry(round).or_insert_with(|| CoinMaterial {
+            decided: decided.to_vec(),
+            roots: HashMap::new(),
+            my_shares: HashMap::new(),
+        });
+        if material.decided.as_slice() != decided {
+            log::error!(
+                "[PPT][COIN] refusing changed decided set for round {}",
+                round
+            );
+            return;
+        }
+        for (dealer, dealer_roots) in roots {
+            material.roots.entry(dealer).or_insert(dealer_roots);
+        }
+        let mut added_shares = false;
+        for (dealer, dealer_shares) in my_shares {
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                material.my_shares.entry(dealer)
+            {
+                entry.insert(dealer_shares);
+                added_shares = true;
+            }
+        }
         log::debug!(
             "[PPT][COIN] node {} stashed coin material for round {} ({} dealers with roots, {} with my-shares)",
             self.myid,
             round,
-            roots.len(),
-            my_shares.len()
+            material.roots.len(),
+            material.my_shares.len()
         );
 
-        self.coin_material.insert(
-            round,
-            CoinMaterial {
-                decided: decided.to_vec(),
-                roots,
-                my_shares,
-            },
-        );
+        if added_shares {
+            // A previous reveal may have contained only a subset of dealers.
+            // Retry the same sealed values when another dealer becomes available.
+            self.coin_reveal_sent.retain(|(r, _)| *r != round + 1);
+        }
 
         // Replay any coin reveals that arrived for acs_round = round+1
         // before this material was available.

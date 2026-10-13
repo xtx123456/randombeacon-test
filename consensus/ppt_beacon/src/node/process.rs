@@ -1042,6 +1042,7 @@ impl Context {
         self.refresh_awss_prepared(round, dealer).await;
         if let Some(decided) = self.round_state.get(&round).and_then(|state| state.acs_decided_set.clone()) {
             self.stash_coin_material(round, &decided);
+            self.acs_note_local_change(round + 1).await;
             // A late honest payload is still an ORIGINAL authenticated share.
             self.try_send_local_transform(round).await;
         }
