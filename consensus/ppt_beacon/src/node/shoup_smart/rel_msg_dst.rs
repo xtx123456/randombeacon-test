@@ -1360,7 +1360,11 @@ mod tests {
         // Q is a fresh node that never participated. We instantiate
         // a RelMsgDstState for Q only to call handle_forward; we
         // don't drive its distribution phase at all.
+        // Bind the trusted commitment root before accepting the forward;
+        // in production this comes from the delivered PublicBundle RBC.
         let mut q = make_state(99, n, t, 0);
+        let root = nodes[1].commitment_root().expect("node 1 delivered");
+        q.bind_root(root);
         let result = q.handle_forward(1, forward_payload);
         assert_eq!(result.len(), 1);
         match &result[0] {
@@ -1481,6 +1485,8 @@ mod tests {
         };
         fwd.fragments.truncate(1); // < n-2t = 2
         let mut q = make_state(99, n, t, 0);
+        let root = nodes[1].commitment_root().expect("node 1 delivered");
+        q.bind_root(root);
         let result = q.handle_forward(1, fwd);
         match &result[0] {
             RelMsgDstAction::ForwardRejected { reason, .. } => {

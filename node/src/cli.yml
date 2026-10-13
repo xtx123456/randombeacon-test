@@ -76,5 +76,9 @@ args:
         takes_value: true
     - ppt-security:
         long: ppt-security
-        help: "PPT only: benchmark (default) or target128 (require private channels, true GF2 extension and w_q>128+n). This checks configuration; PR10 randomness remains and full protocol security is not yet established."
+        help: "PPT only: benchmark (default) or target128 (require private channels, a true GF2 extension, and a degree-test budget reaching 128 bits under --ppt-grind-budget). This checks configuration; PR10 randomness remains and full protocol security is not yet established."
+        takes_value: true
+    - ppt-grind-budget:
+        long: ppt-grind-budget
+        help: "PPT only: how many random-oracle queries a grinding dealer is budgeted in Shoup-Smart 2024 Thm 7.1 (Q*2^n*chi^R). matched (default, Q=2^sigma), grover (Q=2^2sigma, post-quantum convention) or offline80 (Q=2^80, asserted offline budget)."
         takes_value: true
