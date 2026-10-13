@@ -34,6 +34,8 @@ mod tests {
         RbcSend { proposer: Replica, payload: Vec<u8> },
         RbcEcho { proposer: Replica, payload_hash: Hash },
         RbcReady { proposer: Replica, payload_hash: Hash },
+        RbcRequest { proposer: Replica, payload_hash: Hash },
+        RbcPayload { proposer: Replica, recipient: Replica, payload_hash: Hash, payload: Vec<u8> },
         AbaBval { aba_id: usize, aba_round: u64, value: bool },
         AbaAux { aba_id: usize, aba_round: u64, value: bool },
     }
@@ -103,6 +105,8 @@ mod tests {
                     RbcAction::SendReady { payload_hash } => {
                         Some((self.myid, Wire::RbcReady { proposer, payload_hash }))
                     }
+                    RbcAction::RequestPayload { payload_hash } => Some((self.myid, Wire::RbcRequest { proposer, payload_hash })),
+                    RbcAction::SendPayload { recipient, payload_hash, payload } => Some((self.myid, Wire::RbcPayload { proposer, recipient, payload_hash, payload })),
                     RbcAction::Delivered { .. } => None,
                 })
                 .collect()
@@ -344,6 +348,22 @@ mod tests {
                             let acts = r.handle_rbc_ready(proposer, sender, payload_hash);
                             next.extend(acts);
                         }
+                    }
+                    Wire::RbcRequest { proposer, payload_hash } => {
+                        for node in replicas.iter_mut() {
+                            let actions = node.acs.rbc[proposer].handle_request(sender, payload_hash);
+                            next.extend(node.translate_rbc(proposer, actions));
+                        }
+                    }
+                    Wire::RbcPayload { proposer, recipient, payload_hash, payload } => {
+                        let node = &mut replicas[recipient];
+                        let actions = node.acs.rbc[proposer].handle_payload(sender, payload_hash, payload);
+                        if let Some(bytes) = node.acs.rbc[proposer].delivered_payload() {
+                            node.acs.rbc_delivered_payload.insert(proposer, bytes.to_vec());
+                        }
+                        let delivered = actions.iter().any(|action| matches!(action, RbcAction::Delivered { .. }));
+                        next.extend(node.translate_rbc(proposer, actions));
+                        if delivered { next.extend(node.on_rbc_delivered(proposer)); }
                     }
                     Wire::AbaBval { aba_id, aba_round, value } => {
                         for r in replicas.iter_mut() {

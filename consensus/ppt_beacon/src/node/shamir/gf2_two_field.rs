@@ -120,7 +120,44 @@ pub struct Gf2TwoFieldSampled {
     pub g_poly: Vec<Gf2Element>,
 }
 
+/// Main-batch sampling: B small-field polynomials and ONE large-field mask.
+pub(crate) struct Gf2TwoFieldBatch {
+    pub secrets: Vec<Vec<Gf2Element>>,
+    pub f_polys: Vec<Vec<Gf2Element>>,
+    pub mask_shares: Vec<Gf2Element>,
+    pub g_poly: Vec<Gf2Element>,
+}
+
 impl Gf2TwoFieldDealer {
+    /// Sample a complete R=1 batch without generating B unused mask polynomials.
+    /// Small-field evaluations retain the existing depth-zero arithmetic path.
+    pub(crate) fn sample_batch(&self, batch_size: usize) -> Gf2TwoFieldBatch {
+        let mut rng = rand::thread_rng();
+        let mut secrets = vec![Vec::with_capacity(batch_size); self.share_amount];
+        let mut f_polys = Vec::with_capacity(batch_size);
+        for _ in 0..batch_size {
+            let polynomial: Vec<_> = (0..self.threshold)
+                .map(|_| random_small_field(self.profile, &mut rng)).collect();
+            let small: Vec<_> = polynomial.iter().map(|coefficient| {
+                Gf2Element::from_bytes(self.small_profile, *coefficient.as_bytes())
+                    .expect("sampled coefficient is in the base field")
+            }).collect();
+            for (recipient, shares) in secrets.iter_mut().enumerate() {
+                let x = small_field_point(self.small_profile, recipient + 1);
+                let value = eval_poly_horner(self.small_profile, &small, x);
+                shares.push(Gf2Element::from_bytes(self.profile, *value.as_bytes())
+                    .expect("base-field value embeds canonically"));
+            }
+            f_polys.push(polynomial);
+        }
+        let g_poly: Vec<_> = (0..self.threshold)
+            .map(|_| random_large_field(self.profile, &mut rng)).collect();
+        let mask_shares = (1..=self.share_amount).map(|recipient| {
+            eval_poly_horner_small_x(self.profile, &g_poly, small_field_point(self.profile, recipient))
+        }).collect();
+        Gf2TwoFieldBatch { secrets, f_polys, mask_shares, g_poly }
+    }
+
     /// Construct a dealer for the given profile, threshold, and
     /// share count. Returns `Err` with a human-readable message
     /// when any constraint is violated:
@@ -918,6 +955,15 @@ pub struct Gf2SuperInvExtractor {
 }
 
 impl Gf2SuperInvExtractor {
+    /// Apply the agreed matrix to LOCAL dealer shares, before reconstruction.
+    /// Exact input ordering/length and base-field membership are mandatory.
+    pub fn transform_shares(&self, inputs: &[Gf2Element]) -> Result<Vec<Gf2Element>, String> {
+        if inputs.len() != self.num_inputs || inputs.iter().any(|v|
+            Gf2Element::from_bytes(self.small_profile, *v.as_bytes()).is_err()) {
+            return Err("matrix input must contain exactly the selected dealers' small-field shares".into());
+        }
+        Ok(self.extract(inputs))
+    }
     /// Build the extractor. `alpha_points` are 1-based integer node
     /// ids (sorted decided dealers' ids + 1, matching the BigUint
     /// path). `num_outputs` is the number of extracted beacon values

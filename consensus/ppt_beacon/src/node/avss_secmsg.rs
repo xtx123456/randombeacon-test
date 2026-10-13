@@ -1,45 +1,7 @@
-//! Receiver-side plumbing for the new Π_SecMsgDst-routed AVSS
-//! dealer path (Shoup-Smart 2024 Sec 4.3 + commits 1-5 in
-//! `shoup_smart/`).
-//!
-//! ## What this module does (commit 6 — strictly additive)
-//!
-//! Provides `Context` methods that:
-//!
-//!   1. Cache the public AVSS commitment broadcast by the dealer
-//!      (`AvssPublicCommitMsg`) — Merkle roots, h(x) coefficients,
-//!      and a transcript-binding hash that replaces the duplicated
-//!      public fields previously stuffed into n cleartext
-//!      `AVSSSend` packets.
-//!
-//!   2. Route inbound `AVSSSecMsgKey*` and `AVSSSecMsgCipher*` wire
-//!      messages into the per-(round, dealer) `SecMsgDstState`
-//!      instance, lazily creating it on first arrival.
-//!
-//!   3. Translate the channel-tagged outbound actions emitted by
-//!      `SecMsgDstState` (its sender-side `set_input_as_sender`
-//!      output, plus echo / vote responses on the receiver side)
-//!      back into wire `CoinMsg` variants for `Context::send` /
-//!      `Context::broadcast`.
-//!
-//!   4. On `SecMsgDstAction::DeliveredMessage` — i.e. the receiver
-//!      has fully recovered its own per-recipient AVSS payload —
-//!      cache the decrypted plaintext bytes in
-//!      `Context::avss_secmsg_delivered_bytes`. **Commit 6 stops
-//!      here**: it does NOT yet validate the payload against the
-//!      cached public commit, store it in `CTRBCState`, or
-//!      broadcast `AVSSReady`. Those steps belong to commit 7
-//!      (the dealer-side cutover) so commit 6 is a strictly
-//!      additive landing — the legacy `AVSSSend` cleartext path
-//!      still drives the live AVSS quorum.
-//!
-//! ## PQ-safety
-//!
-//! Pure routing + caching + bincode serialise of wire payloads.
-//! The underlying SecMsgDst state machine itself is hash-only
-//! (commit 1-5), so no new crypto assumptions are introduced.
-
-use std::collections::hash_map::Entry;
+//! SecMsg routing for PPTB's AWSS normal phase and selected recovery.
+//! Public data are applied only after scoped RBC delivery. Private data wait for
+//! the agreed key/cipher roots, then pass the existing share/degree validator.
+//! Retain canonical transport evidence for post-ACS complaints and batch audit.
 
 use async_recursion::async_recursion;
 use bincode;
@@ -69,7 +31,7 @@ impl Context {
         dealer: Replica,
     ) -> &mut SecMsgDstState {
         if !self.avss_secmsg_state.contains_key(&(round, dealer)) {
-            let state = self.fresh_avss_secmsg_state(dealer);
+            let state = self.fresh_avss_secmsg_state(round, dealer);
             self.avss_secmsg_state.insert((round, dealer), state);
         }
         self.avss_secmsg_state
@@ -86,8 +48,9 @@ impl Context {
     /// returns `None`, so this helper bootstraps the initial
     /// state independently from the lazy-create path inside
     /// `get_or_init_avss_secmsg`.
-    fn fresh_avss_secmsg_state(&self, dealer: Replica) -> SecMsgDstState {
-        let prime = self.secret_domain.clone();
+    fn fresh_avss_secmsg_state(&self, round: Round, dealer: Replica) -> SecMsgDstState {
+        // Transport keys are independent of the optimized beacon-share field.
+        let prime = (num_bigint::BigUint::from(1u8) << 521usize) - num_bigint::BigUint::from(1u8);
         let n = self.num_nodes;
         let t = self.num_faults;
         let myid = self.myid;
@@ -96,8 +59,14 @@ impl Context {
         // configuration (prime < 2 / n < 4 / t == 0 / 3t >= n);
         // the parent Context already validates these, so the
         // unwrap below is panic-free in any production config.
-        SecMsgDstState::new(myid, n, t, dealer, prime, hash_state)
-            .expect("SecMsgDstState::new given a Context-validated config")
+        let mut state = SecMsgDstState::new(myid, n, t, dealer, prime, hash_state)
+            .expect("SecMsgDstState::new given a Context-validated config");
+        // The immutable public RBC bundle fixes both transcript roots.
+        // Sender construction precedes RBC; receiver construction follows it.
+        if let Some((key, cipher)) = self.avss_public_bundles.get(&(round, dealer)).and_then(|bundle| bundle.secmsg_roots) {
+            state.bind_roots(key, cipher);
+        }
+        state
     }
 
     /// Take-process-put-back helper that lets a SecMsgDst-side
@@ -141,7 +110,7 @@ impl Context {
         let state = self
             .avss_secmsg_state
             .remove(&(round, dealer))
-            .unwrap_or_else(|| self.fresh_avss_secmsg_state(dealer));
+            .unwrap_or_else(|| self.fresh_avss_secmsg_state(round, dealer));
 
         let (new_state, result) = tokio::task::spawn_blocking(move || f(state))
             .await
@@ -154,103 +123,23 @@ impl Context {
         result
     }
 
-    /// Receiver entry point for a broadcast `AVSSSecMsgPublicCommit`
-    /// from `dealer`. Verifies the transcript-binding hash, caches
-    /// the commit, and triggers `try_finalize_avss_secmsg` (which
-    /// is a no-op until the matching SecMsgDst delivery also lands).
-    ///
-    /// `wire_sender` is the WrapperMsg-level sender that ferried
-    /// this commit. We MUST require `wire_sender == msg.origin`:
-    /// the commit's `transcript_root` is a public hash of the
-    /// (origin, round, root_vec, degree_test_coeffs) tuple, so
-    /// **any** node can compute a valid `transcript_root` for any
-    /// `origin` they choose. Without the sender-binding check a
-    /// single Byzantine node X could broadcast a fake commit with
-    /// `origin = Y` (some honest dealer) that arrives before Y's
-    /// real one; honest receivers would cache X's fake commit,
-    /// drop Y's real one as duplicate ("first-seen-wins"), then
-    /// when Y's SecMsgDst payload finally delivers
-    /// `try_finalize_avss_secmsg` would reconstruct a BeaconMsg
-    /// with X's fake `root_vec` + `degree_test_coeffs` and Y's
-    /// honest per-recipient share material. The two-field
-    /// degree-test would fail against the fake h(x) coefficients,
-    /// causing `process_avss_send` to `ban_dealer_global(Y)`. A
-    /// single Byzantine peer could thus frame every other honest
-    /// dealer simultaneously, ban them all in round 0, and stall
-    /// liveness permanently.
+    /// Legacy-shaped public SEND is an authenticated input to public RBC.
+    /// It cannot install a first-seen local commitment. New SecMsg senders use
+    /// the public bundle that also commits to their key/cipher vectors.
     #[async_recursion]
     pub async fn process_avss_secmsg_public_commit(
         &mut self,
         msg: AvssPublicCommitMsg,
         wire_sender: Replica,
     ) {
-        if wire_sender != msg.origin {
-            log::warn!(
-                "[PPT][SECMSG-AVSS][PUB-COMMIT] node {} dropping public-commit \
-                 with wire_sender={} != origin={} (round={}) -- attempted dealer \
-                 framing",
-                self.myid, wire_sender, msg.origin, msg.round
-            );
-            return;
-        }
-        if !msg.verify_transcript_root() {
-            log::warn!(
-                "[PPT][SECMSG-AVSS][PUB-COMMIT] node {} rejecting public-commit \
-                 from dealer {} for round {} -- transcript_root mismatch",
-                self.myid, msg.origin, msg.round
-            );
-            return;
-        }
-        let round = msg.round;
-        let dealer = msg.origin;
-        // Phase F2 -- once the AVSS validation cascade has completed
-        // for this (round, dealer), the cached public commit is no
-        // longer needed (the BeaconMsg has already been stored in
-        // `CTRBCState`, and `try_finalize_avss_secmsg` would early-
-        // return on the same `avss_local_valid` check). Without this
-        // guard, a late-arriving duplicate AvssPublicCommit would
-        // re-cache a fresh `AvssPublicCommitMsg` (~tens of KB) in
-        // `avss_secmsg_public` that never gets released until
-        // `maybe_release_round` runs at end-of-round. Banned dealer
-        // already filtered above.
-        if let Some(rs) = self.round_state.get(&round) {
-            if rs.avss_local_valid.contains(&dealer) {
-                log::debug!(
-                    "[PPT][SECMSG-AVSS][PUB-COMMIT] node {} dropping public-commit \
-                     from already-validated dealer {} for round {} (phase F2 guard)",
-                    self.myid, dealer, round
-                );
-                return;
-            }
-        }
-        // Idempotent: first-seen-wins. Byzantine dealer that
-        // re-broadcasts a different commit is silently dropped.
-        let newly_cached = match self.avss_secmsg_public.entry((round, dealer)) {
-            Entry::Occupied(_) => {
-                log::debug!(
-                    "[PPT][SECMSG-AVSS][PUB-COMMIT] node {} dropping duplicate \
-                     public-commit from dealer {} for round {} (already cached)",
-                    self.myid, dealer, round
-                );
-                false
-            }
-            Entry::Vacant(e) => {
-                log::info!(
-                    "[PPT][SECMSG-AVSS][PUB-COMMIT] node {} cached public-commit \
-                     from dealer {} for round {} (#roots={}, #h-coeffs={})",
-                    self.myid,
-                    dealer,
-                    round,
-                    msg.root_vec.len(),
-                    msg.degree_test_coeffs.len(),
-                );
-                e.insert(msg);
-                true
-            }
-        };
-        if newly_cached {
-            self.try_finalize_avss_secmsg(round, dealer).await;
-        }
+        if wire_sender != msg.origin || !msg.verify_transcript_root() { return; }
+        // Ordinary SEND is only an RBC input. Cache public content after delivery.
+        let round = msg.round; let dealer = msg.origin;
+        let payload = bincode::serialize(&crate::node::wire::PublicBundle {
+            version: 3, challenge_root: None,
+            public: msg, secmsg_roots: None, reserve_roots: None }).expect("public bundle encoding");
+        self.process_scoped_rbc(crate::node::wire::RbcScope::PublicCommit,
+            round, dealer, crate::node::wire::RbcMessage::Send(payload), wire_sender).await;
     }
 
     // ------- Key channel -------
@@ -263,6 +152,7 @@ impl Context {
         payload: Vec<u8>,
         wire_sender: Replica,
     ) {
+        if self.defer_secmsg(round, dealer, CoinMsg::AVSSSecMsgKeyDispersal(round, dealer, payload.clone()), wire_sender) { return; }
         let actions = self
             .with_avss_secmsg_state(round, dealer, move |mut state| {
                 let entries: Vec<DispersalEntry> = match bincode::deserialize(&payload) {
@@ -291,6 +181,7 @@ impl Context {
         payload: Vec<u8>,
         wire_sender: Replica,
     ) {
+        if self.defer_secmsg(round, dealer, CoinMsg::AVSSSecMsgKeyEcho(round, dealer, payload.clone()), wire_sender) { return; }
         let actions = self
             .with_avss_secmsg_state(round, dealer, move |mut state| {
                 let echo: EchoPayload = match bincode::deserialize(&payload) {
@@ -319,6 +210,7 @@ impl Context {
         meta_root: Hash,
         wire_sender: Replica,
     ) {
+        if self.defer_secmsg(round, dealer, CoinMsg::AVSSSecMsgKeyVote(round, dealer, meta_root), wire_sender) { return; }
         let actions = self
             .with_avss_secmsg_state(round, dealer, move |mut state| {
                 let acts = state.handle_key_vote(wire_sender, meta_root);
@@ -338,6 +230,7 @@ impl Context {
         payload: Vec<u8>,
         wire_sender: Replica,
     ) {
+        if self.defer_secmsg(round, dealer, CoinMsg::AVSSSecMsgCipherDispersal(round, dealer, payload.clone()), wire_sender) { return; }
         let actions = self
             .with_avss_secmsg_state(round, dealer, move |mut state| {
                 let entries: Vec<DispersalEntry> = match bincode::deserialize(&payload) {
@@ -366,6 +259,7 @@ impl Context {
         payload: Vec<u8>,
         wire_sender: Replica,
     ) {
+        if self.defer_secmsg(round, dealer, CoinMsg::AVSSSecMsgCipherEcho(round, dealer, payload.clone()), wire_sender) { return; }
         let actions = self
             .with_avss_secmsg_state(round, dealer, move |mut state| {
                 let echo: EchoPayload = match bincode::deserialize(&payload) {
@@ -394,6 +288,7 @@ impl Context {
         meta_root: Hash,
         wire_sender: Replica,
     ) {
+        if self.defer_secmsg(round, dealer, CoinMsg::AVSSSecMsgCipherVote(round, dealer, meta_root), wire_sender) { return; }
         let actions = self
             .with_avss_secmsg_state(round, dealer, move |mut state| {
                 let acts = state.handle_cipher_vote(wire_sender, meta_root);
@@ -484,34 +379,31 @@ impl Context {
                     };
                     self.broadcast(coin_msg, round).await;
                 }
-                SecMsgDstAction::SendForward { .. }
-                | SecMsgDstAction::SendMessageForward { .. } => {
-                    // Forward sub-protocol is not exercised in
-                    // commit 6; commit 7 will route these to a
-                    // dedicated `AVSSSecMsgForward*` wire variant.
-                    // For now, log and drop so we can detect any
-                    // accidental emission during testing.
-                    log::warn!(
-                        "[PPT][SECMSG-AVSS] dropping SendForward/SendMessageForward \
-                         emitted in commit 6 (forwards are commit-7 territory) for \
-                         (round={}, dealer={})",
-                        round, dealer
-                    );
+                SecMsgDstAction::SendForward { channel, recipient, forward } => {
+                    if let Some(root) = self.awss_root(round, dealer) {
+                        if self.awss_selected(round, dealer) && self.awss_recovery.get(&(round, dealer)).map(|state| state.has_complaint()).unwrap_or(false) {
+                            self.send_ppt_wire(recipient, round, crate::node::wire::PptWire::AwssChannelForward {
+                                round, dealer, root, source: self.myid, recipient, channel, proof: forward }).await;
+                        }
+                    }
+                }
+                SecMsgDstAction::SendMessageForward { recipient, payload } => {
+                    if let Some(root) = self.awss_root(round, dealer) {
+                        if self.awss_selected(round, dealer) && self.awss_recovery.get(&(round, dealer)).map(|state| state.has_complaint()).unwrap_or(false) {
+                            self.send_ppt_wire(recipient, round, crate::node::wire::PptWire::AwssForward {
+                                round, dealer, root, source: self.myid, recipient,
+                                tag: crate::node::wire::ForwardTag::Assist, proof: payload }).await;
+                        }
+                    }
                 }
                 SecMsgDstAction::DeliveredMessage { message } => {
                     self.on_avss_secmsg_delivered(round, dealer, message).await;
                 }
                 SecMsgDstAction::ForwardDeliveredMessage { source, message } => {
-                    log::info!(
-                        "[PPT][SECMSG-AVSS] node {} forward-delivered message from \
-                         source {} (round={}, dealer={}) -- {} plaintext bytes \
-                         (commit 6 ignores forward-delivery)",
-                        self.myid,
-                        source,
-                        round,
-                        dealer,
-                        message.len()
-                    );
+                    // Forward plaintext is never implicitly a local share. The
+                    // complaint/assist handler validates its original source and
+                    // certificate before inserting it into recovery state.
+                    log::debug!("[PPT][AWSS] verified forward source={} bytes={} round={} dealer={}", source, message.len(), round, dealer);
                 }
                 SecMsgDstAction::ForwardRejected { source, reason } => {
                     log::warn!(
@@ -529,7 +421,9 @@ impl Context {
                 }
             }
         }
+        self.drive_awss_recovery(round, dealer).await;
     }
+
 
     /// Send a single SecMsgDst-AVSS wire message unicast to one
     /// recipient, taking care to handle the self-delivery loop-back
@@ -553,8 +447,7 @@ impl Context {
         }
         if let Some(sec_key) = self.sec_key_map.get(&recipient).cloned() {
             let wrapper = types::beacon::WrapperMsg::new(coin_msg, self.myid, &sec_key, round);
-            let cancel_handler = self.net_send.send(recipient, wrapper).await;
-            self.add_cancel_handler(cancel_handler);
+            self.send(recipient, wrapper).await;
         } else {
             log::error!(
                 "[PPT][SECMSG-AVSS] no sec_key for recipient {} -- dropping \
@@ -568,7 +461,7 @@ impl Context {
     /// receiver handler. Mirrors the existing `process_avss_send`
     /// self-delivery pattern.
     #[async_recursion]
-    async fn dispatch_self_avss_secmsg(&mut self, coin_msg: CoinMsg, wire_sender: Replica) {
+    pub(crate) async fn dispatch_self_avss_secmsg(&mut self, coin_msg: CoinMsg, wire_sender: Replica) {
         match coin_msg {
             CoinMsg::AVSSSecMsgKeyDispersal(round, dealer, bytes) => {
                 self.process_avss_secmsg_key_dispersal(round, dealer, bytes, wire_sender)
@@ -635,6 +528,8 @@ impl Context {
         plaintext: Vec<u8>,
         wire_sender: Replica,
     ) {
+        // Plain dealer unicasts cannot authenticate a SecMsg-bound main batch.
+        if self.transport != super::context::AvssTransport::Lite { return; }
         if wire_sender != dealer {
             log::warn!(
                 "[PPT][AVSS-LITE][PRIVATE] node {} dropping AVSSPrivatePayload \
@@ -739,15 +634,11 @@ impl Context {
         // Idempotent: first-seen-wins. SecMsgDst delivery is
         // already idempotent at the state-machine level (latches
         // on first XOR), but defensive guard here costs nothing.
-        if self
-            .avss_secmsg_delivered_bytes
-            .contains_key(&(round, dealer))
-        {
-            return;
-        }
-        self.avss_secmsg_delivered_bytes
-            .insert((round, dealer), plaintext);
-        self.try_finalize_avss_secmsg(round, dealer).await;
+        if self.avss_beacon_bytes.contains_key(&(round,dealer)){return;}
+        self.avss_beacon_bytes.insert((round,dealer),plaintext);
+        self.join_secmsg_parts(round,dealer).await;
+        self.drive_awss_recovery(round,dealer).await;
+        self.try_send_local_transform(round).await;
     }
 
     /// Once both the public-commit broadcast and the SecMsgDst
@@ -813,7 +704,7 @@ impl Context {
             .clone();
         let myid = self.myid;
 
-        let payload = match types::beacon::AvssRecipientPayload::deserialize_bytes(&plaintext) {
+        let payload = match super::batch_degree_test::decode_payload(&plaintext, self.gf2_profile, self.batch_size, 0) {
             Some(p) => p,
             None => {
                 log::error!(

@@ -64,7 +64,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
-use crypto::aes_hash::{HashState, MerkleTree, Proof};
+use crypto::aes_hash::{HashState, Proof};
+use crate::node::merkle::MerkleTree;
 use crypto::hash::{do_hash, Hash};
 use serde::{Deserialize, Serialize};
 use types::Replica;
@@ -296,6 +297,8 @@ pub struct RelMsgDstState {
     /// Self-computed meta-root `r = MerkleTree(r_1, ..., r_n)` over
     /// the message-roots received from the sender.
     own_meta_root: Option<Hash>,
+    bound_root: Option<Hash>,
+    echo_meta_proofs: HashMap<Hash, (Hash, Proof)>,
     /// Self-computed meta-paths `{π_i}_{i ∈ [0, n)}`.
     own_meta_paths: Option<Vec<Proof>>,
     /// Per-message-root cache: the `n` `(msg_root, frag_path,
@@ -388,6 +391,8 @@ impl RelMsgDstState {
             sender_dispersed: false,
             own_dispersal_accepted: false,
             own_meta_root: None,
+            bound_root: None,
+            echo_meta_proofs: HashMap::new(),
             own_meta_paths: None,
             own_dispersal_data: vec![None; n],
             echoes_for_self: HashMap::new(),
@@ -470,7 +475,8 @@ impl RelMsgDstState {
         // recompute it themselves (Sec 4.1 prose explicitly says
         // "r is the root of the Merkle tree built from (r_1,...,r_n)"
         // *as part of the echo*, not the dispersal).
-        let _ = msg_roots; // (suppress unused warning; see receiver-side use below)
+        let leaves = msg_roots.iter().map(|root| do_hash(root)).collect();
+        self.bound_root = Some(MerkleTree::new(leaves, &self.hash_state).root());
 
         let mut out = Vec::with_capacity(self.n);
         for (recipient_idx, entries) in dispersal_per_recipient.into_iter().enumerate() {
@@ -534,7 +540,8 @@ impl RelMsgDstState {
             if entry.frag_path.root() != entry.msg_root {
                 return Vec::new();
             }
-            if !entry.frag_path.validate(&self.hash_state) {
+            if !entry.frag_path.matches_leaf(myid_idx, self.n)
+                || !crate::node::merkle::validate(&entry.frag_path) {
                 return Vec::new();
             }
             // Position binding: the path must prove `fragment` is at
@@ -573,6 +580,7 @@ impl RelMsgDstState {
         let meta_root = meta_tree.root();
         let meta_paths: Vec<Proof> = (0..self.n).map(|i| meta_tree.gen_proof(i)).collect();
 
+        if self.bound_root.map(|root| root != meta_root).unwrap_or(false) { return Vec::new(); }
         // Persist the data we need later.
         self.own_dispersal_accepted = true;
         self.own_meta_root = Some(meta_root);
@@ -627,7 +635,10 @@ impl RelMsgDstState {
         wire_sender: Replica,
         echo: EchoPayload,
     ) -> Vec<RelMsgDstAction> {
-        if echo.frag_idx >= self.n {
+        if wire_sender >= self.n || echo.frag_idx >= self.n
+            || self.bound_root.map(|root| root != echo.meta_root).unwrap_or(false)
+            || !echo.frag_path.matches_leaf(echo.frag_idx, self.n)
+            || !echo.meta_path.matches_leaf(self.myid, self.n) {
             return Vec::new();
         }
         // Position binding (1/3): in Π_RelMsgDst every honest P_j
@@ -650,7 +661,7 @@ impl RelMsgDstState {
         if echo.frag_path.root() != echo.msg_root {
             return Vec::new();
         }
-        if !echo.frag_path.validate(&self.hash_state) {
+        if !crate::node::merkle::validate(&echo.frag_path) {
             return Vec::new();
         }
         // Position binding (2/3): the frag_path must prove the
@@ -674,7 +685,7 @@ impl RelMsgDstState {
         if echo.meta_path.root() != echo.meta_root {
             return Vec::new();
         }
-        if !echo.meta_path.validate(&self.hash_state) {
+        if !crate::node::merkle::validate(&echo.meta_path) {
             return Vec::new();
         }
         // Position binding (3/3): the meta_path must prove `msg_root`
@@ -693,6 +704,8 @@ impl RelMsgDstState {
             return Vec::new();
         }
 
+        self.echo_meta_proofs.entry(echo.meta_root)
+            .or_insert((echo.msg_root, echo.meta_path.clone()));
         // Record the echo (first-seen-per-sender wins).
         let echo_map = self
             .echoes_for_self
@@ -733,6 +746,7 @@ impl RelMsgDstState {
         wire_sender: Replica,
         meta_root: Hash,
     ) -> Vec<RelMsgDstAction> {
+        if wire_sender >= self.n || self.bound_root.map(|root| root != meta_root).unwrap_or(false) { return Vec::new(); }
         let (vote_count, already_voted) = {
             let voters = self.votes.entry(meta_root).or_insert_with(HashSet::new);
             voters.insert(wire_sender);
@@ -786,55 +800,71 @@ impl RelMsgDstState {
             return Vec::new();
         }
 
-        // Decode m_myid from the unique fragments.
-        let collected: Vec<(usize, Fragment)> = by_frag_idx
-            .iter()
-            .map(|(idx, (frag, _path))| (*idx, frag.clone()))
-            .collect();
-        let message = match self.decoder.decode(collected) {
-            Ok(m) => m,
-            Err(e) => {
-                log::warn!(
-                    "[ShoupSmart][RelMsgDst] node {} decode failed at delivery: {}",
-                    self.myid, e
-                );
-                return Vec::new();
-            }
+        let (message_root, meta_path) = match self.echo_meta_proofs.get(&meta_root).cloned() {
+            Some(value) => value, None => return Vec::new(),
         };
-
-        // Recover all needed forwarding info:
-        //   - meta_root         (already in scope)
-        //   - π_myid (meta-path for r_myid under meta_root at index myid)
-        //   - r_myid                   (own message root from dispersal)
-        //   - {(idx, path, fragment)}  ≥ n-2t fragments of m_myid
-        let my_meta_path = self
-            .own_meta_paths
-            .as_ref()
-            .and_then(|paths| paths.get(self.myid as usize).cloned());
-        let my_msg_root = self
-            .own_dispersal_data
-            .get(self.myid as usize)
-            .and_then(|s| s.as_ref().map(|(r, _, _)| *r));
-
-        let cache = match (my_meta_path, my_msg_root) {
-            (Some(mp), Some(mr)) => {
-                let frags: Vec<(usize, Proof, Fragment)> = by_frag_idx
-                    .into_iter()
-                    .map(|(idx, (frag, path))| (idx, path, frag))
-                    .collect();
-                Some(DeliveredForwardingCache {
-                    meta_root,
-                    my_meta_path: mp,
-                    my_msg_root: mr,
-                    my_msg_fragments: frags,
-                })
+        let mut fragments: Vec<(usize, Proof, Fragment)> = by_frag_idx.into_iter()
+            .map(|(index, (fragment, proof))| (index, proof, fragment)).collect();
+        fragments.sort_by_key(|entry| entry.0);
+        self.forwarding_cache = Some(DeliveredForwardingCache { meta_root,
+            my_meta_path: meta_path.clone(), my_msg_root: message_root,
+            my_msg_fragments: fragments.clone() });
+        // Even an invalid committed codeword retains transferable complaint
+        // evidence. It must never become a successful distribution output.
+        let forward = ForwardPayload { meta_root, my_meta_path: meta_path,
+            my_msg_root: message_root, forwarder_idx: self.myid, fragments };
+        match self.check_forward(self.myid, &forward) {
+            Ok(Some(message)) => {
+                self.delivered = Some((meta_root, message.clone()));
+                vec![RelMsgDstAction::Delivered { message }]
             }
-            _ => None, // unusual: delivered without our own dispersal data?
-        };
+            _ => Vec::new(),
+        }
+    }
 
-        self.delivered = Some((meta_root, message.clone()));
-        self.forwarding_cache = cache;
-        vec![RelMsgDstAction::Delivered { message }]
+    pub fn bind_root(&mut self, root: Hash) -> bool {
+        if self.bound_root.map(|existing| existing != root).unwrap_or(false) { return false; }
+        self.bound_root = Some(root); true
+    }
+    pub fn commitment_root(&self) -> Option<Hash> { self.bound_root.or(self.own_meta_root) }
+
+    /// Replay the provider's fragment of the requested recipient's own message.
+    /// In the key channel this is private to that recipient, never a disclosure
+    /// of the provider's own key/share to an arbitrary requester.
+    pub fn replay_echo_for(&self, recipient: Replica) -> Option<RelMsgDstAction> {
+        if recipient >= self.n { return None; }
+        let root = self.own_meta_root?;
+        if self.bound_root.map(|bound| bound != root).unwrap_or(false) { return None; }
+        let (msg_root, frag_path, fragment) = self.own_dispersal_data.get(recipient)?.as_ref()?;
+        let meta_path = self.own_meta_paths.as_ref()?.get(recipient)?.clone();
+        Some(RelMsgDstAction::SendEcho { recipient_idx: recipient,
+            echo: EchoPayload { meta_root: root, meta_path, msg_root: *msg_root,
+                frag_path: frag_path.clone(), fragment: fragment.clone(), frag_idx: self.myid } })
+    }
+
+    /// Original provider row, including both proof levels. Release only after
+    /// the beacon batch has opened; it contains fragments of every message.
+    pub fn audit_row(&self) -> Vec<EchoPayload> {
+        (0..self.n).filter_map(|recipient| match self.replay_echo_for(recipient) {
+            Some(RelMsgDstAction::SendEcho { echo, .. }) => Some(echo), _ => None,
+        }).collect()
+    }
+
+    /// Ok(None) is a provably invalid ORIGINAL codeword, after verifying all
+    /// proofs/positions under the agreed root. Err identifies bad forwarding
+    /// evidence and must never trigger disclosure or dealer exclusion.
+    pub fn check_forward(&self, source: Replica, forward: &ForwardPayload)
+        -> Result<Option<Vec<u8>>, ForwardReject> {
+        for action in self.handle_forward(source, forward.clone()) {
+            match action {
+                RelMsgDstAction::ForwardDelivered { message, .. } => return Ok(Some(message)),
+                RelMsgDstAction::ForwardRejected { reason: ForwardReject::DecodeFailed(_), .. }
+                | RelMsgDstAction::ForwardRejected { reason: ForwardReject::RootRebuildMismatch, .. } => return Ok(None),
+                RelMsgDstAction::ForwardRejected { reason, .. } => return Err(reason),
+                _ => {}
+            }
+        }
+        Err(ForwardReject::InvalidMetaPath)
     }
 
     // --- Forwarding sub-protocol (unhappy path) ---
@@ -894,10 +924,16 @@ impl RelMsgDstState {
     /// `meta_root` as authenticated by the forwarder's
     /// `meta_path` chained to it.)
     pub fn handle_forward(
-        &mut self,
+        &self,
         wire_sender: Replica,
         forward: ForwardPayload,
     ) -> Vec<RelMsgDstAction> {
+        if wire_sender >= self.n || forward.forwarder_idx != wire_sender
+            || self.commitment_root() != Some(forward.meta_root)
+            || !forward.my_meta_path.matches_leaf(wire_sender, self.n) {
+            return vec![RelMsgDstAction::ForwardRejected {
+                source: wire_sender, reason: ForwardReject::InvalidMetaPath }];
+        }
         // (1) Validate the forwarder's meta-path: hash(my_msg_root)
         // sits at index `forwarder_idx` in the meta-tree rooted at
         // `meta_root`.
@@ -914,7 +950,7 @@ impl RelMsgDstState {
                 reason: ForwardReject::InvalidMetaPath,
             }];
         }
-        if !forward.my_meta_path.validate(&self.hash_state) {
+        if !crate::node::merkle::validate(&forward.my_meta_path) {
             return vec![RelMsgDstAction::ForwardRejected {
                 source: wire_sender,
                 reason: ForwardReject::InvalidMetaPath,
@@ -950,7 +986,8 @@ impl RelMsgDstState {
         }
         let mut by_idx: HashMap<usize, Fragment> = HashMap::new();
         for (frag_idx, path, frag) in forward.fragments.iter() {
-            if *frag_idx >= self.n {
+            if *frag_idx >= self.n || !path.matches_leaf(*frag_idx, self.n)
+                || by_idx.contains_key(frag_idx) {
                 return vec![RelMsgDstAction::ForwardRejected {
                     source: wire_sender,
                     reason: ForwardReject::InvalidFragmentPath { frag_idx: *frag_idx },
@@ -959,7 +996,7 @@ impl RelMsgDstState {
             let leaf = do_hash(frag.as_bytes());
             if path.item() != leaf
                 || path.root() != forward.my_msg_root
-                || !path.validate(&self.hash_state)
+                || !crate::node::merkle::validate(&path)
             {
                 return vec![RelMsgDstAction::ForwardRejected {
                     source: wire_sender,

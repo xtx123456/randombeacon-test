@@ -302,7 +302,7 @@ pub fn reconstruct(
 fn modinv(a: &num_bigint::BigInt, m: &num_bigint::BigInt) -> Option<num_bigint::BigInt> {
     use num_bigint::BigInt;
     use num_bigint::Sign;
-    use num_traits::{One, Zero};
+    use num_traits::One;
     let (mut old_r, mut r) = (a.clone(), m.clone());
     let (mut old_s, mut s) = (BigInt::one(), BigInt::zero());
     while !r.is_zero() {
@@ -395,6 +395,20 @@ impl SecKeyDstState {
             delivered_share: None,
             sender_known_shares: None,
         })
+    }
+
+    pub fn bind_root(&mut self, root: Hash) -> bool { self.rmd.bind_root(root) }
+    pub fn commitment_root(&self) -> Option<Hash> { self.rmd.commitment_root() }
+    pub fn audit_row(&self) -> Vec<super::rel_msg_dst::EchoPayload> { self.rmd.audit_row() }
+    pub fn replay_echo_for(&self, recipient: Replica) -> Option<SecKeyDstAction> {
+        match self.rmd.replay_echo_for(recipient)? {
+            RelMsgDstAction::SendEcho { recipient_idx, echo } => Some(SecKeyDstAction::SendEcho { recipient_idx, echo }),
+            _ => None,
+        }
+    }
+    pub fn check_forward(&self, source: Replica, forward: &ForwardPayload)
+        -> Result<Option<BigUint>, ForwardReject> {
+        Ok(self.rmd.check_forward(source, forward)?.and_then(|bytes| parse_share(&self.prime, &bytes)))
     }
 
     pub fn delivered(&self) -> bool {
@@ -519,9 +533,6 @@ impl SecKeyDstState {
     ) -> Result<SecKeyDstAction, SecKeyDstError> {
         if recipient == self.myid {
             return Err(SecKeyDstError::SelfForwardRequest);
-        }
-        if self.delivered_share.is_none() {
-            return Err(SecKeyDstError::NotYetDelivered);
         }
         let action = self
             .rmd

@@ -37,7 +37,7 @@ pub(crate) fn avss_local_packet_valid_pure(
     transcript_root: &Hash,
     dealer: Replica,
     round: Round,
-    hash_context: &HashState,
+    _hash_context: &HashState,
     secret_domain: &BigUint,
     nonce_domain: &BigUint,
     num_faults: usize,
@@ -55,6 +55,7 @@ pub(crate) fn avss_local_packet_valid_pure(
     // The dealer shares `batch_size` beacon coins plus `coin_reserve`
     // sealed ACS-coin secrets; all are committed + degree-tested
     // uniformly, so every length / loop below ranges over the total.
+    let main_batch_size = batch_size;
     let batch_size = batch_size + coin_reserve;
     let wss = beacon_msg.wss.as_ref().ok_or("missing WSS payload")?;
     if myid >= num_nodes || wss.secrets.len() != batch_size
@@ -73,13 +74,34 @@ pub(crate) fn avss_local_packet_valid_pure(
         return Err("transcript root mismatch");
     }
 
-    if !beacon_msg.verify_proofs(hash_context) {
+    if gf2_profile.is_none() && !crate::node::merkle::validate_batch(&wss.mps) {
         log::warn!(
             "[PPT][AVSS] invalid Merkle/share proof for dealer {} round {}",
             dealer,
             round
         );
         return Err("merkle proof invalid");
+    }
+
+    if gf2_profile.is_some() {
+        if coin_reserve != super::context::PPT_COIN_RESERVE {
+            return Err("invalid GF2 reserve count");
+        }
+        let roots=beacon_msg.root_vec.as_ref().ok_or("missing root_vec")?;
+        let h=beacon_msg.degree_test_coeffs.as_ref().ok_or("missing degree-test coeffs")?;
+        let masks=beacon_msg.mask_shares.as_ref().ok_or("missing mask shares")?;
+        if beacon_msg.f_large_shares.is_some() {
+            return Err("f_large_shares present in GF2 mode (redundant; dealer should ship None)");
+        }
+        let public=types::beacon::AvssPublicCommitMsg::new(dealer,round,roots.clone(),h.clone());
+        if !super::batch_degree_test::public_shape(&public,main_batch_size,num_nodes,num_faults,gf2_profile) {
+            return Err("malformed GF2 batched public transcript");
+        }
+        let payload=types::beacon::AvssRecipientPayload::new(wss.secrets.clone(),wss.nonces.clone(),
+            masks.clone(),None,wss.mps.clone());
+        return if super::share_pipeline::validate_original(&public,&payload,0,batch_size,myid,num_nodes,num_faults,
+            secret_domain,nonce_domain,gf2_profile,_hash_context,None) {Ok(())}
+            else {Err("GF2 batch/reserve degree test or original commitment failed")};
     }
 
     // Fiat-Shamir degree-test challenge θ (problem-3 fix): derived
@@ -272,6 +294,11 @@ pub(crate) fn avss_local_packet_valid_pure(
 
     for coin_num in 0..batch_size {
         let coeffs = &degree_test_coeffs[coin_num];
+        let lifted=if gf2_profile.is_none(){Some(&f_large_shares[coin_num])}else{None};
+        if types::beacon::avss_commit_leaf_auto(&wssmsg.secrets[coin_num],&mask_shares[coin_num],lifted,&wssmsg.nonces[coin_num])!=wssmsg.mps[coin_num].item()
+            ||BigUint::from_bytes_be(&wssmsg.nonces[coin_num])>=*nonce_domain {
+            return Err("share/mask/nonce does not match the original committed leaf/domain");
+        }
 
         // **Degree bound on the public degree-test polynomial.**
         //
@@ -318,6 +345,8 @@ pub(crate) fn avss_local_packet_valid_pure(
                     .collect();
                 let f_large = BigUint::from_bytes_be(f_large_shares[coin_num].as_slice());
                 let g_share = BigUint::from_bytes_be(mask_shares[coin_num].as_slice());
+                if BigUint::from_bytes_be(&wssmsg.secrets[coin_num])>=*secret_domain||f_large>=*nonce_domain
+                    ||g_share>=*nonce_domain||h_coeffs.iter().any(|v|v>=nonce_domain){return Err("prime share/coefficient outside field");}
 
                 if !verifier.verify_share(myid + 1, &f_large, &g_share, &h_coeffs, theta) {
                     log::warn!(
@@ -464,9 +493,17 @@ impl Context {
     }
 
     pub(crate) async fn process_msg(self: &mut Context, wrapper_msg: WrapperMsg) {
-        log::debug!("Received protocol msg: {:?}", wrapper_msg);
+        log::debug!("[PPT][WIRE] received from {} round {}", wrapper_msg.sender, wrapper_msg.round);
 
         if self.check_proposal(&wrapper_msg) {
+            let mut wrapper_msg = wrapper_msg;
+            if self.options.channel == crate::node::options::PptChannel::Private {
+                let key = match self.sec_key_map.get(&wrapper_msg.sender) { Some(key) => key, None => return };
+                wrapper_msg.protmsg = match crate::node::wire::unprotect(&wrapper_msg, self.myid, key) {
+                    Some(message) => message,
+                    None => { log::warn!("[PPT][WIRE] rejected plaintext or misbound private envelope"); return; }
+                };
+            }
             self.num_messages += 1;
             self.choose_fn(wrapper_msg).await;
         } else {
@@ -478,6 +515,7 @@ impl Context {
     }
 
     pub(crate) async fn choose_fn(self: &mut Context, wrapper_msg: WrapperMsg) {
+        if self.defer_acs_for_audit(&wrapper_msg){return;}
         // Destructure WrapperMsg by ownership rather than cloning
         // `protmsg` just to match on it. The old `wrapper_msg.clone()
         // .protmsg` pattern cloned the entire inbound payload --
@@ -485,6 +523,11 @@ impl Context {
         // consensus main task before we could even dispatch.
         let wire_sender = wrapper_msg.sender;
         match wrapper_msg.protmsg {
+            CoinMsg::PPTBExtension(bytes) => {
+                if let Ok(message) = bincode::deserialize::<crate::node::wire::PptWire>(&bytes) {
+                    self.process_ppt_wire(message, wire_sender).await;
+                }
+            }
             // Legacy cleartext AVSSSend from a peer running an older
             // binary. Commit 7 cut the dealer over to the
             // Shoup-Smart 2024 SecMsgDst path (AVSSSecMsgPublicCommit
@@ -564,30 +607,12 @@ impl Context {
                 );
             }
 
-            CoinMsg::BatchBeaconConstruct(msg, share_sender, round) => {
-                if share_sender != wire_sender {
-                    return;
-                }
-                log::debug!(
-                    "[PPT][BATCH-BEACON-CONSTRUCT] received batched BeaconConstruct from node {} with {} coin-packets in round {}",
-                    share_sender,
-                    msg.packets.len(),
-                    round
-                );
-                self.process_batch_secret_shares(msg, share_sender, round).await;
+            CoinMsg::BatchBeaconConstruct(_, _, round) => {
+                log::debug!("[PPT][COMPARISON-DROP] legacy dealer-first reconstruction packet round={}",round);
             }
 
-            CoinMsg::MulticastRecoveredShares(msg, sender, round) => {
-                if sender != wire_sender {
-                    return;
-                }
-                log::info!(
-                    "[PPT][MULTICAST-DISPATCH] node {} dispatching recovered-share multicast from {} for round {}",
-                    self.myid,
-                    sender,
-                    round
-                );
-                self.process_multicast_recovered_shares(msg, sender, round).await;
+            CoinMsg::MulticastRecoveredShares(_, _, round) => {
+                log::debug!("[PPT][COMPARISON-DROP] legacy proof-only audit packet round={}",round);
             }
             CoinMsg::GatherEcho(_, sender, round) => {
                 log::debug!(
@@ -809,57 +834,37 @@ impl Context {
 
     fn maybe_mark_dealer_completed(&mut self, round: Round, dealer: Replica) -> bool {
         let threshold = self.num_nodes - self.num_faults;
-        let rbc_state = match self.round_state.get_mut(&round) {
-            Some(rbc_state) => rbc_state,
-            None => return false,
-        };
-
-        if rbc_state.avss_completed_dealers.contains(&dealer) {
-            return false;
-        }
-
-        if !rbc_state.avss_local_valid.contains(&dealer) {
-            return false;
-        }
-
-        if rbc_state.matching_avss_complete_count(dealer) < threshold {
-            return false;
-        }
-
-        rbc_state.avss_completed_dealers.insert(dealer);
-        true
+        let state = match self.round_state.get_mut(&round) { Some(state) => state, None => return false };
+        if state.cleared || !state.avss_transcript_roots.contains_key(&dealer)
+            || state.avss_completed_dealers.contains(&dealer)
+            || state.matching_avss_complete_count(dealer) < threshold { return false; }
+        // Public one-sided-vote completion, independent of this recipient's
+        // private delivery. It certifies at least f+1 honest happy holders.
+        state.avss_completed_dealers.insert(dealer); true
     }
 
-    fn maybe_prepare_avss_complete(
-        &mut self,
-        round: Round,
-        dealer: Replica,
-    ) -> Option<crypto::hash::Hash> {
+    fn maybe_prepare_avss_complete(&mut self, round: Round, dealer: Replica) -> Option<Hash> {
         let threshold = self.num_nodes - self.num_faults;
-        let rbc_state = match self.round_state.get_mut(&round) {
-            Some(rbc_state) => rbc_state,
-            None => return None,
-        };
+        let state = self.round_state.get_mut(&round)?;
+        if state.cleared || state.avss_complete_sent.contains(&dealer) { return None; }
+        let root = *state.avss_transcript_roots.get(&dealer)?;
+        if state.matching_avss_ready_count(dealer) < threshold
+            && state.matching_avss_complete_count(dealer) < self.num_faults+1 { return None; }
+        state.avss_complete_sent.insert(dealer); Some(root)
+    }
 
-        if !rbc_state.avss_local_valid.contains(&dealer) {
-            return None;
+    #[async_recursion]
+    pub(crate) async fn refresh_awss_prepared(&mut self, round: Round, dealer: Replica) {
+        if let Some(root) = self.maybe_prepare_avss_complete(round, dealer) {
+            if let Some(state) = self.round_state.get_mut(&round) {
+                state.add_avss_complete_vote(dealer, self.myid, root);
+            }
+            self.broadcast(CoinMsg::AVSSComplete(dealer, root, self.myid, round), round).await;
         }
-
-        if rbc_state.avss_complete_sent.contains(&dealer) {
-            return None;
+        if self.maybe_mark_dealer_completed(round, dealer) {
+            log::info!("[PPT][AWSS-PREPARED] round={} dealer={} public completion; private share availability tracked separately", round, dealer);
+            self.maybe_broadcast_acs_init_from_avss(round).await;
         }
-
-        if rbc_state.matching_avss_ready_count(dealer) < threshold {
-            return None;
-        }
-
-        let transcript_root = match rbc_state.avss_transcript_roots.get(&dealer) {
-            Some(root) => *root,
-            None => return None,
-        };
-
-        rbc_state.avss_complete_sent.insert(dealer);
-        Some(transcript_root)
     }
 
     /// Inbound AVSS packet entry point. **Phase D fire-and-forget**:
@@ -909,6 +914,24 @@ impl Context {
             return;
         }
 
+        let main_binding=self.batch_input_root(round,dealer);
+        if self.gf2_profile.is_some()&&self.transport==super::context::AvssTransport::SecMsg {
+            // Raw AVSSSend/Lite messages cannot replace the committed SecMsg
+            // plaintext. This check also prevents an unauthenticated payload
+            // from making a recipient vote happy when main paths are absent.
+            if main_binding.is_none()||!self.has_secmsg_batch_delivery(round,dealer){return;}
+            let expected=match self.avss_secmsg_delivered_bytes.get(&(round,dealer))
+                .and_then(|bytes|super::batch_degree_test::decode_payload(bytes,self.gf2_profile,self.batch_size,0)) {
+                Some(payload)=>payload,None=>return,
+            };
+            let public=match self.avss_secmsg_public.get(&(round,dealer)){Some(p)=>p,None=>return};
+            if crypto::hash::do_hash(&super::public_rbc::transcript(public).serialize_ctrbc())!=transcript_root
+                ||beacon_msg.mask_shares.as_ref()!=Some(&expected.mask_shares)
+                ||beacon_msg.f_large_shares!=expected.f_large_shares
+                ||!beacon_msg.wss.as_ref().map(|wss|wss.origin==dealer&&wss.secrets==expected.secrets
+                    &&wss.nonces==expected.nonces&&wss.mps==expected.mps).unwrap_or(false){return;}
+        }
+
         // Lazy-create the per-round CTRBCState so the detached
         // validation's apply path can find it when its result lands.
         if !self.round_state.contains_key(&round) {
@@ -946,7 +969,25 @@ impl Context {
         tokio::spawn(async move {
             let (validation_result, beacon_msg_back) =
                 tokio::task::spawn_blocking(move || {
-                    let result = avss_local_packet_valid_pure(
+                    let result = if let (Some(binding),Some(profile))=(main_binding,gf2_profile) {
+                        let result=(|| {
+                            if beacon_msg.origin!=dealer||beacon_msg.round!=round {
+                                return Err("SecMsg batch identity mismatch");
+                            }
+                            let wss=beacon_msg.wss.as_ref().ok_or("missing WSS payload")?;
+                            let public=types::beacon::AvssPublicCommitMsg::new(dealer,round,
+                                beacon_msg.root_vec.as_ref().ok_or("missing root vector")?.clone(),
+                                beacon_msg.degree_test_coeffs.as_ref().ok_or("missing h")?.clone());
+                            let payload=types::beacon::AvssRecipientPayload::new(wss.secrets.clone(),wss.nonces.clone(),
+                                beacon_msg.mask_shares.as_ref().ok_or("missing mask")?.clone(),
+                                beacon_msg.f_large_shares.clone(),wss.mps.clone());
+                            if super::share_pipeline::validate_original(&public,&payload,0,batch_size+super::context::PPT_COIN_RESERVE,
+                                myid,num_nodes,num_faults,&secret_domain,&nonce_domain,Some(profile),&hash_context,Some(&binding)) {
+                                Ok(())
+                            }else{Err("SecMsg batch/reserve degree check failed")}
+                        })();
+                        result
+                    }else{avss_local_packet_valid_pure(
                         &beacon_msg,
                         &transcript_root_owned,
                         dealer,
@@ -960,7 +1001,7 @@ impl Context {
                         crate::node::context::PPT_COIN_RESERVE,
                         myid,
                         gf2_profile,
-                    );
+                    )};
                     (result, beacon_msg)
                 })
                 .await
@@ -1022,12 +1063,9 @@ impl Context {
         match result {
             Ok(()) => {}
             Err(reason) => {
-                log::error!(
-                    "[PPT][AVSS-BAN] banning dealer {} for invalid AVSS packet \
-                     round {} reason={}",
-                    dealer, round, reason
-                );
-                self.ban_dealer_global(dealer);
+                log::warn!("[PPT][AWSS-UNHAPPY] dealer={} round={} reason={}; complaint waits for ACS selection", dealer, round, reason);
+                self.suspected_dealers.insert(dealer);
+                self.drive_awss_recovery(round, dealer).await;
                 return;
             }
         }
@@ -1053,42 +1091,20 @@ impl Context {
             rbc_state.add_avss_ready_vote(dealer, self.myid, transcript_root);
         }
 
-        // Phase F2 -- the AVSS validation cascade has now completed
-        // for (round, dealer): `store_avss_packet` copied every field
-        // we need into `CTRBCState` (root_vec, degree_test_coeffs,
-        // mask_shares, f_large_shares, BatchWSSMsg). The two
-        // SecMsgDst-side caches that fed us here -- the
-        // `AvssPublicCommitMsg` and the decrypted
-        // `AvssRecipientPayload` plaintext bytes -- are dead weight
-        // from this point on. Drop them immediately to keep memory
-        // proportional to "currently-being-validated rounds" rather
-        // than "all rounds waiting for end-of-round
-        // maybe_release_round". At batch=1000 / n=16 this frees on
-        // the order of 5 MB per round per node.
-        //
-        // Late duplicate AVSSPrivatePayload / AVSSSecMsgPublicCommit
-        // arriving for the same (round, dealer) after this point are
-        // dropped by the `avss_local_valid` guards added to
-        // `process_avss_private_payload` and
-        // `process_avss_secmsg_public_commit`, so the drop here is
-        // safe: nothing will re-allocate these entries.
-        self.avss_secmsg_public.remove(&(round, dealer));
-        self.avss_secmsg_delivered_bytes.remove(&(round, dealer));
+        // Preserve canonical public and transport evidence for selected recovery
+        // and the later batch audit. Cleanup is performed at the protocol boundary.
 
         let ready_msg = CoinMsg::AVSSReady(dealer, transcript_root, self.myid, round);
         self.broadcast(ready_msg, round).await;
 
-        if let Some(complete_root) = self.maybe_prepare_avss_complete(round, dealer) {
-            let complete_msg =
-                CoinMsg::AVSSComplete(dealer, complete_root, self.myid, round);
-            self.broadcast(complete_msg, round).await;
-            self.process_avss_complete(dealer, complete_root, self.myid, round)
-                .await;
+        self.refresh_awss_prepared(round, dealer).await;
+        if let Some(decided) = self.round_state.get(&round).and_then(|state| state.acs_decided_set.clone()) {
+            self.stash_coin_material(round, &decided);
+            self.acs_note_local_change(round + 1).await;
+            // A late honest payload is still an ORIGINAL authenticated share.
+            self.try_send_local_transform(round).await;
         }
-
-        if self.maybe_mark_dealer_completed(round, dealer) {
-            self.maybe_broadcast_acs_init_from_avss(round).await;
-        }
+        self.drive_awss_recovery(round, dealer).await;
 
         // This dealer's commitment vector (`comm_vectors`) is now
         // stored locally. If reconstruction for this round is already
@@ -1126,11 +1142,7 @@ impl Context {
             rbc_state.add_avss_ready_vote(dealer, sender, transcript_root);
         }
 
-        if let Some(complete_root) = self.maybe_prepare_avss_complete(round, dealer) {
-            let complete_msg = CoinMsg::AVSSComplete(dealer, complete_root, self.myid, round);
-            self.broadcast(complete_msg, round).await;
-            self.process_avss_complete(dealer, complete_root, self.myid, round).await;
-        }
+        self.refresh_awss_prepared(round, dealer).await;
     }
 
     #[async_recursion]
@@ -1160,15 +1172,7 @@ impl Context {
             rbc_state.add_avss_complete_vote(dealer, sender, transcript_root);
         }
 
-        if self.maybe_mark_dealer_completed(round, dealer) {
-            log::info!(
-                "[PPT][AVSS-COMPLETE] node {} round {} dealer {} marked completed",
-                self.myid,
-                round,
-                dealer
-            );
-            self.maybe_broadcast_acs_init_from_avss(round).await;
-        }
+        self.refresh_awss_prepared(round, dealer).await;
     }
 }
 
@@ -1196,7 +1200,8 @@ impl Context {
             round
         );
 
-        self.reconstruct_beacon(round, 0).await;
+        self.try_send_local_transform(round).await;
+        self.try_decode_transformed(round).await;
     }
 
     /// Called by the ACS driver once an `ACSInstanceState` has
@@ -1344,8 +1349,13 @@ impl Context {
         //     stable, agreed dealer set (= this round's decided set);
         //   - drop the coin state for this round and the material it
         //     consumed (round-1), now that this round's ACS is done.
+        self.start_selected_awss_recovery(round, decided_vec.as_slice()).await;
         self.stash_coin_material(round, decided_vec.as_slice());
+        for dealer in &decided_vec {self.install_reserved_material(round,*dealer).await;}
         self.cleanup_coin_state(round);
+        if round>0 {
+            for dealer in 0..self.num_nodes { self.release_reserve_if_safe(round-1,dealer); }
+        }
 
         self.start_reconstruction_after_acs(round, decided_vec.as_slice())
             .await;
@@ -1395,7 +1405,8 @@ impl Context {
 mod avss_binding_tests {
     use super::*;
     use crate::node::shamir::two_field::TwoFieldDealer;
-    use crypto::aes_hash::{HashState, MerkleTree};
+    use crypto::aes_hash::HashState;
+    use crate::node::merkle::MerkleTree;
     use num_bigint::RandBigInt;
     use rand::SeedableRng;
     use types::beacon::{BatchWSSMsg, BeaconMsg, Val};

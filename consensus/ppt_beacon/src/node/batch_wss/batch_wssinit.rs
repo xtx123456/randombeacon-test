@@ -2,7 +2,8 @@ use std::time::SystemTime;
 
 use async_recursion::async_recursion;
 use crypto::gf2::{Gf2Element, Gf2Profile};
-use crypto::{aes_hash::MerkleTree, hash::Hash};
+use crypto::hash::Hash;
+use crate::node::merkle::MerkleTree;
 use num_bigint::{BigUint, RandBigInt};
 use rand::Rng;
 use types::{
@@ -369,6 +370,7 @@ impl Context {
         // sealed coin-secrets (used by the NEXT round's ACS common
         // coin). They are dealt + validated identically to beacon
         // coins but live at coin indices [batch_size, total_coins).
+        // GF2 batches share ONE main mask; reserves remain individually masked.
         let total_coins = batch_size + crate::node::context::PPT_COIN_RESERVE;
         let low_r = BigUint::from(0u32);
 
@@ -397,6 +399,10 @@ impl Context {
         // (4) Compute h(x) = g(x) − θ·f(x) for every coin. (In char 2,
         //     i.e. the GF(2^w) profile, this is g(x) + θ·f(x); both
         //     forms are byte-equivalent.)
+        let main_batch = match &dealer {
+            DealerAdapter::Gf2 { dealer, .. } => Some(dealer.sample_batch(batch_size)),
+            _ => None,
+        };
         let mut coin_blobs: Vec<CoinPolyBlob> = Vec::with_capacity(total_coins);
         let mut mask_shares_per_node: Vec<Vec<Val>> = vec![Vec::with_capacity(total_coins); n];
         let mut f_large_per_node: Vec<Vec<Val>> = vec![Vec::with_capacity(total_coins); n];
@@ -405,8 +411,18 @@ impl Context {
         // Per-coin leaf hashes for the Merkle trees.
         let mut hashes_vec: Vec<Vec<Hash>> = Vec::with_capacity(total_coins);
 
-        for _ in 0..total_coins {
-            let (secret_shares, f_large_shares, mask_shares, blob) = dealer.sample_coin();
+        for coin in 0..total_coins {
+            let (secret_shares, f_large_shares, mask_shares, blob) = match &main_batch {
+                Some(batch) if coin < batch_size => {
+                    let secrets: Vec<Val> = batch.secrets.iter().map(|shares| *shares[coin].as_bytes()).collect();
+                    let masks = batch.mask_shares.iter().map(|value| *value.as_bytes()).collect();
+                    (secrets.clone(), secrets, masks, None)
+                }
+                _ => {
+                    let (secrets, lifted, masks, blob) = dealer.sample_coin();
+                    (secrets, lifted, masks, Some(blob))
+                }
+            };
 
             // Per-coin nonce: BigUint Shamir salt in BOTH modes
             // (nonces are commit-binding only, don't participate in
@@ -447,7 +463,7 @@ impl Context {
                 f_large_per_node[i].push(f_large);
             }
             hashes_vec.push(coin_leaves);
-            coin_blobs.push(blob);
+            if let Some(blob) = blob { coin_blobs.push(blob); }
         }
 
         let mt_vec = MerkleTree::build_trees(hashes_vec, &self.hash_context);
@@ -458,11 +474,24 @@ impl Context {
         //     its own canonicalisation inside `compute_h_bytes`.
         let theta_bytes = dealer.derive_theta_bytes(new_round, self.myid, &roots_vec);
 
-        // (4) Degree-test polynomial h per coin, under the bound θ.
-        let mut degree_test_batch: Vec<Vec<Val>> = Vec::with_capacity(total_coins);
-        for blob in &coin_blobs {
-            degree_test_batch.push(blob.compute_h_bytes(&theta_bytes, &dealer));
-        }
+        // Defer main theta/h until the SecMsg plaintext has been encrypted and
+        // encoded. The encrypted input contains no h, avoiding circularity.
+        let dealer_id=self.myid;
+        let profile=self.gf2_profile;
+        let make_public=|challenge_root:Option<&Hash>| {
+            let mut h=Vec::with_capacity(total_coins);
+            if let (Some(batch),Some(profile))=(&main_batch,profile) {
+                let theta=crate::node::batch_degree_test::challenges(new_round,dealer_id,
+                    &roots_vec,batch_size,n,faults,profile,challenge_root);
+                h.push(crate::node::batch_degree_test::response(&batch.f_polys,&batch.g_poly,&theta));
+            }
+            for blob in &coin_blobs{h.push(blob.compute_h_bytes(&theta_bytes,&dealer));}
+            assert_eq!(h.len(),if main_batch.is_some(){1+crate::node::context::PPT_COIN_RESERVE}else{total_coins});
+            log::info!("[PPT][DEGREE-TEST] round={} dealer={} mode={} R=1 main={} public_h={} reserves={} main_paths={}",
+                new_round,dealer_id,if main_batch.is_some(){"gf2-batched"}else{"prime-per-coin-comparison"},
+                batch_size,h.len(),crate::node::context::PPT_COIN_RESERVE,if challenge_root.is_some(){"secmsg-binding"}else{"per-coin"});
+            types::beacon::AvssPublicCommitMsg::new(dealer_id,new_round,roots_vec.clone(),h)
+        };
 
         // Assemble per-recipient BatchWSSMsg (f-share, nonce, proof).
         let mut vec_msgs_to_be_sent: Vec<(Replica, BatchWSSMsg)> = (0..n)
@@ -473,81 +502,19 @@ impl Context {
             for i in 0..n {
                 vec_msgs_to_be_sent[i].1.secrets.push(secret_per_node[i][coin]);
                 vec_msgs_to_be_sent[i].1.nonces.push(nonce_per_node[i][coin]);
-                vec_msgs_to_be_sent[i].1.mps.push(mt.gen_proof(i));
+                if self.gf2_profile.is_none()||self.transport!=crate::node::context::AvssTransport::SecMsg||coin>=batch_size {
+                    vec_msgs_to_be_sent[i].1.mps.push(mt.gen_proof(i));
+                }
             }
         }
 
         assert_eq!(roots_vec.len(), total_coins);
-        assert_eq!(degree_test_batch.len(), total_coins);
 
-        // ============================================================
-        // AVSS share-distribution dispatch.
-        //
-        // Step 1 (common to both transports): broadcast a single
-        // AvssPublicCommitMsg carrying root_vec + degree_test_coeffs
-        // + transcript-binding hash. Same wire payload regardless
-        // of transport; saves (n-1)x bytes vs the historical per-
-        // recipient duplication of these public fields.
-        //
-        // Step 2 (transport-specific): ship the per-recipient
-        // AvssRecipientPayload (secrets, nonces, mask_shares,
-        // f_large_shares, mps) to every other node. Two transports:
-        //
-        //   * AvssTransport::Lite (default): single AVSSPrivatePayload
-        //     unicast per recipient. O(n) wire messages per dealer
-        //     per round. Wire-layer confidentiality is provided by
-        //     the existing WrapperMsg HMAC + (typically) TLS, plus
-        //     the PPT-design observation that the post-ACS
-        //     MulticastRecoveredShares phase reveals these same
-        //     share bytes in cleartext anyway -- so application-
-        //     layer encryption only delays the leak by a few
-        //     hundred milliseconds and does not change any
-        //     adversary's information set in the steady-state PPT
-        //     beacon protocol.
-        //
-        //   * AvssTransport::SecMsg: full Shoup-Smart 2024 Sec 4.3
-        //     Pi_SecMsgDst dispersal (Shamir-shared master key +
-        //     per-recipient hash-chain PRG + RBC-style key &
-        //     cipher channels with Bracha echo / vote). O(n^2)
-        //     wire messages per dealer per round. Suitable for
-        //     paper-compliance benchmarks and for deployments
-        //     that cannot rely on wire-layer confidentiality.
-        //
-        // Step 3 (common): the receiver's try_finalize_avss_secmsg
-        // reconstructs an equivalent-shaped BeaconMsg and feeds it
-        // into the same process_avss_send pipeline the legacy
-        // cleartext AVSSSend path used. Every P0/P1/Level fix
-        // (theta buffering, banned_dealers, spawn_blocking,
-        // audit fire-and-forget, coin-0 fast-path) remains in
-        // force regardless of which transport delivered the bytes.
-        //
-        // appx_con is empty (Vec::new()) on the pure-PPT path
-        // (see vec_round_msgs above) so the BeaconMsg
-        // reconstruction on the receiver side does not need the
-        // dealer to ship appx_con explicitly.
-        // ============================================================
+        // Both share transports require private authenticated channels. Lite
+        // sends recipient bytes directly; SecMsg also commits/disperses encrypted
+        // payloads and high-entropy keys. Disclosure is delayed until the protocol
+        // permits it; later batch auditing never justifies early plaintext leaks.
         let _ = vec_round_msgs;
-
-        // ----- Step 1: shared public commit broadcast -----
-        let public_commit = types::beacon::AvssPublicCommitMsg::new(
-            self.myid,
-            new_round,
-            roots_vec.clone(),
-            degree_test_batch.clone(),
-        );
-        let public_commit_for_self = public_commit.clone();
-        self.broadcast(
-            CoinMsg::AVSSSecMsgPublicCommit(public_commit),
-            new_round,
-        )
-        .await;
-        // Broadcast skips self; deliver our own commit synchronously.
-        // wire_sender on the self-deliver path equals self.myid
-        // (== public_commit.origin), so the sender-binding check
-        // inside `process_avss_secmsg_public_commit` passes.
-        let myid = self.myid;
-        self.process_avss_secmsg_public_commit(public_commit_for_self, myid)
-            .await;
 
         // ----- Step 2: build per-recipient AvssRecipientPayload byte vectors -----
         // The ordering matches the SecMsgDst recipient_idx convention
@@ -576,13 +543,18 @@ impl Context {
                 f_large_opt,
                 batchwss.mps,
             );
-            recipient_payload_bytes.push(payload.serialize_bytes());
+            recipient_payload_bytes.push(crate::node::batch_degree_test::encode_payload(
+                &payload, self.gf2_profile, batch_size, 0).expect("canonical dealer batch payload"));
         }
         debug_assert_eq!(recipient_payload_bytes.len(), self.num_nodes);
 
         // ----- Step 3: transport-specific dispatch -----
         match self.transport {
             crate::node::context::AvssTransport::Lite => {
+                let public_commit=make_public(None);
+                self.start_public_rbc(crate::node::wire::PublicBundle {
+                    version: 3, challenge_root: None,
+                    public: public_commit.clone(), secmsg_roots: None, reserve_roots: None }).await;
                 log::info!(
                     "[PPT][AVSS-LITE] node {} dispatching {} per-recipient \
                      AVSSPrivatePayload unicasts for round {} (transport=lite)",
@@ -623,8 +595,7 @@ impl Context {
                             &sec_key,
                             new_round,
                         );
-                        let cancel = self.net_send.send(recipient, wrapper).await;
-                        self.add_cancel_handler(cancel);
+                        self.send(recipient, wrapper).await;
                     }
                 }
             }
@@ -635,27 +606,49 @@ impl Context {
                     self.myid,
                     new_round
                 );
+                // Audit opens the beacon key vector. A separate SecMsg instance
+                // keeps next-round coin reserves sealed under independent keys.
+                let mut beacon_payloads=Vec::with_capacity(n);
+                let mut reserve_payloads=Vec::with_capacity(n);
+                for bytes in recipient_payload_bytes {
+                    let payload=crate::node::batch_degree_test::decode_payload(&bytes,self.gf2_profile,batch_size,0).expect("dealer's canonical payload");
+                    let beacon=crate::node::share_pipeline::slice_payload(&payload,0,batch_size,batch_size).expect("beacon slice");
+                    beacon_payloads.push(crate::node::batch_degree_test::encode_payload(&beacon,self.gf2_profile,batch_size,0).expect("canonical beacon slice"));
+                    reserve_payloads.push(crate::node::share_pipeline::slice_payload(&payload,batch_size,crate::node::context::PPT_COIN_RESERVE,batch_size).expect("reserve slice").serialize_bytes());
+                }
                 let actions = {
                     let secmsg_state =
                         self.get_or_init_avss_secmsg(new_round, self.myid);
                     let mut rng = rand::thread_rng();
                     secmsg_state
-                        .set_input_as_sender(recipient_payload_bytes, &mut rng)
+                        .set_input_as_sender(beacon_payloads, &mut rng)
                         .expect(
                             "[PPT][SECMSG-AVSS] dealer set_input_as_sender failed -- \
                              this should be impossible on the live path \
                              (only fails on degenerate prime/n/t configs)",
                         )
                 };
-                self.dispatch_avss_secmsg_actions(new_round, self.myid, actions)
-                    .await;
+                let roots = self.avss_secmsg_state.get(&(new_round, self.myid))
+                    .and_then(|state| state.commitment_roots()).expect("sender committed both SecMsg vectors");
+                let reserve_actions={
+                    let state=self.get_or_init_reserve(new_round,self.myid);
+                    state.set_input_as_sender(reserve_payloads,&mut rand::thread_rng()).expect("reserve SecMsg input")
+                };
+                let reserve_roots=self.reserve_state.get(&(new_round,self.myid)).and_then(|s|s.commitment_roots()).expect("reserve commitments");
+                let challenge_root=self.gf2_profile.map(|profile|crate::node::batch_degree_test::secmsg_input_root(
+                    new_round,self.myid,&roots_vec,roots,batch_size,n,faults,profile));
+                let public_commit=make_public(challenge_root.as_ref());
+                self.start_public_rbc(crate::node::wire::PublicBundle {
+                    version: 3, challenge_root,
+                    public: public_commit, secmsg_roots: Some(roots), reserve_roots: Some(reserve_roots) }).await;
+                self.dispatch_avss_secmsg_actions(new_round, self.myid, actions).await;
+                self.dispatch_reserve_actions(new_round,self.myid,reserve_actions).await;
             }
         }
 
         // Suppress unused-binding warnings for the local variables
         // that the lite path's match-arm closure moves out of scope.
         let _ = roots_vec;
-        let _ = degree_test_batch;
         let _ = mask_shares_per_node;
         let _ = f_large_per_node;
         // Keep the legacy-path types referenced via PhantomData

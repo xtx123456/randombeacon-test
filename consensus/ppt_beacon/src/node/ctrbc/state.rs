@@ -92,12 +92,14 @@ pub struct CTRBCState {
     /// Dealers we have already broadcast `AVSSComplete` for.
     pub avss_complete_sent: HashSet<Replica, nohash_hasher::BuildNoHashHasher<Replica>>,
 
-    /// Dealers whose AVSS instance has completed locally and can be
-    /// fed into ACS (the ACS driver also re-checks `Context::banned_dealers`).
+    /// Dealers with public AWSS preparation certificates (at least f+1
+    /// honest happy holders), independent of this node's private delivery.
+    /// Can be fed into ACS (the ACS driver also re-checks `Context::banned_dealers`).
     pub avss_completed_dealers: HashSet<Replica, nohash_hasher::BuildNoHashHasher<Replica>>,
 
     // ---- Two-field per-dealer side data ----
-    /// `degree_test_coeffs[dealer][coin] = h(x) coefficients`.
+    /// GF2: `[dealer][0]` is the main-batch h; `[dealer][1+r]` is
+    /// sealed reserve r's h. Prime comparison: one h per coin.
     pub degree_test_coeffs:
         HashMap<Replica, Vec<Vec<Val>>, nohash_hasher::BuildNoHashHasher<Replica>>,
     /// `mask_shares[dealer][coin] = g(i) mod q` (one per coin).
@@ -130,8 +132,8 @@ pub struct CTRBCState {
     /// matrix for the immutable ACS-decided set. Built once per round
     /// by `finalize_acs_round` over `alpha = sorted(decided)+1` with
     /// `num_outputs = |decided| - f`. Used by `coin_check` to extract
-    /// `|decided| - f` independent beacon values per coin column,
-    /// replacing the degenerate all-ones sum.
+    /// `|decided| - f` local OUTPUT SHARES per coin column. The live path
+    /// applies it before OEC, never after recovering each dealer's f(0).
     pub super_inv_extractor: Option<SuperInvExtractor>,
     /// GF(2^w) sibling of `super_inv_extractor`. Populated by
     /// `finalize_acs_round` instead of the BigUint variant when the
@@ -289,7 +291,7 @@ impl CTRBCState {
         self.avss_ready_votes
             .entry(dealer)
             .or_default()
-            .insert(sender, transcript_root);
+            .entry(sender).or_insert(transcript_root);
     }
 
     pub fn add_avss_complete_vote(
@@ -301,7 +303,7 @@ impl CTRBCState {
         self.avss_complete_votes
             .entry(dealer)
             .or_default()
-            .insert(sender, transcript_root);
+            .entry(sender).or_insert(transcript_root);
     }
 
     pub fn matching_avss_ready_count(&self, dealer: Replica) -> usize {

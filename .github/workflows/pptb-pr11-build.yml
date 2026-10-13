@@ -1,0 +1,21 @@
+name: PPTB PR11 build
+
+on:
+  push:
+    branches:
+      - fix/pptb-awss-recovery-rbc
+
+permissions:
+  contents: read
+
+jobs:
+  release-build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.65
+        run: |
+          rustup toolchain install 1.65.0 --profile minimal
+          rustup default 1.65.0
+      - name: Build workspace
+        run: cargo build --release

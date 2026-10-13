@@ -20,6 +20,16 @@ pub use ctrbc::*;
 
 pub mod acs;
 pub mod coin_mapper;
+pub mod options;
+mod wire;
+mod public_rbc;
+mod awss_recovery;
+mod oec;
+mod share_pipeline;
+mod batch_degree_test;
+mod full_audit;
+mod reserve_transport;
+mod merkle;
 pub mod shoup_smart;
 
 mod avss_secmsg;
