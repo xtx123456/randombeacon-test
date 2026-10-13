@@ -58,6 +58,47 @@ pub struct CoinMaterial {
 
 const COIN_SECRET_DOMAIN: &[u8] = b"PPT_ACS_COIN_SECRET_v1::";
 
+/// Merge freshly derived coin material into round `round`'s entry,
+/// creating it when absent. Returns `Some(true)` when at least one
+/// dealer's sealed shares became newly available, or `None` when
+/// `decided` disagrees with the set the entry was created for.
+///
+/// Merging rather than replacing is load-bearing: `my_shares` can also
+/// be filled by `install_reserved_material` from the independently
+/// delivered reserve transport, and `stash_coin_material` re-runs on
+/// every AVSS packet that finishes validating after the ACS decision.
+/// A replacing store would drop those installed shares and leave the
+/// node unable to build its own `ACSCoinReveal`.
+pub(crate) fn merge_coin_material<S: std::hash::BuildHasher>(
+    store: &mut HashMap<Round, CoinMaterial, S>,
+    round: Round,
+    decided: &[Replica],
+    roots: HashMap<Replica, Vec<Hash>>,
+    my_shares: HashMap<Replica, Vec<(Val, Val, Val, Val, Proof)>>,
+) -> Option<bool> {
+    let material = store.entry(round).or_insert_with(|| CoinMaterial {
+        decided: decided.to_vec(),
+        roots: HashMap::new(),
+        my_shares: HashMap::new(),
+    });
+    if material.decided.as_slice() != decided {
+        return None;
+    }
+    for (dealer, dealer_roots) in roots {
+        material.roots.entry(dealer).or_insert(dealer_roots);
+    }
+    let mut added_shares = false;
+    for (dealer, dealer_shares) in my_shares {
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            material.my_shares.entry(dealer)
+        {
+            entry.insert(dealer_shares);
+            added_shares = true;
+        }
+    }
+    Some(added_shares)
+}
+
 /// Derive ABA instance `j`'s coin bit from the reconstructed common
 /// coin secret `C` for an ABA round. All honest nodes hold the same
 /// `C` (it is the sum of fixed shared secrets), so the per-instance
@@ -198,32 +239,23 @@ impl Context {
             }
         }
 
-        // Late AVSS validation must preserve shares already installed
-        // from the independently delivered reserve transport.
-        let material = self.coin_material.entry(round).or_insert_with(|| CoinMaterial {
-            decided: decided.to_vec(),
-            roots: HashMap::new(),
-            my_shares: HashMap::new(),
-        });
-        if material.decided.as_slice() != decided {
-            log::error!(
-                "[PPT][COIN] refusing changed decided set for round {}",
-                round
-            );
-            return;
-        }
-        for (dealer, dealer_roots) in roots {
-            material.roots.entry(dealer).or_insert(dealer_roots);
-        }
-        let mut added_shares = false;
-        for (dealer, dealer_shares) in my_shares {
-            if let std::collections::hash_map::Entry::Vacant(entry) =
-                material.my_shares.entry(dealer)
-            {
-                entry.insert(dealer_shares);
-                added_shares = true;
+        let added_shares = match merge_coin_material(
+            &mut self.coin_material,
+            round,
+            decided,
+            roots,
+            my_shares,
+        ) {
+            Some(added) => added,
+            None => {
+                log::error!(
+                    "[PPT][COIN] refusing changed decided set for round {}",
+                    round
+                );
+                return;
             }
-        }
+        };
+        let material = &self.coin_material[&round];
         log::debug!(
             "[PPT][COIN] node {} stashed coin material for round {} ({} dealers with roots, {} with my-shares)",
             self.myid,
@@ -678,6 +710,121 @@ pub fn coin_bit_from_seed(seed: &[u8], aba_instance_id: usize, aba_round: u64) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sealed_shares(tag: u8) -> Vec<(Val, Val, Val, Val, Proof)> {
+        (0..PPT_COIN_RESERVE)
+            .map(|rr| {
+                let mut value = [0u8; 32];
+                value[0] = tag;
+                value[1] = rr as u8;
+                (
+                    value,
+                    value,
+                    value,
+                    value,
+                    Proof::new(vec![value], vec![true]),
+                )
+            })
+            .collect()
+    }
+
+    /// Regression: `stash_coin_material` re-runs for every AVSS packet
+    /// that finishes validating after the ACS decision, and in GF2 mode
+    /// an early run can legitimately derive no sealed shares at all. A
+    /// replacing store dropped the shares that `install_reserved_material`
+    /// had already put in place, after which nothing reinstalled them and
+    /// the node could no longer build its own `ACSCoinReveal`.
+    #[test]
+    fn late_stash_preserves_installed_reserve_shares() {
+        let mut store: HashMap<Round, CoinMaterial> = HashMap::new();
+        let decided = vec![0usize, 1, 2];
+
+        // Reserve transport installs dealer 1's sealed shares.
+        let mut installed = HashMap::new();
+        installed.insert(1usize, sealed_shares(0xAA));
+        assert_eq!(
+            merge_coin_material(&mut store, 4, &decided, HashMap::new(), installed),
+            Some(true)
+        );
+
+        // A late AVSS validation re-stashes with nothing to contribute.
+        assert_eq!(
+            merge_coin_material(&mut store, 4, &decided, HashMap::new(), HashMap::new()),
+            Some(false)
+        );
+
+        let material = &store[&4];
+        assert!(
+            material.my_shares.contains_key(&1),
+            "late stash dropped the installed reserve shares"
+        );
+        assert_eq!(material.my_shares[&1].len(), PPT_COIN_RESERVE);
+        assert_eq!(material.my_shares[&1][0].0[0], 0xAA);
+    }
+
+    /// A dealer whose shares arrive later must be added without
+    /// disturbing the dealers already present, and the caller must be
+    /// told so it can re-drive the next round's reveal.
+    #[test]
+    fn merge_adds_newly_available_dealer_without_clobbering() {
+        let mut store: HashMap<Round, CoinMaterial> = HashMap::new();
+        let decided = vec![0usize, 1, 2];
+
+        let mut first = HashMap::new();
+        first.insert(1usize, sealed_shares(0xAA));
+        merge_coin_material(&mut store, 4, &decided, HashMap::new(), first).unwrap();
+
+        // Dealer 1 is re-derived (same slot, different bytes) alongside
+        // a genuinely new dealer 2. The incumbent must win.
+        let mut second = HashMap::new();
+        second.insert(1usize, sealed_shares(0xBB));
+        second.insert(2usize, sealed_shares(0xCC));
+        assert_eq!(
+            merge_coin_material(&mut store, 4, &decided, HashMap::new(), second),
+            Some(true)
+        );
+
+        let material = &store[&4];
+        assert_eq!(material.my_shares.len(), 2);
+        assert_eq!(material.my_shares[&1][0].0[0], 0xAA);
+        assert_eq!(material.my_shares[&2][0].0[0], 0xCC);
+    }
+
+    /// Roots merge per dealer and the first recorded vector is kept, so
+    /// a later run cannot repoint a sealed coin at a different root.
+    #[test]
+    fn merge_keeps_first_roots_per_dealer() {
+        let mut store: HashMap<Round, CoinMaterial> = HashMap::new();
+        let decided = vec![0usize, 1];
+
+        let mut first = HashMap::new();
+        first.insert(0usize, vec![[1u8; 32]; PPT_COIN_RESERVE]);
+        merge_coin_material(&mut store, 7, &decided, first, HashMap::new()).unwrap();
+
+        let mut second = HashMap::new();
+        second.insert(0usize, vec![[9u8; 32]; PPT_COIN_RESERVE]);
+        second.insert(1usize, vec![[2u8; 32]; PPT_COIN_RESERVE]);
+        merge_coin_material(&mut store, 7, &decided, second, HashMap::new()).unwrap();
+
+        let material = &store[&7];
+        assert_eq!(material.roots[&0][0], [1u8; 32]);
+        assert_eq!(material.roots[&1][0], [2u8; 32]);
+    }
+
+    /// The decided set is what round `round + 1`'s coin reconstruction
+    /// agrees on, so a run carrying a different set must be refused
+    /// rather than silently merged into the existing entry.
+    #[test]
+    fn merge_refuses_changed_decided_set() {
+        let mut store: HashMap<Round, CoinMaterial> = HashMap::new();
+        merge_coin_material(&mut store, 4, &[0usize, 1, 2], HashMap::new(), HashMap::new())
+            .unwrap();
+        assert_eq!(
+            merge_coin_material(&mut store, 4, &[0usize, 1, 3], HashMap::new(), HashMap::new()),
+            None
+        );
+        assert_eq!(store[&4].decided, vec![0usize, 1, 2]);
+    }
 
     #[test]
     fn genesis_coin_is_deterministic_per_instance_and_round() {
