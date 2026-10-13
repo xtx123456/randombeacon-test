@@ -70,8 +70,18 @@
 //! arithmetic, not to claim a protocol-level comparison.
 
 use std::env;
-use std::hint::black_box;
 use std::time::Instant;
+
+// std::hint::black_box became stable in Rust 1.66. Keep this standalone
+// benchmark usable with the older toolchain used by the node deployments.
+#[inline(always)]
+fn black_box<T>(value: T) -> T {
+    unsafe {
+        let result = std::ptr::read_volatile(&value);
+        std::mem::forget(value);
+        result
+    }
+}
 
 use num_bigint::{BigUint, RandBigInt};
 
