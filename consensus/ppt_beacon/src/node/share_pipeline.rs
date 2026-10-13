@@ -38,10 +38,21 @@ pub(crate) fn validate_original(public:&AvssPublicCommitMsg,p:&AvssRecipientPayl
     offset:usize,len:usize,source:Replica,n:usize,f:usize,small:&BigUint,large:&BigUint,
     profile:Option<Gf2Profile>,_hash:&HashState)->bool {
     if source>=n||p.secrets.len()!=len||p.nonces.len()!=len||p.mask_shares.len()!=len||p.mps.len()!=len
-        ||offset.checked_add(len).map(|end|end>public.root_vec.len()||end>public.degree_test_coeffs.len()).unwrap_or(true)
+        ||offset.checked_add(len).map(|end|end>public.root_vec.len()
+            ||(profile.is_none()&&end>public.degree_test_coeffs.len())).unwrap_or(true)
         || match (profile,&p.f_large_shares){(Some(_),None)=>false,(None,Some(v))=>v.len()!=len,_=>true}{return false;}
     // Sharing, transport and rebuilding use the same PPTB SHA-256 rule.
     if !crate::node::merkle::validate_batch(&p.mps){return false;}
+    if let Some(profile)=profile {
+        let batch=match public.root_vec.len().checked_sub(super::context::PPT_COIN_RESERVE){Some(b) if b>0=>b,_=>return false};
+        for i in 0..len {
+            let proof=&p.mps[i];
+            if !proof.matches_leaf(source,n)||proof.root()!=public.root_vec[offset+i]
+                ||BigUint::from_bytes_be(&p.nonces[i])>=*large
+                ||proof.item()!=types::beacon::avss_commit_leaf_gf2(&p.secrets[i],&p.mask_shares[i],&p.nonces[i]){return false;}
+        }
+        return super::batch_degree_test::verify_values(public,&p.secrets,&p.mask_shares,offset,batch,source,n,f,profile);
+    }
     let theta=Context::theta_from_commitment(public.round,public.origin,&public.root_vec,large);
     let binary=profile.and_then(|p|super::shamir::gf2_two_field::Gf2TwoFieldDealer::new(p,f+1,n).ok());
     let binary_theta=profile.map(|p|Context::theta_from_commitment_gf2(public.round,public.origin,&public.root_vec,p));
@@ -76,7 +87,7 @@ pub(crate) fn validate_original(public:&AvssPublicCommitMsg,p:&AvssRecipientPayl
 impl Context {
     pub(crate) fn original_beacon_payload(&self,round:Round,dealer:Replica)->Option<AvssRecipientPayload> {
         if let Some(bytes)=self.avss_beacon_bytes.get(&(round,dealer)) {
-            let p=AvssRecipientPayload::deserialize_bytes(bytes)?;
+            let p=super::batch_degree_test::decode_payload(bytes,self.gf2_profile,self.batch_size,0)?;
             let public=self.avss_secmsg_public.get(&(round,dealer))?;
             if validate_original(public,&p,0,self.batch_size,self.myid,self.num_nodes,self.num_faults,
                 &self.secret_domain,&self.nonce_domain,self.gf2_profile,&self.hash_context){return Some(p);}return None;

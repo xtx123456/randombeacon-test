@@ -31,6 +31,44 @@ configuration and benchmark defaults.
 
 ## Arithmetic and OEC
 
+### R=1 main-batch degree test
+
+The live GF2 path now samples B small-field f polynomials and ONE independent
+large-field g polynomial. After committing every recipient's f/g/nonce data,
+it derives one domain-separated challenge coefficient theta_l per input and
+broadcasts a single h = g + sum_l theta_l*f_l (minus equals plus in GF2).
+Recipients authenticate all original points, enforce base/extension membership
+and the exact f+1 coefficient bound, then verify the complete batch identity.
+A proper subset of main inputs cannot pass as a complete batch. Complaint
+recovery rechecks the same identity at the recovering recipient's point.
+
+Challenge inputs bind the round, dealer, field widths, B, n, f, the complete
+root vector and coefficient position. This retains a commitment-hash challenge
+approach, adapted to a coefficient vector. It is not a full implementation or
+adaptive/QROM proof of JoC section 7, and it does not change ACS coin bootstrap.
+R remains exactly 1; field widths and target128 configuration gates are unchanged.
+
+The main private payload encodes only one 32-byte mask share. Internal state
+expands it into a repeated per-coin view for existing bookkeeping; that view is
+not the encrypted transport encoding. Audit decodes/re-evaluates the shared mask
+once and rebuilds the identical compact plaintext, ciphertext and Merkle roots.
+Existing per-coin nonce shares, share roots and Merkle proofs are retained.
+
+The 12 sealed reserve coins KEEP independent masks and individual h responses,
+in their independently keyed SecMsg instance. Main audit must not reveal a mask
+relation involving a sealed reserve. Public h layout in GF2 is therefore
+[main_h, reserve_h_0, ..., reserve_h_11], not one h over all B+12 inputs.
+Prime-field comparisons retain per-coin h/masks; they have no extension-field
+soundness claim. The PPT-only PublicBundle version is now 2; all PPT nodes must
+update together. Shared BEA/HashRand messages and implementation are unchanged.
+
+At n=16, f=5, B=1000, raw public h coefficients fall from 194304 bytes to
+2496 bytes per dealer (including the 12 reserves). Main private mask values
+fall from 32000 bytes to 32 bytes per recipient. These are payload counts,
+not measured network traffic or throughput; RBC/SecMsg, proofs, metadata,
+complaints, ACS and audit costs remain. Retained per-coin proofs prevent this
+change alone from establishing a strict O(n) total amortized communication bound.
+
 The matrix uses sorted dealer IDs+1 as input points and the next m-f distinct
 points as output points. All recipients use identical input order/dimensions.
 GF2 matrices and output reconstruction use GF(2^w_p); large-field mask evaluation
@@ -72,8 +110,9 @@ vectors even if a Byzantine recipient withholds its key/plaintext. Bad row proof
 are rejected as provider evidence. Valid fragments that fail ORIGINAL codeword
 rebuilding prove a bad dealer; missing fragments merely cause waiting.
 
-For every beacon coin, audit OEC recovers f, g, nonce and (in the prime comparison)
-large-field f, then re-evaluates all n points. Rebuild each share tree, generate
+For every beacon coin, audit OEC recovers f, nonce and (in the prime comparison)
+large-field f, then re-evaluates all n points. GF2 audit recovers the ONE main
+g polynomial once; the prime comparison retains per-coin g. Rebuild each share tree, generate
 its original point paths, serialize the original bincode recipient layout,
 encrypt with the reconstructed actual key share and apply the original RS
 encoding/tree shape. Rebuild the key polynomial, canonical key encoding and both

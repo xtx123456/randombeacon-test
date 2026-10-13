@@ -19,6 +19,8 @@ pub(crate) enum ForwardTag { Complaint, Assist, Report }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PublicBundle {
+    /// Version 2 uses one GF2 main-batch h and a compact main mask.
+    pub version: u16,
     pub public: types::beacon::AvssPublicCommitMsg,
     /// Exact roots of the SecMsg key/cipher vectors. None for Lite comparisons.
     pub secmsg_roots: Option<(Hash, Hash)>,

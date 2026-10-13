@@ -370,6 +370,7 @@ impl Context {
         // sealed coin-secrets (used by the NEXT round's ACS common
         // coin). They are dealt + validated identically to beacon
         // coins but live at coin indices [batch_size, total_coins).
+        // GF2 batches share ONE main mask; reserves remain individually masked.
         let total_coins = batch_size + crate::node::context::PPT_COIN_RESERVE;
         let low_r = BigUint::from(0u32);
 
@@ -398,6 +399,10 @@ impl Context {
         // (4) Compute h(x) = g(x) − θ·f(x) for every coin. (In char 2,
         //     i.e. the GF(2^w) profile, this is g(x) + θ·f(x); both
         //     forms are byte-equivalent.)
+        let main_batch = match &dealer {
+            DealerAdapter::Gf2 { dealer, .. } => Some(dealer.sample_batch(batch_size)),
+            _ => None,
+        };
         let mut coin_blobs: Vec<CoinPolyBlob> = Vec::with_capacity(total_coins);
         let mut mask_shares_per_node: Vec<Vec<Val>> = vec![Vec::with_capacity(total_coins); n];
         let mut f_large_per_node: Vec<Vec<Val>> = vec![Vec::with_capacity(total_coins); n];
@@ -406,8 +411,18 @@ impl Context {
         // Per-coin leaf hashes for the Merkle trees.
         let mut hashes_vec: Vec<Vec<Hash>> = Vec::with_capacity(total_coins);
 
-        for _ in 0..total_coins {
-            let (secret_shares, f_large_shares, mask_shares, blob) = dealer.sample_coin();
+        for coin in 0..total_coins {
+            let (secret_shares, f_large_shares, mask_shares, blob) = match &main_batch {
+                Some(batch) if coin < batch_size => {
+                    let secrets: Vec<Val> = batch.secrets.iter().map(|shares| *shares[coin].as_bytes()).collect();
+                    let masks = batch.mask_shares.iter().map(|value| *value.as_bytes()).collect();
+                    (secrets.clone(), secrets, masks, None)
+                }
+                _ => {
+                    let (secrets, lifted, masks, blob) = dealer.sample_coin();
+                    (secrets, lifted, masks, Some(blob))
+                }
+            };
 
             // Per-coin nonce: BigUint Shamir salt in BOTH modes
             // (nonces are commit-binding only, don't participate in
@@ -448,7 +463,7 @@ impl Context {
                 f_large_per_node[i].push(f_large);
             }
             hashes_vec.push(coin_leaves);
-            coin_blobs.push(blob);
+            if let Some(blob) = blob { coin_blobs.push(blob); }
         }
 
         let mt_vec = MerkleTree::build_trees(hashes_vec, &self.hash_context);
@@ -459,8 +474,15 @@ impl Context {
         //     its own canonicalisation inside `compute_h_bytes`.
         let theta_bytes = dealer.derive_theta_bytes(new_round, self.myid, &roots_vec);
 
-        // (4) Degree-test polynomial h per coin, under the bound θ.
+        // (4) One R=1 response for the GF2 main batch, followed by independently
+        // masked per-coin reserve responses. Prime-field comparisons keep the
+        // legacy per-coin layout. All sharing material is committed above.
         let mut degree_test_batch: Vec<Vec<Val>> = Vec::with_capacity(total_coins);
+        if let (Some(batch), Some(profile)) = (&main_batch, self.gf2_profile) {
+            let theta = crate::node::batch_degree_test::challenges(new_round, self.myid,
+                &roots_vec, batch_size, n, faults, profile);
+            degree_test_batch.push(crate::node::batch_degree_test::response(&batch.f_polys, &batch.g_poly, &theta));
+        }
         for blob in &coin_blobs {
             degree_test_batch.push(blob.compute_h_bytes(&theta_bytes, &dealer));
         }
@@ -479,7 +501,12 @@ impl Context {
         }
 
         assert_eq!(roots_vec.len(), total_coins);
-        assert_eq!(degree_test_batch.len(), total_coins);
+        assert_eq!(degree_test_batch.len(), if main_batch.is_some() {
+            1 + crate::node::context::PPT_COIN_RESERVE
+        } else { total_coins });
+        log::info!("[PPT][DEGREE-TEST] round={} dealer={} mode={} R=1 main={} public_h={} reserves={}",
+            new_round, self.myid, if main_batch.is_some() { "gf2-batched" } else { "prime-per-coin-comparison" },
+            batch_size, degree_test_batch.len(), crate::node::context::PPT_COIN_RESERVE);
 
         // Both share transports require private authenticated channels. Lite
         // sends recipient bytes directly; SecMsg also commits/disperses encrypted
@@ -521,7 +548,8 @@ impl Context {
                 f_large_opt,
                 batchwss.mps,
             );
-            recipient_payload_bytes.push(payload.serialize_bytes());
+            recipient_payload_bytes.push(crate::node::batch_degree_test::encode_payload(
+                &payload, self.gf2_profile, batch_size, 0).expect("canonical dealer batch payload"));
         }
         debug_assert_eq!(recipient_payload_bytes.len(), self.num_nodes);
 
@@ -529,6 +557,7 @@ impl Context {
         match self.transport {
             crate::node::context::AvssTransport::Lite => {
                 self.start_public_rbc(crate::node::wire::PublicBundle {
+                    version: 2,
                     public: public_commit.clone(), secmsg_roots: None, reserve_roots: None }).await;
                 log::info!(
                     "[PPT][AVSS-LITE] node {} dispatching {} per-recipient \
@@ -586,8 +615,9 @@ impl Context {
                 let mut beacon_payloads=Vec::with_capacity(n);
                 let mut reserve_payloads=Vec::with_capacity(n);
                 for bytes in recipient_payload_bytes {
-                    let payload=types::beacon::AvssRecipientPayload::deserialize_bytes(&bytes).expect("dealer's canonical payload");
-                    beacon_payloads.push(crate::node::share_pipeline::slice_payload(&payload,0,batch_size).expect("beacon slice").serialize_bytes());
+                    let payload=crate::node::batch_degree_test::decode_payload(&bytes,self.gf2_profile,batch_size,0).expect("dealer's canonical payload");
+                    let beacon=crate::node::share_pipeline::slice_payload(&payload,0,batch_size).expect("beacon slice");
+                    beacon_payloads.push(crate::node::batch_degree_test::encode_payload(&beacon,self.gf2_profile,batch_size,0).expect("canonical beacon slice"));
                     reserve_payloads.push(crate::node::share_pipeline::slice_payload(&payload,batch_size,crate::node::context::PPT_COIN_RESERVE).expect("reserve slice").serialize_bytes());
                 }
                 let actions = {
@@ -610,6 +640,7 @@ impl Context {
                 };
                 let reserve_roots=self.reserve_state.get(&(new_round,self.myid)).and_then(|s|s.commitment_roots()).expect("reserve commitments");
                 self.start_public_rbc(crate::node::wire::PublicBundle {
+                    version: 2,
                     public: public_commit, secmsg_roots: Some(roots), reserve_roots: Some(reserve_roots) }).await;
                 self.dispatch_avss_secmsg_actions(new_round, self.myid, actions).await;
                 self.dispatch_reserve_actions(new_round,self.myid,reserve_actions).await;

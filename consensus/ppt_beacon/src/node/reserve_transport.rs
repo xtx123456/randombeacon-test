@@ -4,7 +4,6 @@ use std::collections::HashSet;
 use async_recursion::async_recursion;
 use num_bigint::BigUint;
 use types::{Replica,Round};
-use types::beacon::AvssRecipientPayload;
 use super::{Context,wire::{self,PptWire,RmdPacket},shoup_smart::sec_msg_dst::{SecMsgDstState,SecMsgDstAction,SecMsgChannel}};
 
 #[derive(Default)]
@@ -101,7 +100,7 @@ impl Context {
     pub(crate) async fn install_reserved_material(&mut self,round:Round,dealer:Replica) {
         let material=match self.coin_material.get(&round){Some(m) if m.decided.contains(&dealer)&&!m.my_shares.contains_key(&dealer)=>m,_=>return};
         let _=material;
-        let payload=match self.reserve_bytes.get(&(round,dealer)).and_then(|b|AvssRecipientPayload::deserialize_bytes(b)){Some(p)=>p,None=>return};
+        let payload=match self.reserve_bytes.get(&(round,dealer)).and_then(|b|super::batch_degree_test::decode_payload(b,self.gf2_profile,self.batch_size,self.batch_size)){Some(p)=>p,None=>return};
         let public=match self.avss_secmsg_public.get(&(round,dealer)){Some(p)=>p,None=>return};
         let count=super::context::PPT_COIN_RESERVE;
         if !super::share_pipeline::validate_original(public,&payload,self.batch_size,count,self.myid,self.num_nodes,self.num_faults,
@@ -117,11 +116,12 @@ impl Context {
     #[async_recursion]
     pub(crate) async fn join_secmsg_parts(&mut self,round:Round,dealer:Replica) {
         if self.avss_secmsg_delivered_bytes.contains_key(&(round,dealer)){return;}
-        let beacon=match self.avss_beacon_bytes.get(&(round,dealer)).and_then(|b|AvssRecipientPayload::deserialize_bytes(b)){Some(p)=>p,None=>return};
-        let reserve=match self.reserve_bytes.get(&(round,dealer)).and_then(|b|AvssRecipientPayload::deserialize_bytes(b)){Some(p)=>p,None=>return};
+        let beacon=match self.avss_beacon_bytes.get(&(round,dealer)).and_then(|b|super::batch_degree_test::decode_payload(b,self.gf2_profile,self.batch_size,0)){Some(p)=>p,None=>return};
+        let reserve=match self.reserve_bytes.get(&(round,dealer)).and_then(|b|super::batch_degree_test::decode_payload(b,self.gf2_profile,self.batch_size,self.batch_size)){Some(p)=>p,None=>return};
         if beacon.secrets.len()!=self.batch_size||reserve.secrets.len()!=super::context::PPT_COIN_RESERVE{return;}
         if let Some(payload)=super::share_pipeline::join_payloads(beacon,reserve){
-            self.avss_secmsg_delivered_bytes.insert((round,dealer),payload.serialize_bytes());
+            let bytes=match super::batch_degree_test::encode_payload(&payload,self.gf2_profile,self.batch_size,0){Some(b)=>b,None=>return};
+            self.avss_secmsg_delivered_bytes.insert((round,dealer),bytes);
             self.try_finalize_avss_secmsg(round,dealer).await;
         }
     }

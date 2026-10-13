@@ -55,6 +55,7 @@ pub(crate) fn avss_local_packet_valid_pure(
     // The dealer shares `batch_size` beacon coins plus `coin_reserve`
     // sealed ACS-coin secrets; all are committed + degree-tested
     // uniformly, so every length / loop below ranges over the total.
+    let main_batch_size = batch_size;
     let batch_size = batch_size + coin_reserve;
     let wss = beacon_msg.wss.as_ref().ok_or("missing WSS payload")?;
     if myid >= num_nodes || wss.secrets.len() != batch_size
@@ -73,13 +74,34 @@ pub(crate) fn avss_local_packet_valid_pure(
         return Err("transcript root mismatch");
     }
 
-    if !crate::node::merkle::validate_batch(&wss.mps) {
+    if gf2_profile.is_none() && !crate::node::merkle::validate_batch(&wss.mps) {
         log::warn!(
             "[PPT][AVSS] invalid Merkle/share proof for dealer {} round {}",
             dealer,
             round
         );
         return Err("merkle proof invalid");
+    }
+
+    if gf2_profile.is_some() {
+        if coin_reserve != super::context::PPT_COIN_RESERVE {
+            return Err("invalid GF2 reserve count");
+        }
+        let roots=beacon_msg.root_vec.as_ref().ok_or("missing root_vec")?;
+        let h=beacon_msg.degree_test_coeffs.as_ref().ok_or("missing degree-test coeffs")?;
+        let masks=beacon_msg.mask_shares.as_ref().ok_or("missing mask shares")?;
+        if beacon_msg.f_large_shares.is_some() {
+            return Err("f_large_shares present in GF2 mode (redundant; dealer should ship None)");
+        }
+        let public=types::beacon::AvssPublicCommitMsg::new(dealer,round,roots.clone(),h.clone());
+        if !super::batch_degree_test::public_shape(&public,main_batch_size,num_nodes,num_faults,gf2_profile) {
+            return Err("malformed GF2 batched public transcript");
+        }
+        let payload=types::beacon::AvssRecipientPayload::new(wss.secrets.clone(),wss.nonces.clone(),
+            masks.clone(),None,wss.mps.clone());
+        return if super::share_pipeline::validate_original(&public,&payload,0,batch_size,myid,num_nodes,num_faults,
+            secret_domain,nonce_domain,gf2_profile,_hash_context) {Ok(())}
+            else {Err("GF2 batch/reserve degree test or original commitment failed")};
     }
 
     // Fiat-Shamir degree-test challenge θ (problem-3 fix): derived

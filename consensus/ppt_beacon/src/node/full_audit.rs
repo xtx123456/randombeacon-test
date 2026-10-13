@@ -105,8 +105,8 @@ fn audit_dealer(bundle:&PublicBundle,input:&[(Replica,DealerDisclosure)],batch:u
         for provider in 0..n {
             let key=match parse_share(&key_prime,&keys[provider]){Some(k)=>k,None=>return DealerResult::Complete(Some("noncanonical committed transport key".into()))};
             let bytes=match decrypt_with_share(&key_prime,&key,&ciphers[provider]){Some(v)=>v,None=>return DealerResult::Complete(Some("committed ciphertext cannot be decrypted".into()))};
-            let payload=match AvssRecipientPayload::deserialize_bytes(&bytes){Some(p)=>p,None=>return DealerResult::Complete(Some("committed plaintext is not an AVSS payload".into()))};
-            if payload.serialize_bytes()!=bytes||payload.secrets.len()!=batch||payload.nonces.len()!=batch||payload.mask_shares.len()!=batch
+            let payload=match super::batch_degree_test::decode_payload(&bytes,profile,batch,0){Some(p)=>p,None=>return DealerResult::Complete(Some("committed plaintext is not a canonical AVSS payload".into()))};
+            if super::batch_degree_test::encode_payload(&payload,profile,batch,0).as_ref()!=Some(&bytes)||payload.secrets.len()!=batch||payload.nonces.len()!=batch||payload.mask_shares.len()!=batch
                 ||payload.mps.len()!=batch||match (profile,&payload.f_large_shares){(Some(_),None)=>false,(None,Some(v))=>v.len()!=batch,_=>true}
                 {return DealerResult::Complete(Some("committed plaintext has invalid canonical batch encoding".into()));}
             payloads.insert(provider,payload.clone());original.push(payload);
@@ -128,10 +128,17 @@ fn audit_dealer(bundle:&PublicBundle,input:&[(Replica,DealerDisclosure)],batch:u
     let mut rebuilt:Vec<_>=(0..n).map(|_|AvssRecipientPayload::new(Vec::with_capacity(batch),Vec::with_capacity(batch),Vec::with_capacity(batch),
         profile.is_none().then(||Vec::with_capacity(batch)),Vec::with_capacity(batch))).collect();
     let mut tree_leaves=Vec::with_capacity(batch);
+    // The binary main batch has only one mask polynomial: decode it once.
+    let shared_mask=if profile.is_some(){
+        let points=payloads.iter().map(|(provider,p)|(*provider,p.mask_shares[0].to_vec())).collect();
+        oec::decode(&mask_field,f,f,n,&points,cache)
+    }else{None};
+    let shared_mask_values=shared_mask.as_ref().map(|mask|(0..n)
+        .map(|provider|oec::val(&mask.at_point(provider)).expect("decoded mask is canonical")).collect::<Vec<_>>());
     for coin in 0..batch {
         let points=|select:fn(&AvssRecipientPayload,usize)->Val|payloads.iter().map(|(p,v)|(*p,select(v,coin).to_vec())).collect();
         let secret=oec::decode(&secret_field,f,f,n,&points(|p,i|p.secrets[i]),cache);
-        let mask=oec::decode(&mask_field,f,f,n,&points(|p,i|p.mask_shares[i]),cache);
+        let mask=if profile.is_some(){shared_mask.clone()}else{oec::decode(&mask_field,f,f,n,&points(|p,i|p.mask_shares[i]),cache)};
         let nonce=oec::decode(&nonce_field,f,f,n,&points(|p,i|p.nonces[i]),cache);
         let lifted=if profile.is_none(){oec::decode(&nonce_field,f,f,n,&points(|p,i|p.f_large_shares.as_ref().unwrap()[i]),cache)}else{None};
         let (secret,mask,nonce)=match (secret,mask,nonce){(Some(a),Some(b),Some(c))=>(a,b,c),_=>{
@@ -140,7 +147,9 @@ fn audit_dealer(bundle:&PublicBundle,input:&[(Replica,DealerDisclosure)],batch:u
         if profile.is_none()&&lifted.is_none(){return if actual_payloads.is_some(){DealerResult::Complete(Some("committed lifted shares violate degree bound".into()))}else{DealerResult::Waiting};}
         let mut leaves=Vec::with_capacity(n);
         for provider in 0..n {
-            let secret=oec::val(&secret.at_point(provider)).unwrap();let mask=oec::val(&mask.at_point(provider)).unwrap();let nonce=oec::val(&nonce.at_point(provider)).unwrap();
+            let secret=oec::val(&secret.at_point(provider)).unwrap();
+            let mask=match &shared_mask_values{Some(values)=>values[provider],None=>oec::val(&mask.at_point(provider)).unwrap()};
+            let nonce=oec::val(&nonce.at_point(provider)).unwrap();
             let p=&mut rebuilt[provider];p.secrets.push(secret);p.mask_shares.push(mask);p.nonces.push(nonce);
             let leaf=if let Some(lifted)=&lifted {let value=oec::val(&lifted.at_point(provider)).unwrap();p.f_large_shares.as_mut().unwrap().push(value);
                 types::beacon::avss_commit_leaf(&secret,&mask,&value,&nonce)}else{types::beacon::avss_commit_leaf_gf2(&secret,&mask,&nonce)};
@@ -165,7 +174,9 @@ fn audit_dealer(bundle:&PublicBundle,input:&[(Replica,DealerDisclosure)],batch:u
         for provider in 0..n {
             let key=BigUint::from_bytes_be(&polynomial.at_point(provider));
             key_messages.push(serialize_share(&key_prime,&key).expect("decoded key is in field"));
-            ciphertexts.push(encrypt_with_share(&key_prime,&key,&rebuilt[provider].serialize_bytes()));
+            let plaintext=match super::batch_degree_test::encode_payload(&rebuilt[provider],profile,batch,0){
+                Some(bytes)=>bytes,None=>return DealerResult::Complete(Some("rebuilt batch mask layout is not canonical".into()))};
+            ciphertexts.push(encrypt_with_share(&key_prime,&key,&plaintext));
         }
         let roots=bundle.secmsg_roots.unwrap();
         let new_key=rebuild_vector(&key_messages,n,f,&hash);let new_cipher=rebuild_vector(&ciphertexts,n,f,&hash);
@@ -204,7 +215,7 @@ impl Context {
             let mut entries=Vec::with_capacity(dealers.len());
             for dealer in &dealers {
                 let root=match self.awss_root(round,*dealer){Some(r)=>r,None=>return};
-                let original=self.avss_beacon_bytes.get(&(round,*dealer)).and_then(|b|AvssRecipientPayload::deserialize_bytes(b))
+                let original=self.avss_beacon_bytes.get(&(round,*dealer)).and_then(|b|super::batch_degree_test::decode_payload(b,self.gf2_profile,self.batch_size,0))
                     .or_else(||self.original_beacon_payload(round,*dealer));
                 let original=original.filter(|p|p.secrets.len()==self.batch_size&&p.nonces.len()==self.batch_size&&p.mask_shares.len()==self.batch_size&&p.mps.len()==self.batch_size);
                 let recovered=self.awss_recovery.get(&(round,*dealer)).and_then(|s|s.local_shares.as_ref()).map(|p|AuditValues{

@@ -67,7 +67,7 @@ impl Context {
         Some(crypto::hash::do_hash(&super::public_rbc::transcript(public).serialize_ctrbc()))
     }
     fn awss_happy(&self, round: Round, dealer: Replica, source: Replica, bytes: &[u8]) -> bool {
-        let payload=match AvssRecipientPayload::deserialize_bytes(bytes){Some(p)=>p,None=>return false};
+        let payload=match super::batch_degree_test::decode_payload(bytes,self.gf2_profile,self.batch_size,0){Some(p)=>p,None=>return false};
         let public=match self.avss_secmsg_public.get(&(round,dealer)){Some(p)=>p,None=>return false};
         super::share_pipeline::validate_original(public,&payload,0,self.batch_size,source,self.num_nodes,self.num_faults,
             &self.secret_domain,&self.nonce_domain,self.gf2_profile,&self.hash_context)
@@ -263,7 +263,7 @@ impl Context {
             }
             ForwardTag::Assist => {
                 if !happy { return; }
-                let payload = match bytes.and_then(|bytes| AvssRecipientPayload::deserialize_bytes(&bytes)) { Some(payload) => payload, None => return };
+                let payload = match bytes.and_then(|bytes| super::batch_degree_test::decode_payload(&bytes,self.gf2_profile,self.batch_size,0)) { Some(payload) => payload, None => return };
                 let state = self.awss_recovery.get_mut(&(round, dealer)).unwrap();
                 state.assists.entry(source).or_insert(payload);
                 state.certificates.entry(source).or_insert(proof);
@@ -369,6 +369,10 @@ impl Context {
         let nonce_weights=prime_weights(&providers,self.myid,&self.nonce_domain);
         let mut nonces=Vec::with_capacity(total);
         let mut f_large = self.gf2_profile.is_none().then(|| Vec::with_capacity(total));
+        let shared_mask=if let Some(profile)=self.gf2_profile {
+            let points:Vec<_>=chosen.iter().map(|(_,p)|p.mask_shares[0]).collect();
+            match gf2_apply(profile,binary_weights.as_ref().unwrap(),&points){Ok(v)=>Some(v),Err(_)=>return}
+        }else{None};
         for coin in 0..total {
             let secret_points: Vec<_> = chosen.iter().map(|(_, payload)| payload.secrets[coin]).collect();
             let mask_points: Vec<_> = chosen.iter().map(|(_, payload)| payload.mask_shares[coin]).collect();
@@ -377,7 +381,7 @@ impl Context {
             match self.gf2_profile {
                 Some(profile) => {
                     let secret = match gf2_apply(profile, binary_weights.as_ref().unwrap(), &secret_points) { Ok(value) => value, Err(_) => return };
-                    let mask = match gf2_apply(profile, binary_weights.as_ref().unwrap(), &mask_points) { Ok(value) => value, Err(_) => return };
+                    let mask = shared_mask.expect("one recovered GF2 main mask");
                     secrets.push(secret); masks.push(mask);
                 }
                 None => {
@@ -393,18 +397,8 @@ impl Context {
         let public = match self.avss_secmsg_public.get(&(round, dealer)) { Some(public) => public, None => return };
         match self.gf2_profile {
             Some(profile) => {
-                let verifier = match super::shamir::gf2_two_field::Gf2TwoFieldDealer::new(profile, self.num_faults+1, self.num_nodes) {
-                    Ok(verifier) => verifier, Err(_) => return,
-                };
-                let theta = Context::theta_from_commitment_gf2(round, dealer, &public.root_vec, profile);
-                for coin in 0..total {
-                    let coefficients: Result<Vec<_>, _> = public.degree_test_coeffs[coin].iter()
-                        .map(|value| Gf2Element::from_bytes(profile, *value)).collect();
-                    let coefficients = match coefficients { Ok(value) => value, Err(_) => return };
-                    let secret = match Gf2Element::from_bytes(profile, secrets[coin]) { Ok(value) => value, Err(_) => return };
-                    let mask = match Gf2Element::from_bytes(profile, masks[coin]) { Ok(value) => value, Err(_) => return };
-                    if !verifier.verify_share(self.myid+1, &secret, &mask, &coefficients, &theta) { return; }
-                }
+                if !super::batch_degree_test::verify_values(public,&secrets,&masks,0,total,self.myid,
+                    self.num_nodes,self.num_faults,profile){return;}
             }
             None => {
                 let verifier = super::shamir::two_field::TwoFieldDealer::new(self.secret_domain.clone(), self.nonce_domain.clone(), self.num_faults+1, self.num_nodes);

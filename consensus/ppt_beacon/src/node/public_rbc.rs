@@ -123,9 +123,9 @@ impl Context {
         let public = &bundle.public;
         let round = public.round; let dealer = public.origin;
         let total = self.batch_size + super::context::PPT_COIN_RESERVE;
-        if !public.verify_transcript_root() || public.root_vec.len() != total
-            || public.degree_test_coeffs.len() != total
-            || public.degree_test_coeffs.iter().any(|coeffs| coeffs.len() != self.num_faults+1) {
+        if bundle.version != 2 || !public.verify_transcript_root() || public.root_vec.len() != total
+            || !super::batch_degree_test::public_shape(public, self.batch_size, self.num_nodes,
+                self.num_faults, self.gf2_profile) {
             log::warn!("[PPT][PUBLIC-RBC] rejected malformed public transcript round={} dealer={}", round, dealer);
             return;
         }

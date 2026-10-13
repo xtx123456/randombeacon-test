@@ -98,7 +98,8 @@ pub struct CTRBCState {
     pub avss_completed_dealers: HashSet<Replica, nohash_hasher::BuildNoHashHasher<Replica>>,
 
     // ---- Two-field per-dealer side data ----
-    /// `degree_test_coeffs[dealer][coin] = h(x) coefficients`.
+    /// GF2: `[dealer][0]` is the main-batch h; `[dealer][1+r]` is
+    /// sealed reserve r's h. Prime comparison: one h per coin.
     pub degree_test_coeffs:
         HashMap<Replica, Vec<Vec<Val>>, nohash_hasher::BuildNoHashHasher<Replica>>,
     /// `mask_shares[dealer][coin] = g(i) mod q` (one per coin).

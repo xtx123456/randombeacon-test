@@ -136,6 +136,7 @@ impl Context {
         // Ordinary SEND is only an RBC input. Cache public content after delivery.
         let round = msg.round; let dealer = msg.origin;
         let payload = bincode::serialize(&crate::node::wire::PublicBundle {
+            version: 2,
             public: msg, secmsg_roots: None, reserve_roots: None }).expect("public bundle encoding");
         self.process_scoped_rbc(crate::node::wire::RbcScope::PublicCommit,
             round, dealer, crate::node::wire::RbcMessage::Send(payload), wire_sender).await;
@@ -701,7 +702,7 @@ impl Context {
             .clone();
         let myid = self.myid;
 
-        let payload = match types::beacon::AvssRecipientPayload::deserialize_bytes(&plaintext) {
+        let payload = match super::batch_degree_test::decode_payload(&plaintext, self.gf2_profile, self.batch_size, 0) {
             Some(p) => p,
             None => {
                 log::error!(

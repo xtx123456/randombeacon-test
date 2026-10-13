@@ -26,6 +26,7 @@ mod public_rbc;
 mod awss_recovery;
 mod oec;
 mod share_pipeline;
+mod batch_degree_test;
 mod full_audit;
 mod reserve_transport;
 mod merkle;
