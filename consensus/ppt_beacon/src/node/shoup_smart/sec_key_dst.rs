@@ -302,7 +302,7 @@ pub fn reconstruct(
 fn modinv(a: &num_bigint::BigInt, m: &num_bigint::BigInt) -> Option<num_bigint::BigInt> {
     use num_bigint::BigInt;
     use num_bigint::Sign;
-    use num_traits::{One, Zero};
+    use num_traits::One;
     let (mut old_r, mut r) = (a.clone(), m.clone());
     let (mut old_s, mut s) = (BigInt::one(), BigInt::zero());
     while !r.is_zero() {

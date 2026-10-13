@@ -395,12 +395,12 @@ impl Context {
         transport: AvssTransport,
         gf2_profile: Option<Gf2Profile>,
     ) -> anyhow::Result<oneshot::Sender<()>> {
-        Self::spawn_with_options(config, sleep, batch, frequency, transport, gf2_profile,
+        Self::spawn_with_options(config, _sleep, batch, frequency, transport, gf2_profile,
                                  crate::node::options::PptOptions::default())
     }
 
     pub fn spawn_with_options(
-        config: Node, sleep: u128, batch: usize, frequency: Round,
+        config: Node, _sleep: u128, batch: usize, frequency: Round,
         transport: AvssTransport, gf2_profile: Option<Gf2Profile>,
         options: crate::node::options::PptOptions,
     ) -> anyhow::Result<oneshot::Sender<()>> {

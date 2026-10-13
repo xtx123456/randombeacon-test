@@ -1,7 +1,7 @@
 //! Reliable public AWSS transcript delivery and shared payload-fetch routing.
 use async_recursion::async_recursion;
 use types::{Replica, Round};
-use types::beacon::{BeaconMsg, CoinMsg, WrapperMsg};
+use types::beacon::{BeaconMsg, WrapperMsg};
 use crate::node::{Context, CTRBCState};
 use super::acs::rbc::{RbcAction, RbcInstanceState};
 use super::wire::{self, PptWire, PublicBundle, RbcScope, RbcMessage};
