@@ -418,6 +418,7 @@ impl Context {
     ) -> anyhow::Result<oneshot::Sender<()>> {
         options.validate(&config, gf2_profile, transport)?;
         log::info!("[PPT][ASSUMPTIONS] channel={:?} target128={} adaptive total corruption f={} n={}; randomness remains PR10; no full protocol security claim", options.channel, options.target128, config.num_faults, config.num_nodes);
+        log::info!("[PPT][PATH] local-share matrix -> polynomial OEC (degree={}, matching points={}) -> complete batch commitment audit; PPTB SHA-256 Merkle",config.num_faults,2*config.num_faults+1);
         if options.channel == crate::node::options::PptChannel::Benchmark {
             log::warn!("[PPT][ASSUMPTIONS] plaintext TCP+HMAC: benchmark only; sharing confidentiality is NOT provided");
         }

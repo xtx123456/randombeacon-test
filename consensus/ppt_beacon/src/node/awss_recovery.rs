@@ -283,10 +283,10 @@ impl Context {
             .map(|state| state.recovered_peers.len() == self.num_nodes).unwrap_or(false);
         if cleared && acknowledged {
             self.avss_secmsg_state.remove(&(round, dealer));
+            self.avss_secmsg_delivered_bytes.remove(&(round,dealer));
             self.avss_beacon_bytes.remove(&(round,dealer));
             if !self.reserve_state.contains_key(&(round,dealer)) {
                 self.avss_secmsg_public.remove(&(round,dealer));
-                self.avss_secmsg_delivered_bytes.remove(&(round,dealer));
                 self.avss_public_bundles.remove(&(round,dealer));self.avss_public_rbc.remove(&(round,dealer));
             }
             // Preserve the selected/ack tombstone; release private evidence.

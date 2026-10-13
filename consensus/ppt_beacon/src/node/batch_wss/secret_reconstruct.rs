@@ -179,7 +179,7 @@ pub(crate) fn audit_post_complaint_pure(
         };
         for entry in &snapshot.packets {
             let packet = &entry.packet;
-            if !crypto::aes_hash::Proof::validate_batch(&packet.mps, hash_context) {
+            if !crate::node::merkle::validate_batch(&packet.mps) {
                 result.rejected_providers.insert(provider);
                 continue;
             }
@@ -267,7 +267,7 @@ pub fn verify_recon_shares_pure(
         // taints the whole packet from this provider; we simply skip
         // it and rely on the other >= 2f+1 honest providers.
         if !packet_lengths_ok(&packet)
-            || !crypto::aes_hash::Proof::validate_batch(&packet.mps, hash_context)
+            || !crate::node::merkle::validate_batch(&packet.mps)
         {
             continue;
         }
@@ -1895,7 +1895,8 @@ impl Context {
 mod recon_fix_tests {
     use super::*;
     use crate::node::shamir::two_field::TwoFieldDealer;
-    use crypto::aes_hash::{HashState, MerkleTree};
+    use crypto::aes_hash::HashState;
+    use crate::node::merkle::MerkleTree;
     use num_bigint::BigUint;
     use types::beacon::BatchWSSReconMsg;
 

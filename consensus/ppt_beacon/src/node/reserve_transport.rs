@@ -22,7 +22,7 @@ impl Context {
     #[async_recursion]
     pub(crate) async fn process_reserve_wire(&mut self,message:PptWire,sender:Replica) {
         let (round,dealer)=match &message {PptWire::ReserveTransport{round,dealer,..}|PptWire::ReserveRequest{round,dealer,..}|PptWire::ReserveRecovered{round,dealer,..}=>(*round,*dealer),_=>return};
-        if sender>=self.num_nodes||dealer>=self.num_nodes{return;}
+        if sender>=self.num_nodes||dealer>=self.num_nodes||round>self.max_rounds{return;}
         if self.avss_public_bundles.get(&(round,dealer)).and_then(|b|b.reserve_roots).is_none() {
             if self.round_state.get(&round).map(|s|s.cleared).unwrap_or(false){return;}
             let pending=self.reserve_pending.entry((round,dealer)).or_default();
@@ -47,7 +47,13 @@ impl Context {
                 if let Ok((state,actions))=result{self.reserve_state.insert((round,dealer),state);self.dispatch_reserve_actions(round,dealer,actions).await;}
                 else{log::error!("[PPT][RESERVE] transport worker failed round={} dealer={}",round,dealer);}
             }
-            PptWire::ReserveRequest{recipient,..}=>{if recipient!=sender||!self.awss_selected(round,dealer){return;}
+            PptWire::ReserveRequest{recipient,..}=>{if recipient!=sender{return;}
+                if !self.awss_selected(round,dealer){
+                    let pending=self.reserve_pending.entry((round,dealer)).or_default();
+                    if !pending.iter().any(|(m,p)|*p==sender&&matches!(m,PptWire::ReserveRequest{..})){
+                        pending.push((PptWire::ReserveRequest{round,dealer,recipient},sender));
+                    }return;
+                }
                 self.reserve_serving.entry((round,dealer)).or_default().requests.insert(recipient);self.drive_reserve_replay(round,dealer).await;}
             PptWire::ReserveRecovered{..}=>{self.reserve_serving.entry((round,dealer)).or_default().acks.insert(sender);self.release_reserve_if_safe(round,dealer);}
             _=>{}
@@ -64,6 +70,7 @@ impl Context {
             }
             SecMsgDstAction::DeliveredMessage{message}=>{
                 self.reserve_bytes.entry((round,dealer)).or_insert(message);
+                self.install_reserved_material(round,dealer).await;
                 self.join_secmsg_parts(round,dealer).await;
                 let state=self.reserve_serving.entry((round,dealer)).or_default();
                 if !state.ack_sent{state.ack_sent=true;state.acks.insert(self.myid);
@@ -84,9 +91,28 @@ impl Context {
     }
     #[async_recursion]
     pub(crate) async fn request_selected_reserve(&mut self,round:Round,dealer:Replica) {
+        let pending=self.reserve_pending.remove(&(round,dealer)).unwrap_or_default();
+        for (message,sender) in pending{self.process_reserve_wire(message,sender).await;}
         if self.transport!=super::AvssTransport::SecMsg||self.reserve_bytes.contains_key(&(round,dealer)){return;}
         let state=self.reserve_serving.entry((round,dealer)).or_default();if state.requested{return;}state.requested=true;
         self.broadcast(wire::encode(&PptWire::ReserveRequest{round,dealer,recipient:self.myid}),round).await;
+    }
+    #[async_recursion]
+    pub(crate) async fn install_reserved_material(&mut self,round:Round,dealer:Replica) {
+        let material=match self.coin_material.get(&round){Some(m) if m.decided.contains(&dealer)&&!m.my_shares.contains_key(&dealer)=>m,_=>return};
+        let _=material;
+        let payload=match self.reserve_bytes.get(&(round,dealer)).and_then(|b|AvssRecipientPayload::deserialize_bytes(b)){Some(p)=>p,None=>return};
+        let public=match self.avss_secmsg_public.get(&(round,dealer)){Some(p)=>p,None=>return};
+        let count=super::context::PPT_COIN_RESERVE;
+        if !super::share_pipeline::validate_original(public,&payload,self.batch_size,count,self.myid,self.num_nodes,self.num_faults,
+            &self.secret_domain,&self.nonce_domain,self.gf2_profile,&self.hash_context){return;}
+        let shares=(0..count).map(|i|(payload.secrets[i],payload.mask_shares[i],
+            payload.f_large_shares.as_ref().map(|v|v[i]).unwrap_or(payload.secrets[i]),payload.nonces[i],payload.mps[i].clone())).collect();
+        self.coin_material.get_mut(&round).unwrap().my_shares.insert(dealer,shares);
+        // Retry availability of the SAME sealed coin, never introduce a new
+        // coin value or alter PR10's derivation/reveal timing.
+        let next=round+1;self.coin_reveal_sent.retain(|(r,_)|*r!=next);
+        self.acs_note_local_change(next).await;
     }
     #[async_recursion]
     pub(crate) async fn join_secmsg_parts(&mut self,round:Round,dealer:Replica) {
@@ -102,7 +128,12 @@ impl Context {
     pub(crate) fn release_reserve_if_safe(&mut self,round:Round,dealer:Replica) {
         let next_done=self.acs_state.get(&(round+1)).map(|s|s.finalized).unwrap_or(false);
         let all=self.reserve_serving.get(&(round,dealer)).map(|s|s.acks.len()==self.num_nodes).unwrap_or(false);
-        if next_done&&all {self.reserve_state.remove(&(round,dealer));self.reserve_bytes.remove(&(round,dealer));self.reserve_pending.remove(&(round,dealer));}
+        if next_done&&all {
+            self.reserve_state.remove(&(round,dealer));self.reserve_bytes.remove(&(round,dealer));self.reserve_pending.remove(&(round,dealer));
+            if !self.avss_secmsg_state.contains_key(&(round,dealer))&&self.round_state.get(&round).map(|s|s.cleared).unwrap_or(false){
+                self.avss_secmsg_public.remove(&(round,dealer));self.avss_public_bundles.remove(&(round,dealer));self.avss_public_rbc.remove(&(round,dealer));
+            }
+        }
     }
 }
 fn reserve_slot(message:&PptWire)->(u8,u8) {match message{

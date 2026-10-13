@@ -72,7 +72,12 @@ impl Polynomial {
 }
 
 #[derive(Default, Debug)]
-pub(crate) struct OecCache { inverses:HashMap<(Vec<u8>,Vec<Replica>),Vec<Vec<Scalar>>> }
+pub(crate) struct OecCache {
+    inverses:HashMap<(Vec<u8>,Vec<Replica>),Vec<Vec<Scalar>>>,
+    // A previously CONFIRMED point set is only an interpolation hint. Each new
+    // coordinate still needs its own d+f+1 support check; this is not a locator.
+    basis_hint:HashMap<(Vec<u8>,usize),Vec<Replica>>,
+}
 
 /// Gauss-Jordan on a possibly overdetermined augmented system. Free variables
 /// are set to zero; inconsistent rows are rejected, never silently discarded.
@@ -126,7 +131,17 @@ pub(crate) fn decode(field:&Field,degree:usize,faults:usize,n:usize,
     input:&BTreeMap<Replica,Vec<u8>>,cache:&mut OecCache)->Option<Polynomial> {
     let points:Vec<_>=input.iter().filter(|(p,_)|**p<n).filter_map(|(p,b)|field.parse(b).map(|v|(*p,v))).collect();
     let k=degree+1;if points.len()<k+faults{return None;}
-    if let Some(coefficients)=interpolate(field,&points[..k],cache){if let Some(p)=confirm(field,coefficients,&points,degree,faults){return Some(p);}}
+    let hint_key=(field.id(),degree);
+    let hint=cache.basis_hint.get(&hint_key).cloned();
+    if let Some(ids)=hint {
+        let chosen:Option<Vec<_>>=ids.iter().map(|id|points.iter().find(|(p,_)|p==id).cloned()).collect();
+        if let Some(chosen)=chosen {if chosen.len()==k {if let Some(coefficients)=interpolate(field,&chosen,cache){
+            if let Some(p)=confirm(field,coefficients,&points,degree,faults){cache.basis_hint.insert(hint_key.clone(),p.support[..k].to_vec());return Some(p);}
+        }}}
+    }
+    if let Some(coefficients)=interpolate(field,&points[..k],cache){if let Some(p)=confirm(field,coefficients,&points,degree,faults){
+        cache.basis_hint.insert(hint_key.clone(),p.support[..k].to_vec());return Some(p);
+    }}
     for errors in 1..=faults.min((points.len()-k)/2) {
         let q_len=k+errors;let unknowns=q_len+errors;
         let rows=points.iter().map(|(provider,y)|{
@@ -143,7 +158,7 @@ pub(crate) fn decode(field:&Field,degree:usize,faults:usize,n:usize,
             for j in 0..=errors {remainder[offset+j]=field.sub(&remainder[offset+j],&field.mul(&c,&locator[j]));}
         }
         if remainder.iter().any(|v|!is_zero(v)){continue;}
-        if let Some(p)=confirm(field,coefficients,&points,degree,faults){return Some(p);}
+        if let Some(p)=confirm(field,coefficients,&points,degree,faults){cache.basis_hint.insert(hint_key.clone(),p.support[..k].to_vec());return Some(p);}
     }
     None
 }

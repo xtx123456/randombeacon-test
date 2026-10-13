@@ -50,7 +50,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
-use crypto::aes_hash::{HashState, MerkleTree, Proof};
+use crypto::aes_hash::{HashState, Proof};
+use crate::node::merkle::MerkleTree;
 use crypto::hash::{do_hash, Hash};
 use types::Replica;
 
@@ -353,7 +354,7 @@ impl CompactBroadcastState {
             );
             return Vec::new();
         }
-        if !path.validate(&self.hash_state) {
+        if !crate::node::merkle::validate(&path) {
             log::debug!(
                 "[ShoupSmart][CompactBroadcast] node {} dropped SEND: invalid path",
                 self.myid
@@ -432,7 +433,7 @@ impl CompactBroadcastState {
         if path.root() != root {
             return Vec::new();
         }
-        if !path.validate(&self.hash_state) {
+        if !crate::node::merkle::validate(&path) {
             return Vec::new();
         }
         // Position binding (2/2): the Merkle path must additionally

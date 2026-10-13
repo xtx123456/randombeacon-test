@@ -64,7 +64,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
-use crypto::aes_hash::{HashState, MerkleTree, Proof};
+use crypto::aes_hash::{HashState, Proof};
+use crate::node::merkle::MerkleTree;
 use crypto::hash::{do_hash, Hash};
 use serde::{Deserialize, Serialize};
 use types::Replica;
@@ -540,7 +541,7 @@ impl RelMsgDstState {
                 return Vec::new();
             }
             if !entry.frag_path.matches_leaf(myid_idx, self.n)
-                || !entry.frag_path.validate(&self.hash_state) {
+                || !crate::node::merkle::validate(&entry.frag_path) {
                 return Vec::new();
             }
             // Position binding: the path must prove `fragment` is at
@@ -660,7 +661,7 @@ impl RelMsgDstState {
         if echo.frag_path.root() != echo.msg_root {
             return Vec::new();
         }
-        if !echo.frag_path.validate(&self.hash_state) {
+        if !crate::node::merkle::validate(&echo.frag_path) {
             return Vec::new();
         }
         // Position binding (2/3): the frag_path must prove the
@@ -684,7 +685,7 @@ impl RelMsgDstState {
         if echo.meta_path.root() != echo.meta_root {
             return Vec::new();
         }
-        if !echo.meta_path.validate(&self.hash_state) {
+        if !crate::node::merkle::validate(&echo.meta_path) {
             return Vec::new();
         }
         // Position binding (3/3): the meta_path must prove `msg_root`
@@ -949,7 +950,7 @@ impl RelMsgDstState {
                 reason: ForwardReject::InvalidMetaPath,
             }];
         }
-        if !forward.my_meta_path.validate(&self.hash_state) {
+        if !crate::node::merkle::validate(&forward.my_meta_path) {
             return vec![RelMsgDstAction::ForwardRejected {
                 source: wire_sender,
                 reason: ForwardReject::InvalidMetaPath,
@@ -995,7 +996,7 @@ impl RelMsgDstState {
             let leaf = do_hash(frag.as_bytes());
             if path.item() != leaf
                 || path.root() != forward.my_msg_root
-                || !path.validate(&self.hash_state)
+                || !crate::node::merkle::validate(&path)
             {
                 return vec![RelMsgDstAction::ForwardRejected {
                     source: wire_sender,

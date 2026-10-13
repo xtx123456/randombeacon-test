@@ -4,7 +4,8 @@
 use std::collections::{BTreeMap,HashSet};
 use std::sync::Arc;
 use async_recursion::async_recursion;
-use crypto::aes_hash::{HashState,MerkleTree};
+use crypto::aes_hash::HashState;
+use crate::node::merkle::MerkleTree;
 use crypto::hash::{do_hash,Hash};
 use crypto::gf2::Gf2Profile;
 use num_bigint::BigUint;
@@ -38,15 +39,16 @@ pub(crate) struct FullAuditState {
 }
 pub(crate) struct FullAuditCompletion {
     round:Round,version:u64,results:Vec<(Replica,Option<String>)>,rejected:Vec<Replica>,cache:OecCache,
+    error:Option<String>,
 }
 
 fn public_root(bundle:&PublicBundle)->Hash {do_hash(&super::public_rbc::transcript(&bundle.public).serialize_ctrbc())}
-fn valid_row(row:&[EchoPayload],root:Hash,provider:Replica,n:usize,hash:&HashState)->bool {
+fn valid_row(row:&[EchoPayload],root:Hash,provider:Replica,n:usize,_hash:&HashState)->bool {
     row.len()==n && row.iter().enumerate().all(|(recipient,e)|
         e.meta_root==root&&e.frag_idx==provider&&e.meta_path.matches_leaf(recipient,n)
-        &&e.meta_path.root()==root&&e.meta_path.item()==do_hash(&e.msg_root)&&e.meta_path.validate(hash)
+        &&e.meta_path.root()==root&&e.meta_path.item()==do_hash(&e.msg_root)&&crate::node::merkle::validate(&e.meta_path)
         &&e.frag_path.matches_leaf(provider,n)&&e.frag_path.root()==e.msg_root
-        &&e.frag_path.item()==do_hash(e.fragment.as_bytes())&&e.frag_path.validate(hash))
+        &&e.frag_path.item()==do_hash(e.fragment.as_bytes())&&crate::node::merkle::validate(&e.frag_path))
 }
 fn valid_entries(entries:&[DealerDisclosure],dealers:&[Replica],batch:usize,n:usize)->bool {
     entries.len()==dealers.len()&&entries.iter().zip(dealers).all(|(e,d)|e.dealer==*d
@@ -218,7 +220,7 @@ impl Context {
     }
     #[async_recursion]
     pub(crate) async fn process_full_audit_disclosure(&mut self,round:Round,dealers:Vec<Replica>,entries:Vec<DealerDisclosure>,sender:Replica) {
-        if sender>=self.num_nodes||dealers.len()<self.num_nodes-self.num_faults||dealers.len()>self.num_nodes||dealers.windows(2).any(|w|w[0]>=w[1])
+        if sender>=self.num_nodes||round>self.max_rounds||dealers.len()<self.num_nodes-self.num_faults||dealers.len()>self.num_nodes||dealers.windows(2).any(|w|w[0]>=w[1])
             ||dealers.iter().any(|d|*d>=self.num_nodes)||!valid_entries(&entries,&dealers,self.batch_size,self.num_nodes){return;}
         if let Some(selected)=self.round_state.get(&round).and_then(|s|s.acs_decided_set.as_ref()){if selected!=&dealers{return;}}
         let state=self.full_audit.entry(round).or_default();if state.complete||state.authenticated.contains(&sender){return;}
@@ -227,7 +229,7 @@ impl Context {
     }
     #[async_recursion]
     pub(crate) async fn process_audit_certificate(&mut self,round:Round,dealers:Vec<Replica>,rows:Vec<(Replica,Vec<DealerDisclosure>)>,sender:Replica) {
-        if sender>=self.num_nodes||rows.len()>self.num_nodes||dealers.len()<self.num_nodes-self.num_faults||dealers.len()>self.num_nodes
+        if sender>=self.num_nodes||round>self.max_rounds||rows.len()>self.num_nodes||dealers.len()<self.num_nodes-self.num_faults||dealers.len()>self.num_nodes
             ||dealers.windows(2).any(|w|w[0]>=w[1])||dealers.iter().any(|d|*d>=self.num_nodes){return;}
         let mut seen=HashSet::new();
         for (provider,entries) in rows {
@@ -253,16 +255,18 @@ impl Context {
         tokio::spawn(async move{
             let result=tokio::task::spawn_blocking(move||{let mut results=Vec::new();let mut rejected=Vec::new();
                 for (bundle,input) in work {if let DealerResult::Complete(reason)=audit_dealer(&bundle,&input,batch,n,f,&small,&large,profile,hash.clone(),&mut cache,&authenticated,&mut rejected){results.push((bundle.public.origin,reason));}}
-                rejected.sort_unstable();rejected.dedup();FullAuditCompletion{round,version,results,rejected,cache}
+                rejected.sort_unstable();rejected.dedup();FullAuditCompletion{round,version,results,rejected,cache,error:None}
             }).await;
-            if let Ok(completion)=result{let _=tx.send(completion);}else{log::error!("[PPT][FULL-AUDIT] worker failed round={}",round);}
+            let completion=match result{Ok(c)=>c,Err(e)=>FullAuditCompletion{round,version,results:Vec::new(),rejected:Vec::new(),cache:OecCache::default(),error:Some(e.to_string())}};
+            let _=tx.send(completion);
         });
     }
     #[async_recursion]
     pub(crate) async fn finalize_full_audit(&mut self,completion:FullAuditCompletion) {
-        let FullAuditCompletion{round,version,results,rejected,cache}=completion;
+        let FullAuditCompletion{round,version,results,rejected,cache,error}=completion;
         let dealers=match self.round_state.get(&round).and_then(|s|s.acs_decided_set.clone()){Some(d)=>d,None=>return};
         let state=match self.full_audit.get_mut(&round){Some(s)=>s,None=>return};state.inflight=false;state.cache=Some(cache);
+        if let Some(error)=error{log::error!("[PPT][FULL-AUDIT] worker failed round={}: {}; audit remains pending",round,error);return;}
         for (dealer,reason) in results{state.completed_dealers.entry(dealer).or_insert(reason);}
         let changed=state.version!=version;let complete=dealers.iter().all(|d|state.completed_dealers.contains_key(d));
         for provider in rejected{log::warn!("[PPT][AUDIT-PROVIDER-REJECT] node={} round={} provider={} (no dealer exclusion)",self.myid,round,provider);}
@@ -281,7 +285,7 @@ impl Context {
         }else if changed&&!complete{self.try_run_full_audit(round).await;}
     }
     pub(crate) fn note_audit_ack(&mut self,round:Round,sender:Replica) {
-        if sender>=self.num_nodes{return;}let state=self.full_audit.entry(round).or_default();state.acks.insert(sender);
+        if sender>=self.num_nodes||round>self.max_rounds{return;}let state=self.full_audit.entry(round).or_default();state.acks.insert(sender);
         if state.complete&&state.acks.len()==self.num_nodes&&self.round_state.get(&round).map(|s|s.cleared).unwrap_or(false){
             state.rows.clear();state.cache=None;self.share_pipeline.remove(&round);
         }

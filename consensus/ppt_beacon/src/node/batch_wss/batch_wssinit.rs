@@ -2,7 +2,8 @@ use std::time::SystemTime;
 
 use async_recursion::async_recursion;
 use crypto::gf2::{Gf2Element, Gf2Profile};
-use crypto::{aes_hash::MerkleTree, hash::Hash};
+use crypto::hash::Hash;
+use crate::node::merkle::MerkleTree;
 use num_bigint::{BigUint, RandBigInt};
 use rand::Rng;
 use types::{

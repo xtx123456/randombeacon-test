@@ -1,109 +1,142 @@
-# PPTB second batch: sharing transport, reliable delivery and selected recovery
+# PPTB: AWSS, local-share extraction, OEC and full batch audit
 
-This branch is based on PR10. It does not change BEA/HashRand, shared Merkle
-verification, existing CoinMsg variant numbers, or benchmark defaults. The only
-shared wire addition is an appended PPTBExtension variant; BEA ignores it.
+The live PPT path is now:
 
-The initial target deployments are n=4,f=1 and n=16,f=5, with total adaptive
-corruption bounded by f and a 128-bit post-quantum computational-security target.
-This is a design target, not a completed adaptive-security proof. PR10's theta,
-genesis coin and reserve-window fallback are deliberately retained. Share-level
-matrix extraction, beacon OEC and full commitment-rebuilding audits belong to
-later changes. A 2^-40 statistical failure budget is separate from computational
-security and must be derived for each event; it is not supplied by a hash size.
+1. Share f/g and commit canonical recipient messages; reliably deliver public
+   roots and h. Ready comes only from a happy holder. The AWSS preparation
+   certificate is independent of this recipient having its private message.
+2. ACS fixes a sorted dealer set D. Only selected AWSS instances activate
+   missing-message retrieval and verifiable complaint/report/assist recovery.
+3. Each recipient multiplies its LOCAL f-shares, ordered by D, by the same
+   super-invertible matrix. For m=|D| there are m-f output polynomials per coin,
+   of degree at most f. Broadcast these output shares once, without inventing
+   original-dealer Merkle paths for transformed values.
+4. Polynomial OEC recovers each output polynomial online. Emit its constant
+   coefficient in canonical (coin, sub-output) order. Recover/open the entire
+   batch even after first-match leader selection succeeds.
+5. Only after the entire local batch has opened, multicast original f-shares,
+   masks, nonce shares, actual instance key shares and original key/cipher
+   dispersal rows needed to rebuild every committed message.
+6. Rebuild all selected dealers' original polynomials, all sharing points, share
+   trees, canonical plaintexts, encrypted messages and RS fragment/meta trees.
+   Compare complete rebuilt roots with those delivered by public RBC.
+7. A complete transferable reconstruction certificate can prove dealer error.
+   Invalid provider proofs never establish dealer guilt. Preserve this round's
+   already-decided set; apply proven exclusions to subsequent ACS rounds.
 
-## Channel configuration
+Former dealer-secret-first recovery and point-proof-only audit remain labelled
+legacy comparison helpers. The PPT dispatcher rejects their reconstruction/audit
+wire messages. BEA/HashRand keeps its implementation, wire discriminants,
+configuration and benchmark defaults.
 
-PPT-only flags (unchanged defaults are explicit comparison settings):
+## Arithmetic and OEC
 
-- `--ppt-channel benchmark`: existing plaintext TCP+HMAC, no confidentiality.
-- `--ppt-channel private`: encrypted, authenticated packets using existing
-  provisioned 32-byte pairwise secrets. AES-256 encrypts with a fresh per-packet
-  key derived by domain-separated HMAC from a 32-byte random nonce, source,
-  destination and round. The existing HMAC verifies the encrypted envelope
-  before decryption. No threshold setup, public-key encryption or new dependency.
-- `--ppt-channel external-private`: the operator explicitly asserts an actual
-  private authenticated underlying channel. Plain TCP and a trusted-looking LAN
-  do not by themselves satisfy this assumption.
-- `--ppt-security benchmark`: permits algebra/performance comparison profiles.
-- `--ppt-security target128`: requires a private channel, SecMsg and a true GF2
-  extension with w_q > 128+n. It validates configuration, not the deferred
-  randomness or the complete protocol proof.
+The matrix uses sorted dealer IDs+1 as input points and the next m-f distinct
+points as output points. All recipients use identical input order/dimensions.
+GF2 matrices and output reconstruction use GF(2^w_p); large-field mask evaluation
+uses small-field multiplication where possible. Prime-field arithmetic remains
+a legacy comparison, not a true extension-field construction.
 
-For the intended sizes, `--transport secmsg --field 'GF2(64,256)'
---ppt-channel private --ppt-security target128` meets the configured field and
-channel checks. Apply these flags to every PPT node, not to the BEA command.
-The current benchmark script defaults are not silently changed.
+For degree d=f and at most f faulty providers, OEC accepts only when at least
+d+f+1=2f+1 DISTINCT points match a degree-at-most-d candidate. At least d+1 matching
+points are honest, establishing uniqueness when honest providers hold the same
+polynomial. With e received errors, d+f+1+e arrivals suffice; the worst case is
+all n=3f+1 arrivals. For n=4 and n=16 the confirmation thresholds are 3 and 11;
+the error budgets remain 1 and 5.
 
-SecMsg's transport-key Shamir field is independent of the beacon fields: use the
-521-bit Mersenne prime 2^521-1, avoiding a low-entropy transport key. Beacon share,
-degree-test and extraction arithmetic keep the selected small/large GF2 profile.
-SecMsg still needs private channels for its key fragments. Key/cipher evidence
-and canonical encoding remain available through recovery and batch audit.
-Per-instance SecMsg keys may later be disclosed by audit; long-term pairwise
-channel secrets must never be disclosed as audit data.
+The normal path interpolates with a cached inverse Vandermonde matrix, then
+checks every received point and the support threshold. A previously confirmed
+point set is an interpolation hint for the next coordinate, always followed by
+a fresh support check. Berlekamp-Welch locates errors when the fast path fails.
+Exact division, degree, field membership and support are checked after decoding.
+Duplicate/equivocating provider slots cannot add votes. Missing points, decode
+failure or worker failure leave the coordinate pending. Transformed shares have
+no f+1-only fallback.
 
-## Public delivery
+Beacon polynomial OEC is distinct from SecMsg's byte-oriented Reed-Solomon
+erasure coding. The latter reconstructs ORIGINAL committed bytes from proved
+fragments and re-encodes the codeword before accepting its root.
 
-The public sharing transcript (all per-coin commitments and h coefficients) is
-delivered by its own scoped Bracha RBC. Cache/apply it only after a matching
-READY quorum. Public-transcript and ACS-proposal instances have distinct wire
-scopes, and include the round and proposer. Both support hash-checked retrieval
-from honest holders after f+1 READY votes, including a recipient that received
-a conflicting first SEND. Early requests are remembered until content arrives.
-Payload responses do not create votes or bypass delivery thresholds. Existing
-sender/root/index Merkle checks are preserved. Recovery caches needed by slow
-recipients are not expired using a timeout or a local completion assumption.
+## Audit objects and sealed reserves
 
-## AWSS preparation and selected recovery
+SecMsg has independent beacon and PR10 coin-reserve instances, each with its own
+key/cipher root pair bound into public RBC. Keys use the independent 521-bit
+Mersenne prime 2^521-1. Publishing a beacon key never decrypts a reserve ciphertext.
+Reserve coin generation, commitment-root theta, genesis coin and out-of-window
+fallback retain their PR10 algorithms.
 
-The normal share-generation/degree-check path is retained. Only happy holders
-send AVSSReady. With n=3f+1, n-f matching Ready votes imply at least f+1 honest
-happy holders. AVSSComplete is a one-sided-vote relay: send after n-f Ready or
-f+1 Complete; public preparation finishes after n-f Complete. This public state
-no longer requires the local recipient to have private materials. Public RBC
-must have delivered before the preparation certificate is applied.
+Each dispersal row contains the provider's shard of every recipient message and
+both Merkle proof levels. Successful distribution implies at least f+1 honest
+row holders. After batch opening these rows recover exact original key/cipher
+vectors even if a Byzantine recipient withholds its key/plaintext. Bad row proofs
+are rejected as provider evidence. Valid fragments that fail ORIGINAL codeword
+rebuilding prove a bad dealer; missing fragments merely cause waiting.
 
-SecMsg's public bundle binds both key/cipher meta-roots, in addition to the
-original share commitments and h. Reordered key/cipher messages wait for this
-bundle. Delivery/forwarding verifies recipient and fragment indices, Merkle
-depth/positions and the agreed root, then reconstructs/re-encodes the ORIGINAL
-RS codeword. A valid proof of a malformed original codeword is kept as bottom
-evidence. Bad relay proofs do not establish dealer guilt.
+For every beacon coin, audit OEC recovers f, g, nonce and (in the prime comparison)
+large-field f, then re-evaluates all n points. Rebuild each share tree, generate
+its original point paths, serialize the original bincode recipient layout,
+encrypt with the reconstructed actual key share and apply the original RS
+encoding/tree shape. Rebuild the key polynomial, canonical key encoding and both
+key/cipher meta-roots. A plaintext tree cannot stand in for a ciphertext commitment.
+Commitment nonces are never encryption keys; audit never reveals pairwise secrets.
 
-After ACS, only selected instances can activate recovery. A missing-data request
-causes providers to replay fragments for the REQUESTER's key/ciphertext, privately
-to that requester. It never asks providers to reveal their own share plaintext.
-An unhappy recipient forwards its committed message (or bottom evidence) as a
-complaint. Before accepting it, receivers verify both committed channels and run
-the existing share/degree check at the complaint's original recipient index.
-Only a verified unhappy message triggers assists from happy holders. Relays
-include the original complaint as a report, so assist/report message reordering
-does not lose the evidence. This follows the complaint/assist mechanism in
-Shoup-Smart, Journal of Cryptology 2024, Section 5.1, adapted to PPTB's post-ACS
-selection: https://doi.org/10.1007/s00145-024-09505-6.
+PPTB trees use a domain-separated SHA-256 node rule consistently for sharing,
+key/cipher dispersal, forwarding and audit. The legacy shared AES compression
+had different single-tree/batch semantics and failed to retain encrypted blocks
+in its single-tree path. PPTB no longer uses it; BEA hashing/verification stays
+unchanged. The existing 32-byte digest width is retained; this is not a complete
+concrete quantum-security proof.
 
-With f+1 validated happy assists, interpolate the local recipient's f/g shares
-using a single coefficient vector per provider set, check them against h, and
-keep their original certificates. GF2 coefficients remain in the small field;
-large mask shares use mul_small. These derived local shares have no original
-Merkle paths. Until the subsequent matrix/OEC change, PR10 reconstruction imports
-only the certified original points at their original provider indices.
+Lite retains its actual-private-channel/algebra comparison role. Its audit
+authenticates original points before OEC and rebuilds the FULL polynomial/tree;
+it has no invented SecMsg key/cipher commitment. Transferable missing-share
+complaints require SecMsg, so target128 rejects Lite. Defaults are not switched.
 
-Lite is retained as a private-channel performance comparison. It lacks the
-transferable key/cipher evidence needed by this SecMsg complaint implementation,
-so target128 rejects Lite. No default transport is switched. The later complete
-audit/OEC changes are still needed for the final PPTB path, particularly the
-bad-case audit of recovered local shares. This PR does not claim all second-batch
-requirements or Byzantine/adaptive end-to-end termination are already proved.
+## Consistent exclusion and lifetime
 
-Selected serving evidence is released only after local batch audit and ACKs from
-ALL participants. n-f ACKs could omit an honest delayed recipient. A Byzantine
-can withhold its ACK and keep historical transport evidence in memory; safe
-bounded garbage collection/reconfiguration is a separate unresolved requirement.
-No network delay bound or timeout is introduced to hide that limitation.
+Round r+1 sharing may overlap round r reconstruction. Its ACS waits for the full
+round-r audit. The exact root-bound reconstruction rules give every honest node
+the same valid/fault verdict for each selected dealer, so subsequent ACS uses
+the same accumulated exclusions. Early ACS messages are buffered and replayed.
+Fault certificates relay original evidence without modifying a decided set.
 
-## Validation status
+Keep original materials until batch output AND full audit complete. Selected
+share-serving evidence waits for ALL share ACKs; audit rows wait for all audit
+ACKs. Reserve serving waits for the next ACS to finish and all reserve ACKs.
+An n-f quorum or timeout could omit a delayed honest party. A Byzantine can
+withhold an ACK and retain historical caches; bounded certified checkpoints or
+reconfiguration remain an unresolved lifetime requirement.
 
-At the user's request, no build, tests or benchmarks are run by the assistant.
-Source/diff inspection does not establish compilation or runtime correctness.
+## Configuration and security boundary
+
+Initial deployments: n=4,f=1 and n=16,f=5; total adaptive corruption at most f;
+128-bit post-quantum computational-security target. The 2^-40 statistical budget
+is a separate event-specific calculation, not a consequence of hash size.
+
+PPT-only flags preserve explicit comparison defaults:
+
+- `--ppt-channel benchmark`: plaintext TCP+HMAC, without confidentiality.
+- `--ppt-channel private`: AES-256/HMAC with existing provisioned 32-byte pairwise
+  secrets and fresh per-packet nonce/domain separation.
+- `--ppt-channel external-private`: operator asserts an actual private,
+  authenticated underlying channel.
+- `--ppt-security benchmark`: algebra/performance comparison parameters.
+- `--ppt-security target128`: requires SecMsg, a private channel, a true GF2
+  extension and w_q>128+n. This checks parameters, not the protocol proof.
+
+Example per PPT node: `--transport secmsg --field 'GF2(64,256)'
+--ppt-channel private --ppt-security target128`. Use matching configuration on
+all PPT nodes. The benchmark script does not implicitly add these flags.
+
+Fresh theta timing/source, first pi_Beacon and the complete ACS common-coin
+bootstrap/unbounded supply remain deferred. Public PR10 genesis and deterministic
+fallback cannot justify unpredictable-common-coin or full asynchronous termination
+claims. Field-size/channel/OEC/audit checks do not resolve these source/proof gaps.
+Security is not established by renaming functions or running a benchmark.
+
+## Verification
+
+Compile the complete workspace using `cargo build --release` on Linux with Rust
+1.65 through the PR11 workflow. The assistant runs no tests or benchmarks.
+A successful build establishes compilation only; beacon agreement, throughput
+and Byzantine/adaptive termination require separate evidence.

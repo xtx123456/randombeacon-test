@@ -28,6 +28,7 @@ mod oec;
 mod share_pipeline;
 mod full_audit;
 mod reserve_transport;
+mod merkle;
 pub mod shoup_smart;
 
 mod avss_secmsg;

@@ -131,8 +131,8 @@ pub struct CTRBCState {
     /// matrix for the immutable ACS-decided set. Built once per round
     /// by `finalize_acs_round` over `alpha = sorted(decided)+1` with
     /// `num_outputs = |decided| - f`. Used by `coin_check` to extract
-    /// `|decided| - f` independent beacon values per coin column,
-    /// replacing the degenerate all-ones sum.
+    /// `|decided| - f` local OUTPUT SHARES per coin column. The live path
+    /// applies it before OEC, never after recovering each dealer's f(0).
     pub super_inv_extractor: Option<SuperInvExtractor>,
     /// GF(2^w) sibling of `super_inv_extractor`. Populated by
     /// `finalize_acs_round` instead of the BigUint variant when the

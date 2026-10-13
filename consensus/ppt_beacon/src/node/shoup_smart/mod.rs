@@ -92,7 +92,8 @@ pub(crate) fn proof_leaf_index(proof: &Proof) -> usize {
 #[cfg(test)]
 mod proof_leaf_index_tests {
     use super::*;
-    use crypto::aes_hash::{HashState, MerkleTree};
+    use crypto::aes_hash::HashState;
+    use crate::node::merkle::MerkleTree;
     use crypto::hash::{do_hash, Hash};
     use std::sync::Arc;
 

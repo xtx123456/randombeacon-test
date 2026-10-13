@@ -342,7 +342,7 @@ impl Context {
         // codebase's `MerkleTree::build_trees`; `validate_batch` is the
         // trusted path, also used by the post-ACS audit / recon).
         let batch_ok = !packet.mps.is_empty()
-            && Proof::validate_batch(&packet.mps, &hc);
+            && crate::node::merkle::validate_batch(&packet.mps);
         if batch_ok {
             let entry = self
                 .coin_shares

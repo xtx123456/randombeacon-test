@@ -19,6 +19,7 @@ pub(crate) struct SharePipeline {
 pub(crate) enum ShareCompletion {
     Transformed { round:Round, dealers:Vec<Replica>, values:Result<Vec<Val>,String> },
     Decoded { round:Round,version:u64,decoded:Vec<Option<Vec<u8>>>,cache:OecCache,errors:Vec<Replica> },
+    Failed {round:Round,error:String},
 }
 
 pub(crate) fn slice_payload(p:&AvssRecipientPayload,start:usize,len:usize)->Option<AvssRecipientPayload> {
@@ -35,13 +36,12 @@ pub(crate) fn join_payloads(mut a:AvssRecipientPayload,b:AvssRecipientPayload)->
 /// remains bound to the ENTIRE public root vector, including sealed reserves.
 pub(crate) fn validate_original(public:&AvssPublicCommitMsg,p:&AvssRecipientPayload,
     offset:usize,len:usize,source:Replica,n:usize,f:usize,small:&BigUint,large:&BigUint,
-    profile:Option<Gf2Profile>,hash:&HashState)->bool {
+    profile:Option<Gf2Profile>,_hash:&HashState)->bool {
     if source>=n||p.secrets.len()!=len||p.nonces.len()!=len||p.mask_shares.len()!=len||p.mps.len()!=len
         ||offset.checked_add(len).map(|end|end>public.root_vec.len()||end>public.degree_test_coeffs.len()).unwrap_or(true)
         || match (profile,&p.f_large_shares){(Some(_),None)=>false,(None,Some(v))=>v.len()!=len,_=>true}{return false;}
-    // Original share trees use build_trees/hash_batch. Keep the matching
-    // verifier rather than substituting the transport's single-tree hasher.
-    if !crypto::aes_hash::Proof::validate_batch(&p.mps,hash){return false;}
+    // Sharing, transport and rebuilding use the same PPTB SHA-256 rule.
+    if !crate::node::merkle::validate_batch(&p.mps){return false;}
     let theta=Context::theta_from_commitment(public.round,public.origin,&public.root_vec,large);
     let binary=profile.and_then(|p|super::shamir::gf2_two_field::Gf2TwoFieldDealer::new(p,f+1,n).ok());
     let binary_theta=profile.map(|p|Context::theta_from_commitment_gf2(public.round,public.origin,&public.root_vec,p));
@@ -125,7 +125,7 @@ impl Context {
 
     #[async_recursion]
     pub(crate) async fn process_transformed_shares(&mut self,round:Round,dealers:Vec<Replica>,values:Vec<Val>,sender:Replica) {
-        if sender>=self.num_nodes||dealers.len()<self.num_nodes-self.num_faults||dealers.len()>self.num_nodes
+        if sender>=self.num_nodes||round>self.max_rounds||dealers.len()<self.num_nodes-self.num_faults||dealers.len()>self.num_nodes
             ||dealers.iter().any(|d|*d>=self.num_nodes)||dealers.windows(2).any(|w|w[0]>=w[1])
             ||values.len()!=self.batch_size*(dealers.len()-self.num_faults)
             ||self.round_state.get(&round).map(|s|s.cleared).unwrap_or(false){return;}
@@ -161,15 +161,20 @@ impl Context {
                     if let Some(poly)=oec::decode(&field,f,f,n,&input,&mut cache){errors.extend(poly.errors.iter().copied());decoded[coordinate]=Some(poly.at_zero());}
                 }errors.sort_unstable();errors.dedup();(decoded,cache,errors)
             }).await;
-            if let Ok((decoded,cache,errors))=result{let _=tx.send(ShareCompletion::Decoded{round,version,decoded,cache,errors});}
-            // A worker panic cannot masquerade as a decoded output.
-            else {log::error!("[PPT][OEC] worker failed round={}",round);}
+            match result {
+                Ok((decoded,cache,errors))=>{let _=tx.send(ShareCompletion::Decoded{round,version,decoded,cache,errors});}
+                Err(error)=>{let _=tx.send(ShareCompletion::Failed{round,error:error.to_string()});}
+            }
         });
     }
 
     #[async_recursion]
     pub(crate) async fn finalize_share_completion(&mut self,completion:ShareCompletion) {
         match completion {
+            ShareCompletion::Failed{round,error}=>{
+                if let Some(p)=self.share_pipeline.get_mut(&round){p.decoding=false;}
+                log::error!("[PPT][OEC] worker failed round={}: {}; waiting for a retry, no output accepted",round,error);
+            }
             ShareCompletion::Transformed{round,dealers,values}=>{
                 let state=self.share_pipeline.entry(round).or_default();state.matrix_inflight=false;
                 let values=match values{Ok(v)=>v,Err(e)=>{log::error!("[PPT][MATRIX] round={} failed: {}",round,e);return;}};

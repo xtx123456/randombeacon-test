@@ -37,7 +37,7 @@ pub(crate) fn avss_local_packet_valid_pure(
     transcript_root: &Hash,
     dealer: Replica,
     round: Round,
-    hash_context: &HashState,
+    _hash_context: &HashState,
     secret_domain: &BigUint,
     nonce_domain: &BigUint,
     num_faults: usize,
@@ -73,7 +73,7 @@ pub(crate) fn avss_local_packet_valid_pure(
         return Err("transcript root mismatch");
     }
 
-    if !beacon_msg.verify_proofs(hash_context) {
+    if !crate::node::merkle::validate_batch(&wss.mps) {
         log::warn!(
             "[PPT][AVSS] invalid Merkle/share proof for dealer {} round {}",
             dealer,
@@ -272,6 +272,11 @@ pub(crate) fn avss_local_packet_valid_pure(
 
     for coin_num in 0..batch_size {
         let coeffs = &degree_test_coeffs[coin_num];
+        let lifted=if gf2_profile.is_none(){Some(&f_large_shares[coin_num])}else{None};
+        if types::beacon::avss_commit_leaf_auto(&wssmsg.secrets[coin_num],&mask_shares[coin_num],lifted,&wssmsg.nonces[coin_num])!=wssmsg.mps[coin_num].item()
+            ||BigUint::from_bytes_be(&wssmsg.nonces[coin_num])>=*nonce_domain {
+            return Err("share/mask/nonce does not match the original committed leaf/domain");
+        }
 
         // **Degree bound on the public degree-test polynomial.**
         //
@@ -318,6 +323,8 @@ pub(crate) fn avss_local_packet_valid_pure(
                     .collect();
                 let f_large = BigUint::from_bytes_be(f_large_shares[coin_num].as_slice());
                 let g_share = BigUint::from_bytes_be(mask_shares[coin_num].as_slice());
+                if BigUint::from_bytes_be(&wssmsg.secrets[coin_num])>=*secret_domain||f_large>=*nonce_domain
+                    ||g_share>=*nonce_domain||h_coeffs.iter().any(|v|v>=nonce_domain){return Err("prime share/coefficient outside field");}
 
                 if !verifier.verify_share(myid + 1, &f_large, &g_share, &h_coeffs, theta) {
                     log::warn!(
@@ -1285,6 +1292,7 @@ impl Context {
         //     consumed (round-1), now that this round's ACS is done.
         self.start_selected_awss_recovery(round, decided_vec.as_slice()).await;
         self.stash_coin_material(round, decided_vec.as_slice());
+        for dealer in &decided_vec {self.install_reserved_material(round,*dealer).await;}
         self.cleanup_coin_state(round);
         if round>0 {
             for dealer in 0..self.num_nodes { self.release_reserve_if_safe(round-1,dealer); }
@@ -1338,7 +1346,8 @@ impl Context {
 mod avss_binding_tests {
     use super::*;
     use crate::node::shamir::two_field::TwoFieldDealer;
-    use crypto::aes_hash::{HashState, MerkleTree};
+    use crypto::aes_hash::HashState;
+    use crate::node::merkle::MerkleTree;
     use num_bigint::RandBigInt;
     use rand::SeedableRng;
     use types::beacon::{BatchWSSMsg, BeaconMsg, Val};
