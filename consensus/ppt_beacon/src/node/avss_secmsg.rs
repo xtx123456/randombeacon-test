@@ -136,7 +136,7 @@ impl Context {
         // Ordinary SEND is only an RBC input. Cache public content after delivery.
         let round = msg.round; let dealer = msg.origin;
         let payload = bincode::serialize(&crate::node::wire::PublicBundle {
-            version: 2,
+            version: 3, challenge_root: None,
             public: msg, secmsg_roots: None, reserve_roots: None }).expect("public bundle encoding");
         self.process_scoped_rbc(crate::node::wire::RbcScope::PublicCommit,
             round, dealer, crate::node::wire::RbcMessage::Send(payload), wire_sender).await;
@@ -528,6 +528,8 @@ impl Context {
         plaintext: Vec<u8>,
         wire_sender: Replica,
     ) {
+        // Plain dealer unicasts cannot authenticate a SecMsg-bound main batch.
+        if self.transport != super::context::AvssTransport::Lite { return; }
         if wire_sender != dealer {
             log::warn!(
                 "[PPT][AVSS-LITE][PRIVATE] node {} dropping AVSSPrivatePayload \

@@ -50,11 +50,11 @@ fn valid_row(row:&[EchoPayload],root:Hash,provider:Replica,n:usize,_hash:&HashSt
         &&e.frag_path.matches_leaf(provider,n)&&e.frag_path.root()==e.msg_root
         &&e.frag_path.item()==do_hash(e.fragment.as_bytes())&&crate::node::merkle::validate(&e.frag_path))
 }
-fn valid_entries(entries:&[DealerDisclosure],dealers:&[Replica],batch:usize,n:usize)->bool {
+fn valid_entries(entries:&[DealerDisclosure],dealers:&[Replica],batch:usize,n:usize,proofless:bool)->bool {
     entries.len()==dealers.len()&&entries.iter().zip(dealers).all(|(e,d)|e.dealer==*d
         &&(e.key_row.is_empty()||e.key_row.len()==n)&&(e.cipher_row.is_empty()||e.cipher_row.len()==n)
         &&e.original.as_ref().map(|p|p.secrets.len()==batch&&p.nonces.len()==batch&&p.mask_shares.len()==batch
-            &&p.mps.len()==batch&&p.f_large_shares.as_ref().map(|v|v.len()==batch).unwrap_or(true)).unwrap_or(true)
+            &&p.mps.len()==(if proofless{0}else{batch})&&p.f_large_shares.as_ref().map(|v|v.len()==batch).unwrap_or(true)).unwrap_or(true)
         &&e.recovered.as_ref().map(|p|p.secrets.len()==batch&&p.nonces.len()==batch&&p.masks.len()==batch
             &&p.f_large.as_ref().map(|v|v.len()==batch).unwrap_or(true)&&p.providers.len()<=n).unwrap_or(true)
         &&e.key.as_ref().map(|k|k.len()==66).unwrap_or(true))
@@ -91,6 +91,7 @@ fn audit_dealer(bundle:&PublicBundle,input:&[(Replica,DealerDisclosure)],batch:u
     small:&BigUint,large:&BigUint,profile:Option<Gf2Profile>,hash:Arc<HashState>,cache:&mut OecCache,
     authenticated:&HashSet<Replica>,rejected:&mut Vec<Replica>)->DealerResult {
     let root=public_root(bundle);
+    let main_binding=bundle.challenge_root.as_ref();
     let input:Vec<_>=input.iter().filter(|(_,e)|e.root==root).collect();
     let mut payloads:BTreeMap<Replica,AvssRecipientPayload>=BTreeMap::new();let mut actual_keys=None;let mut actual_payloads=None;
     if let Some((key_root,cipher_root))=bundle.secmsg_roots {
@@ -107,7 +108,7 @@ fn audit_dealer(bundle:&PublicBundle,input:&[(Replica,DealerDisclosure)],batch:u
             let bytes=match decrypt_with_share(&key_prime,&key,&ciphers[provider]){Some(v)=>v,None=>return DealerResult::Complete(Some("committed ciphertext cannot be decrypted".into()))};
             let payload=match super::batch_degree_test::decode_payload(&bytes,profile,batch,0){Some(p)=>p,None=>return DealerResult::Complete(Some("committed plaintext is not a canonical AVSS payload".into()))};
             if super::batch_degree_test::encode_payload(&payload,profile,batch,0).as_ref()!=Some(&bytes)||payload.secrets.len()!=batch||payload.nonces.len()!=batch||payload.mask_shares.len()!=batch
-                ||payload.mps.len()!=batch||match (profile,&payload.f_large_shares){(Some(_),None)=>false,(None,Some(v))=>v.len()!=batch,_=>true}
+                ||payload.mps.len()!=(if main_binding.is_some(){0}else{batch})||match (profile,&payload.f_large_shares){(Some(_),None)=>false,(None,Some(v))=>v.len()!=batch,_=>true}
                 {return DealerResult::Complete(Some("committed plaintext has invalid canonical batch encoding".into()));}
             payloads.insert(provider,payload.clone());original.push(payload);
         }
@@ -119,7 +120,7 @@ fn audit_dealer(bundle:&PublicBundle,input:&[(Replica,DealerDisclosure)],batch:u
         // Lite comparison: original point paths authenticate the OEC inputs.
         // They do not replace the full polynomial/tree reconstruction below.
         for (provider,e) in &input {if let Some(p)=&e.original {
-            if share_pipeline::validate_original(&bundle.public,p,0,batch,*provider,n,f,small,large,profile,&hash){payloads.insert(*provider,p.clone());}
+            if share_pipeline::validate_original(&bundle.public,p,0,batch,*provider,n,f,small,large,profile,&hash,None){payloads.insert(*provider,p.clone());}
             else if authenticated.contains(provider){rejected.push(*provider);}
         }}if payloads.len()<2*f+1{return DealerResult::Waiting;}
     }
@@ -161,8 +162,9 @@ fn audit_dealer(bundle:&PublicBundle,input:&[(Replica,DealerDisclosure)],batch:u
     for (coin,tree) in trees.iter().enumerate(){
         if tree.root()!=bundle.public.root_vec[coin]{return DealerResult::Complete(Some(format!("fully rebuilt share commitment differs at coin {}",coin)));}
     }
-    for provider in 0..n {for tree in &trees{rebuilt[provider].mps.push(tree.gen_proof(provider));}
-        if !share_pipeline::validate_original(&bundle.public,&rebuilt[provider],0,batch,provider,n,f,small,large,profile,&hash){
+    for provider in 0..n {
+        if main_binding.is_none(){for tree in &trees{rebuilt[provider].mps.push(tree.gen_proof(provider));}}
+        if !share_pipeline::validate_original(&bundle.public,&rebuilt[provider],0,batch,provider,n,f,small,large,profile,&hash,main_binding){
             return DealerResult::Complete(Some("rebuilt polynomials fail the agreed degree-test identity/domain binding".into()));
         }
     }
@@ -217,7 +219,8 @@ impl Context {
                 let root=match self.awss_root(round,*dealer){Some(r)=>r,None=>return};
                 let original=self.avss_beacon_bytes.get(&(round,*dealer)).and_then(|b|super::batch_degree_test::decode_payload(b,self.gf2_profile,self.batch_size,0))
                     .or_else(||self.original_beacon_payload(round,*dealer));
-                let original=original.filter(|p|p.secrets.len()==self.batch_size&&p.nonces.len()==self.batch_size&&p.mask_shares.len()==self.batch_size&&p.mps.len()==self.batch_size);
+                let expected_proofs=if self.batch_input_root(round,*dealer).is_some(){0}else{self.batch_size};
+                let original=original.filter(|p|p.secrets.len()==self.batch_size&&p.nonces.len()==self.batch_size&&p.mask_shares.len()==self.batch_size&&p.mps.len()==expected_proofs);
                 let recovered=self.awss_recovery.get(&(round,*dealer)).and_then(|s|s.local_shares.as_ref()).map(|p|AuditValues{
                     secrets:p.secrets.clone(),masks:p.masks.clone(),nonces:p.nonces.clone(),f_large:p.f_large.clone(),providers:p.providers.clone()});
                 let (key,key_row,cipher_row)=self.avss_secmsg_state.get(&(round,*dealer)).map(|s|s.audit_material()).unwrap_or_default();
@@ -232,7 +235,8 @@ impl Context {
     #[async_recursion]
     pub(crate) async fn process_full_audit_disclosure(&mut self,round:Round,dealers:Vec<Replica>,entries:Vec<DealerDisclosure>,sender:Replica) {
         if sender>=self.num_nodes||round>self.max_rounds||dealers.len()<self.num_nodes-self.num_faults||dealers.len()>self.num_nodes||dealers.windows(2).any(|w|w[0]>=w[1])
-            ||dealers.iter().any(|d|*d>=self.num_nodes)||!valid_entries(&entries,&dealers,self.batch_size,self.num_nodes){return;}
+            ||dealers.iter().any(|d|*d>=self.num_nodes)||!valid_entries(&entries,&dealers,self.batch_size,self.num_nodes,
+                self.gf2_profile.is_some()&&self.transport==super::context::AvssTransport::SecMsg){return;}
         if let Some(selected)=self.round_state.get(&round).and_then(|s|s.acs_decided_set.as_ref()){if selected!=&dealers{return;}}
         let state=self.full_audit.entry(round).or_default();if state.complete||state.authenticated.contains(&sender){return;}
         state.rows.insert(sender,AuditPacket{dealers,entries:Arc::new(entries)});state.authenticated.insert(sender);state.version+=1;
@@ -244,7 +248,8 @@ impl Context {
             ||dealers.windows(2).any(|w|w[0]>=w[1])||dealers.iter().any(|d|*d>=self.num_nodes){return;}
         let mut seen=HashSet::new();
         for (provider,entries) in rows {
-            if provider>=self.num_nodes||!seen.insert(provider)||!valid_entries(&entries,&dealers,self.batch_size,self.num_nodes){continue;}
+            if provider>=self.num_nodes||!seen.insert(provider)||!valid_entries(&entries,&dealers,self.batch_size,self.num_nodes,
+                self.gf2_profile.is_some()&&self.transport==super::context::AvssTransport::SecMsg){continue;}
             // Forwarded rows prove their fragment/point indices with Merkle paths.
             // They cannot create authenticated provider-misconduct accusations.
             let state=self.full_audit.entry(round).or_default();if state.complete{break;}

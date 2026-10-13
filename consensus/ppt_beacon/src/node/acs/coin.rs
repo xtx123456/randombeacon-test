@@ -167,6 +167,8 @@ impl Context {
                 let wss = state.node_secrets.get(&d);
                 let masks = state.mask_shares.get(&d);
                 if let (Some(wss), Some(masks)) = (wss, masks) {
+                    let proofless=self.gf2_profile.is_some()&&self.transport==crate::node::context::AvssTransport::SecMsg;
+                    let required_proofs=if proofless{PPT_COIN_RESERVE}else{total};
                     let f_larges = if self.gf2_profile.is_some() {
                         &wss.secrets
                     } else {
@@ -177,7 +179,7 @@ impl Context {
                     };
                     if wss.secrets.len() >= total
                         && wss.nonces.len() >= total
-                        && wss.mps.len() >= total
+                        && wss.mps.len() >= required_proofs
                         && masks.len() >= total
                         && f_larges.len() >= total
                     {
@@ -189,7 +191,7 @@ impl Context {
                                 masks[idx],
                                 f_larges[idx],
                                 wss.nonces[idx],
-                                wss.mps[idx].clone(),
+                                wss.mps[if proofless{rr}else{idx}].clone(),
                             ));
                         }
                         my_shares.insert(d, v);

@@ -123,7 +123,7 @@ impl Context {
         let public = &bundle.public;
         let round = public.round; let dealer = public.origin;
         let total = self.batch_size + super::context::PPT_COIN_RESERVE;
-        if bundle.version != 2 || !public.verify_transcript_root() || public.root_vec.len() != total
+        if bundle.version != 3 || !public.verify_transcript_root() || public.root_vec.len() != total
             || !super::batch_degree_test::public_shape(public, self.batch_size, self.num_nodes,
                 self.num_faults, self.gf2_profile) {
             log::warn!("[PPT][PUBLIC-RBC] rejected malformed public transcript round={} dealer={}", round, dealer);
@@ -132,6 +132,14 @@ impl Context {
         if self.round_state.get(&round).map(|state| state.cleared).unwrap_or(false) { return; }
         if self.transport == super::context::AvssTransport::SecMsg && (bundle.secmsg_roots.is_none()||bundle.reserve_roots.is_none()) {
             log::warn!("[PPT][PUBLIC-RBC] SecMsg transcript lacks key/cipher commitments"); return;
+        }
+        let expected_challenge=if self.transport==super::context::AvssTransport::SecMsg {
+            self.gf2_profile.map(|profile|super::batch_degree_test::secmsg_input_root(round,dealer,
+                &public.root_vec,bundle.secmsg_roots.expect("checked SecMsg commitments"),
+                self.batch_size,self.num_nodes,self.num_faults,profile))
+        }else{None};
+        if bundle.challenge_root!=expected_challenge {
+            log::warn!("[PPT][PUBLIC-RBC] main challenge input is not bound to the encrypted batch");return;
         }
         let roots = bundle.secmsg_roots;
         let reserve_roots=bundle.reserve_roots;

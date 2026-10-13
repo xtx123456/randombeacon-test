@@ -104,7 +104,7 @@ impl Context {
         let public=match self.avss_secmsg_public.get(&(round,dealer)){Some(p)=>p,None=>return};
         let count=super::context::PPT_COIN_RESERVE;
         if !super::share_pipeline::validate_original(public,&payload,self.batch_size,count,self.myid,self.num_nodes,self.num_faults,
-            &self.secret_domain,&self.nonce_domain,self.gf2_profile,&self.hash_context){return;}
+            &self.secret_domain,&self.nonce_domain,self.gf2_profile,&self.hash_context,self.batch_input_root(round,dealer).as_ref()){return;}
         let shares=(0..count).map(|i|(payload.secrets[i],payload.mask_shares[i],
             payload.f_large_shares.as_ref().map(|v|v[i]).unwrap_or(payload.secrets[i]),payload.nonces[i],payload.mps[i].clone())).collect();
         self.coin_material.get_mut(&round).unwrap().my_shares.insert(dealer,shares);

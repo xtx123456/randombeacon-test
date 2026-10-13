@@ -70,7 +70,7 @@ impl Context {
         let payload=match super::batch_degree_test::decode_payload(bytes,self.gf2_profile,self.batch_size,0){Some(p)=>p,None=>return false};
         let public=match self.avss_secmsg_public.get(&(round,dealer)){Some(p)=>p,None=>return false};
         super::share_pipeline::validate_original(public,&payload,0,self.batch_size,source,self.num_nodes,self.num_faults,
-            &self.secret_domain,&self.nonce_domain,self.gf2_profile,&self.hash_context)
+            &self.secret_domain,&self.nonce_domain,self.gf2_profile,&self.hash_context,self.batch_input_root(round,dealer).as_ref())
     }
 
     /// Out-of-order subprotocol data is processed only after public RBC fixed
@@ -398,7 +398,7 @@ impl Context {
         match self.gf2_profile {
             Some(profile) => {
                 if !super::batch_degree_test::verify_values(public,&secrets,&masks,0,total,self.myid,
-                    self.num_nodes,self.num_faults,profile){return;}
+                    self.num_nodes,self.num_faults,profile,self.batch_input_root(round,dealer).as_ref()){return;}
             }
             None => {
                 let verifier = super::shamir::two_field::TwoFieldDealer::new(self.secret_domain.clone(), self.nonce_domain.clone(), self.num_faults+1, self.num_nodes);

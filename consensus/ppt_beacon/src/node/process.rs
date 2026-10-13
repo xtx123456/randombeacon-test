@@ -100,7 +100,7 @@ pub(crate) fn avss_local_packet_valid_pure(
         let payload=types::beacon::AvssRecipientPayload::new(wss.secrets.clone(),wss.nonces.clone(),
             masks.clone(),None,wss.mps.clone());
         return if super::share_pipeline::validate_original(&public,&payload,0,batch_size,myid,num_nodes,num_faults,
-            secret_domain,nonce_domain,gf2_profile,_hash_context) {Ok(())}
+            secret_domain,nonce_domain,gf2_profile,_hash_context,None) {Ok(())}
             else {Err("GF2 batch/reserve degree test or original commitment failed")};
     }
 
@@ -914,6 +914,24 @@ impl Context {
             return;
         }
 
+        let main_binding=self.batch_input_root(round,dealer);
+        if self.gf2_profile.is_some()&&self.transport==super::context::AvssTransport::SecMsg {
+            // Raw AVSSSend/Lite messages cannot replace the committed SecMsg
+            // plaintext. This check also prevents an unauthenticated payload
+            // from making a recipient vote happy when main paths are absent.
+            if main_binding.is_none()||!self.has_secmsg_batch_delivery(round,dealer){return;}
+            let expected=match self.avss_secmsg_delivered_bytes.get(&(round,dealer))
+                .and_then(|bytes|super::batch_degree_test::decode_payload(bytes,self.gf2_profile,self.batch_size,0)) {
+                Some(payload)=>payload,None=>return,
+            };
+            let public=match self.avss_secmsg_public.get(&(round,dealer)){Some(p)=>p,None=>return};
+            if crypto::hash::do_hash(&super::public_rbc::transcript(public).serialize_ctrbc())!=transcript_root
+                ||beacon_msg.mask_shares.as_ref()!=Some(&expected.mask_shares)
+                ||beacon_msg.f_large_shares!=expected.f_large_shares
+                ||!beacon_msg.wss.as_ref().map(|wss|wss.origin==dealer&&wss.secrets==expected.secrets
+                    &&wss.nonces==expected.nonces&&wss.mps==expected.mps).unwrap_or(false){return;}
+        }
+
         // Lazy-create the per-round CTRBCState so the detached
         // validation's apply path can find it when its result lands.
         if !self.round_state.contains_key(&round) {
@@ -951,7 +969,25 @@ impl Context {
         tokio::spawn(async move {
             let (validation_result, beacon_msg_back) =
                 tokio::task::spawn_blocking(move || {
-                    let result = avss_local_packet_valid_pure(
+                    let result = if let (Some(binding),Some(profile))=(main_binding,gf2_profile) {
+                        let result=(|| {
+                            if beacon_msg.origin!=dealer||beacon_msg.round!=round {
+                                return Err("SecMsg batch identity mismatch");
+                            }
+                            let wss=beacon_msg.wss.as_ref().ok_or("missing WSS payload")?;
+                            let public=types::beacon::AvssPublicCommitMsg::new(dealer,round,
+                                beacon_msg.root_vec.as_ref().ok_or("missing root vector")?.clone(),
+                                beacon_msg.degree_test_coeffs.as_ref().ok_or("missing h")?.clone());
+                            let payload=types::beacon::AvssRecipientPayload::new(wss.secrets.clone(),wss.nonces.clone(),
+                                beacon_msg.mask_shares.as_ref().ok_or("missing mask")?.clone(),
+                                beacon_msg.f_large_shares.clone(),wss.mps.clone());
+                            if super::share_pipeline::validate_original(&public,&payload,0,batch_size+super::context::PPT_COIN_RESERVE,
+                                myid,num_nodes,num_faults,&secret_domain,&nonce_domain,Some(profile),&hash_context,Some(&binding)) {
+                                Ok(())
+                            }else{Err("SecMsg batch/reserve degree check failed")}
+                        })();
+                        result
+                    }else{avss_local_packet_valid_pure(
                         &beacon_msg,
                         &transcript_root_owned,
                         dealer,
@@ -965,7 +1001,7 @@ impl Context {
                         crate::node::context::PPT_COIN_RESERVE,
                         myid,
                         gf2_profile,
-                    );
+                    )};
                     (result, beacon_msg)
                 })
                 .await

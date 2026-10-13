@@ -22,36 +22,51 @@ pub(crate) enum ShareCompletion {
     Failed {round:Round,error:String},
 }
 
-pub(crate) fn slice_payload(p:&AvssRecipientPayload,start:usize,len:usize)->Option<AvssRecipientPayload> {
+pub(crate) fn slice_payload(p:&AvssRecipientPayload,start:usize,len:usize,batch:usize)->Option<AvssRecipientPayload> {
     let end=start.checked_add(len)?;
+    let proofs=if p.mps.len()==p.secrets.len(){p.mps.get(start..end)?.to_vec()}
+        else if p.secrets.len()==batch&&p.mps.is_empty()&&start==0&&len==batch{Vec::new()}
+        else if p.secrets.len()==batch+super::context::PPT_COIN_RESERVE&&p.mps.len()==super::context::PPT_COIN_RESERVE {
+            if start==0&&len==batch{Vec::new()}
+            else if start==batch&&len==super::context::PPT_COIN_RESERVE{p.mps.clone()}
+            else{return None;}
+        }else{return None;};
     Some(AvssRecipientPayload::new(p.secrets.get(start..end)?.to_vec(),p.nonces.get(start..end)?.to_vec(),
-        p.mask_shares.get(start..end)?.to_vec(),match &p.f_large_shares{Some(v)=>Some(v.get(start..end)?.to_vec()),None=>None},p.mps.get(start..end)?.to_vec()))
+        p.mask_shares.get(start..end)?.to_vec(),match &p.f_large_shares{Some(v)=>Some(v.get(start..end)?.to_vec()),None=>None},proofs))
 }
 pub(crate) fn join_payloads(mut a:AvssRecipientPayload,b:AvssRecipientPayload)->Option<AvssRecipientPayload> {
     a.secrets.extend(b.secrets);a.nonces.extend(b.nonces);a.mask_shares.extend(b.mask_shares);a.mps.extend(b.mps);
     match (&mut a.f_large_shares,b.f_large_shares){(Some(a),Some(b))=>a.extend(b),(None,None)=>{},_=>return None,}Some(a)
 }
 
-/// Verify original share inputs with their OWN commitment paths. The challenge
-/// remains bound to the ENTIRE public root vector, including sealed reserves.
+/// A main_binding is supplied ONLY for SecMsg-authenticated plaintexts or
+/// verified Forward/audit reconstructions. It replaces main coin paths, never
+/// input authentication. Reserves and Lite comparisons retain their paths.
 pub(crate) fn validate_original(public:&AvssPublicCommitMsg,p:&AvssRecipientPayload,
     offset:usize,len:usize,source:Replica,n:usize,f:usize,small:&BigUint,large:&BigUint,
-    profile:Option<Gf2Profile>,_hash:&HashState)->bool {
-    if source>=n||p.secrets.len()!=len||p.nonces.len()!=len||p.mask_shares.len()!=len||p.mps.len()!=len
+    profile:Option<Gf2Profile>,_hash:&HashState,main_binding:Option<&crypto::hash::Hash>)->bool {
+    let batch=public.root_vec.len().checked_sub(super::context::PPT_COIN_RESERVE);
+    let expected_proofs=if main_binding.is_some()&&offset==0 {
+        match batch{Some(batch) if len==batch=>0,
+            Some(batch) if len==batch+super::context::PPT_COIN_RESERVE=>super::context::PPT_COIN_RESERVE,_=>return false}
+    }else{len};
+    if (main_binding.is_some()&&profile.is_none())||source>=n||p.secrets.len()!=len||p.nonces.len()!=len||p.mask_shares.len()!=len||p.mps.len()!=expected_proofs
         ||offset.checked_add(len).map(|end|end>public.root_vec.len()
             ||(profile.is_none()&&end>public.degree_test_coeffs.len())).unwrap_or(true)
         || match (profile,&p.f_large_shares){(Some(_),None)=>false,(None,Some(v))=>v.len()!=len,_=>true}{return false;}
     // Sharing, transport and rebuilding use the same PPTB SHA-256 rule.
-    if !crate::node::merkle::validate_batch(&p.mps){return false;}
+    if !p.mps.is_empty()&&!crate::node::merkle::validate_batch(&p.mps){return false;}
     if let Some(profile)=profile {
-        let batch=match public.root_vec.len().checked_sub(super::context::PPT_COIN_RESERVE){Some(b) if b>0=>b,_=>return false};
+        let batch=match batch{Some(b) if b>0=>b,_=>return false};
         for i in 0..len {
-            let proof=&p.mps[i];
+            if BigUint::from_bytes_be(&p.nonces[i])>=*large{return false;}
+            if main_binding.is_some()&&offset+i<batch{continue;}
+            let index=if main_binding.is_some()&&offset==0{i-batch}else{i};
+            let proof=&p.mps[index];
             if !proof.matches_leaf(source,n)||proof.root()!=public.root_vec[offset+i]
-                ||BigUint::from_bytes_be(&p.nonces[i])>=*large
                 ||proof.item()!=types::beacon::avss_commit_leaf_gf2(&p.secrets[i],&p.mask_shares[i],&p.nonces[i]){return false;}
         }
-        return super::batch_degree_test::verify_values(public,&p.secrets,&p.mask_shares,offset,batch,source,n,f,profile);
+        return super::batch_degree_test::verify_values(public,&p.secrets,&p.mask_shares,offset,batch,source,n,f,profile,main_binding);
     }
     let theta=Context::theta_from_commitment(public.round,public.origin,&public.root_vec,large);
     let binary=profile.and_then(|p|super::shamir::gf2_two_field::Gf2TwoFieldDealer::new(p,f+1,n).ok());
@@ -86,18 +101,20 @@ pub(crate) fn validate_original(public:&AvssPublicCommitMsg,p:&AvssRecipientPayl
 
 impl Context {
     pub(crate) fn original_beacon_payload(&self,round:Round,dealer:Replica)->Option<AvssRecipientPayload> {
+        let binding=self.batch_input_root(round,dealer);
+        if binding.is_some()&&!self.has_secmsg_batch_delivery(round,dealer){return None;}
         if let Some(bytes)=self.avss_beacon_bytes.get(&(round,dealer)) {
             let p=super::batch_degree_test::decode_payload(bytes,self.gf2_profile,self.batch_size,0)?;
             let public=self.avss_secmsg_public.get(&(round,dealer))?;
             if validate_original(public,&p,0,self.batch_size,self.myid,self.num_nodes,self.num_faults,
-                &self.secret_domain,&self.nonce_domain,self.gf2_profile,&self.hash_context){return Some(p);}return None;
+                &self.secret_domain,&self.nonce_domain,self.gf2_profile,&self.hash_context,binding.as_ref()){return Some(p);}return None;
         }
         let state=self.round_state.get(&round)?;
         if !state.avss_local_valid.contains(&dealer){return None;}
         let wss=state.node_secrets.get(&dealer)?;
         let p=AvssRecipientPayload::new(wss.secrets.clone(),wss.nonces.clone(),state.mask_shares.get(&dealer)?.clone(),
             if self.gf2_profile.is_none(){Some(state.f_large_shares.get(&dealer)?.clone())}else{None},wss.mps.clone());
-        slice_payload(&p,0,self.batch_size)
+        slice_payload(&p,0,self.batch_size,self.batch_size)
     }
 
     #[async_recursion]

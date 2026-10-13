@@ -3,27 +3,47 @@
 //! The main batch shares one independent mask polynomial. Sealed reserve
 //! coins keep their own masks and per-coin checks: opening the main batch
 //! must not expose any relation involving a still sealed reserve coin.
-//! Challenge derivation retains the commitment-hash approach; this module
-//! does not claim to instantiate the full JoC section 7 protocol.
+//! SecMsg main challenges bind the encrypted input before h is computed.
+//! Lite comparisons retain share paths. Separate SecMsg/public RBC voting
+//! remains; no complete adaptive/QROM proof is claimed by this implementation.
 use crypto::gf2::{Gf2Element, Gf2Profile};
 use crypto::hash::{do_hash, Hash};
 use types::{Replica, Round};
 use types::beacon::{AvssPublicCommitMsg, AvssRecipientPayload, Val};
 use super::{Context, context::PPT_COIN_RESERVE};
 
+/// Root of the complete encrypted main input, fixed BEFORE challenge/response.
+/// The private plaintext excludes h/theta, so this ordering has no cycle.
+pub(crate) fn secmsg_input_root(round: Round, dealer: Replica, roots: &[Hash],
+    key_cipher: (Hash, Hash), batch: usize, n: usize, f: usize,
+    profile: Gf2Profile) -> Hash {
+    let mut input = b"PPTB_SECMSG_BATCH_INPUT_v1::".to_vec();
+    input.extend_from_slice(&round.to_be_bytes());
+    for value in [dealer, batch, n, f, profile.w_p, profile.w_q, roots.len()] {
+        input.extend_from_slice(&(value as u64).to_be_bytes());
+    }
+    input.extend_from_slice(&key_cipher.0);
+    input.extend_from_slice(&key_cipher.1);
+    for root in roots { input.extend_from_slice(root); }
+    do_hash(&input)
+}
+
 /// One independently domain-separated coefficient per main input polynomial.
 /// The full commitment and field/batch parameters are fixed before derivation.
 pub(crate) fn challenges(round: Round, dealer: Replica, roots: &[Hash],
-    batch: usize, n: usize, f: usize, profile: Gf2Profile) -> Vec<Gf2Element> {
+    batch: usize, n: usize, f: usize, profile: Gf2Profile,
+    secmsg_root: Option<&Hash>) -> Vec<Gf2Element> {
     let mut input = b"PPTB_BATCH_DEGREE_R1_COMMIT_v1::".to_vec();
     input.extend_from_slice(&round.to_be_bytes());
     for value in [dealer, batch, n, f, profile.w_p as usize, profile.w_q as usize, roots.len()] {
         input.extend_from_slice(&(value as u64).to_be_bytes());
     }
     for root in roots { input.extend_from_slice(root); }
-    let commitment = do_hash(&input);
+    let commitment = secmsg_root.copied().unwrap_or_else(|| do_hash(&input));
     (0..batch).map(|coin| {
-        let mut query = b"PPTB_BATCH_DEGREE_R1_COEFFICIENT_v1::".to_vec();
+        let domain: &[u8] = if secmsg_root.is_some() { b"PPTB_SECMSG_BATCH_COEFFICIENT_v1::" }
+            else { b"PPTB_BATCH_DEGREE_R1_COEFFICIENT_v1::" };
+        let mut query = domain.to_vec();
         query.extend_from_slice(&commitment);
         query.extend_from_slice(&(coin as u64).to_be_bytes());
         Gf2Element::from_random_bytes(profile, do_hash(&query))
@@ -63,7 +83,7 @@ pub(crate) fn public_shape(public: &AvssPublicCommitMsg, batch: usize,
 /// may be checked; a fragment of the main batch cannot satisfy this check.
 pub(crate) fn verify_values(public: &AvssPublicCommitMsg, secrets: &[Val], masks: &[Val],
     offset: usize, batch: usize, source: Replica, n: usize, f: usize,
-    profile: Gf2Profile) -> bool {
+    profile: Gf2Profile, secmsg_root: Option<&Hash>) -> bool {
     if source >= n || secrets.len() != masks.len()
         || !public_shape(public, batch, n, f, Some(profile)) { return false; }
     let total = batch + PPT_COIN_RESERVE;
@@ -81,7 +101,7 @@ pub(crate) fn verify_values(public: &AvssPublicCommitMsg, secrets: &[Val], masks
         let mut combination = match Gf2Element::from_bytes(profile, masks[0]) {
             Ok(value) => value, Err(_) => return false,
         };
-        let theta = challenges(public.round, public.origin, &public.root_vec, batch, n, f, profile);
+        let theta = challenges(public.round, public.origin, &public.root_vec, batch, n, f, profile, secmsg_root);
         for (secret, theta) in secrets[..batch].iter().zip(&theta) {
             if Gf2Element::from_bytes(base, *secret).is_err() { return false; }
             let secret = match Gf2Element::from_bytes(profile, *secret) { Ok(v) => v, Err(_) => return false };
@@ -144,4 +164,22 @@ pub(crate) fn decode_payload(bytes: &[u8], profile: Option<Gf2Profile>,
         }
     }
     Some(payload)
+}
+
+impl Context {
+    pub(crate) fn batch_input_root(&self, round: Round, dealer: Replica) -> Option<Hash> {
+        self.avss_public_bundles.get(&(round, dealer)).and_then(|bundle| bundle.challenge_root)
+    }
+
+    /// A dealer-authenticated TCP message is insufficient. Proofless inputs
+    /// come only from a complete SecMsg delivery under the agreed key/cipher roots.
+    pub(crate) fn has_secmsg_batch_delivery(&self, round: Round, dealer: Replica) -> bool {
+        let roots = match self.avss_public_bundles.get(&(round, dealer)).and_then(|b| b.secmsg_roots) {
+            Some(roots) => roots, None => return false,
+        };
+        let bytes = match self.avss_beacon_bytes.get(&(round, dealer)) { Some(b) => b, None => return false };
+        self.avss_secmsg_state.get(&(round, dealer)).map(|state| {
+            state.commitment_roots() == Some(roots) && state.delivered_message() == Some(bytes.as_slice())
+        }).unwrap_or(false)
+    }
 }

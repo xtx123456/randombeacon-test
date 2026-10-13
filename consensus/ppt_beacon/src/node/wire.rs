@@ -19,8 +19,10 @@ pub(crate) enum ForwardTag { Complaint, Assist, Report }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PublicBundle {
-    /// Version 2 uses one GF2 main-batch h and a compact main mask.
+    /// Version 3 authenticates GF2 main inputs with SecMsg, without coin paths.
     pub version: u16,
+    /// Explicit input root for the main RO challenge; verified against SecMsg.
+    pub challenge_root: Option<Hash>,
     pub public: types::beacon::AvssPublicCommitMsg,
     /// Exact roots of the SecMsg key/cipher vectors. None for Lite comparisons.
     pub secmsg_roots: Option<(Hash, Hash)>,

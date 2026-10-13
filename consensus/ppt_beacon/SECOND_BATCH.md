@@ -35,39 +35,60 @@ configuration and benchmark defaults.
 
 The live GF2 path now samples B small-field f polynomials and ONE independent
 large-field g polynomial. After committing every recipient's f/g/nonce data,
-it derives one domain-separated challenge coefficient theta_l per input and
-broadcasts a single h = g + sum_l theta_l*f_l (minus equals plus in GF2).
-Recipients authenticate all original points, enforce base/extension membership
+the SecMsg path encrypts/encodes the complete main input and fixes its key/cipher
+roots. A context-bound input root r combines these roots and the share roots;
+only then does it derive theta_l and compute the single h = g + sum_l theta_l*f_l
+(minus equals plus in GF2). Lite retains the share-root challenge comparison.
+Recipients authenticate the complete SecMsg message, enforce base/extension membership
 and the exact f+1 coefficient bound, then verify the complete batch identity.
 A proper subset of main inputs cannot pass as a complete batch. Complaint
 recovery rechecks the same identity at the recovering recipient's point.
 
 Challenge inputs bind the round, dealer, field widths, B, n, f, the complete
-root vector and coefficient position. This retains a commitment-hash challenge
-approach, adapted to a coefficient vector. It is not a full implementation or
-adaptive/QROM proof of JoC section 7, and it does not change ACS coin bootstrap.
+root vector and coefficient position. SecMsg uses its explicitly transmitted,
+receiver-verified input root r; encrypted input bytes contain no theta/h, so
+the commit/challenge/response ordering has no circular dependency. This follows
+the section 7 input-binding approach, but retains separate public RBC and SecMsg
+votes and does not claim the complete Dst3move optimization or adaptive/QROM proof.
+ACS coin bootstrap is unchanged.
 R remains exactly 1; field widths and target128 configuration gates are unchanged.
 
 The main private payload encodes only one 32-byte mask share. Internal state
 expands it into a repeated per-coin view for existing bookkeeping; that view is
 not the encrypted transport encoding. Audit decodes/re-evaluates the shared mask
 once and rebuilds the identical compact plaintext, ciphertext and Merkle roots.
-Existing per-coin nonce shares, share roots and Merkle proofs are retained.
+Existing per-coin nonce shares and public share roots are retained. In GF2+SecMsg,
+the main plaintext has an EMPTY coin-proof vector. A local happy vote requires
+actual SecMsg delivery under the public RBC's exact key/cipher roots. Raw
+AVSSSend/Lite unicasts cannot replace that authenticated plaintext. Complaint
+and assist inputs require verified Forward certificates under the same roots.
+Audit recovers the ORIGINAL committed key/cipher vectors before trusting their
+plaintexts, then rebuilds all share roots and the compact encrypted payload.
+It does not manufacture main coin paths that were never sent. Provider-declared
+plaintexts remain diagnostics, not unauthenticated OEC inputs. Lite and prime
+comparisons retain per-coin paths.
 
 The 12 sealed reserve coins KEEP independent masks and individual h responses,
 in their independently keyed SecMsg instance. Main audit must not reveal a mask
 relation involving a sealed reserve. Public h layout in GF2 is therefore
 [main_h, reserve_h_0, ..., reserve_h_11], not one h over all B+12 inputs.
 Prime-field comparisons retain per-coin h/masks; they have no extension-field
-soundness claim. The PPT-only PublicBundle version is now 2; all PPT nodes must
+soundness claim. The PPT-only PublicBundle version is now 3; all PPT nodes must
 update together. Shared BEA/HashRand messages and implementation are unchanged.
 
 At n=16, f=5, B=1000, raw public h coefficients fall from 194304 bytes to
 2496 bytes per dealer (including the 12 reserves). Main private mask values
 fall from 32000 bytes to 32 bytes per recipient. These are payload counts,
-not measured network traffic or throughput; RBC/SecMsg, proofs, metadata,
-complaints, ACS and audit costs remain. Retained per-coin proofs prevent this
-change alone from establishing a strict O(n) total amortized communication bound.
+not measured network traffic or throughput. With the main paths removed,
+GF2+SecMsg's canonical main plaintext at B=1000 is 64065 bytes, compared with
+276065 bytes at n=16 in version 2; reserve paths are unchanged. SecMsg's own
+message/fragment proofs, metadata, complaints, ACS and audit costs remain.
+For fixed widths and A ABA rounds, normal-path offline communication is
+O(B*n^2 + A*n^3*log n). Dividing by B*(m-f)=Theta(B*n) yields
+O(n + A*n^2*log n/B), which is O(n) when B=Omega(A*n*log n).
+This is a conditional amortized normal-path bound, not a Byzantine worst-case
+termination claim. Full output reconstruction and audit still have quadratic
+amortized communication with sufficiently large B; matrix/OEC code is unchanged.
 
 The matrix uses sorted dealer IDs+1 as input points and the next m-f distinct
 points as output points. All recipients use identical input order/dimensions.
@@ -112,8 +133,9 @@ rebuilding prove a bad dealer; missing fragments merely cause waiting.
 
 For every beacon coin, audit OEC recovers f, nonce and (in the prime comparison)
 large-field f, then re-evaluates all n points. GF2 audit recovers the ONE main
-g polynomial once; the prime comparison retains per-coin g. Rebuild each share tree, generate
-its original point paths, serialize the original bincode recipient layout,
+g polynomial once; the prime comparison retains per-coin g. Rebuild each share
+tree and, only for comparison modes that originally carried paths, generate
+its original point paths. Serialize the original bincode recipient layout,
 encrypt with the reconstructed actual key share and apply the original RS
 encoding/tree shape. Rebuild the key polynomial, canonical key encoding and both
 key/cipher meta-roots. A plaintext tree cannot stand in for a ciphertext commitment.
