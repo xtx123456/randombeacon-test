@@ -553,7 +553,7 @@ impl Context {
             crate::node::context::AvssTransport::Lite => {
                 let public_commit=make_public(None);
                 self.start_public_rbc(crate::node::wire::PublicBundle {
-                    version: 3, challenge_root: None,
+                    version: crate::node::wire::PUBLIC_BUNDLE_VERSION, challenge_root: None,
                     public: public_commit.clone(), secmsg_roots: None, reserve_roots: None }).await;
                 log::info!(
                     "[PPT][AVSS-LITE] node {} dispatching {} per-recipient \
@@ -639,7 +639,7 @@ impl Context {
                     new_round,self.myid,&roots_vec,roots,batch_size,n,faults,profile));
                 let public_commit=make_public(challenge_root.as_ref());
                 self.start_public_rbc(crate::node::wire::PublicBundle {
-                    version: 3, challenge_root,
+                    version: crate::node::wire::PUBLIC_BUNDLE_VERSION, challenge_root,
                     public: public_commit, secmsg_roots: Some(roots), reserve_roots: Some(reserve_roots) }).await;
                 self.dispatch_avss_secmsg_actions(new_round, self.myid, actions).await;
                 self.dispatch_reserve_actions(new_round,self.myid,reserve_actions).await;

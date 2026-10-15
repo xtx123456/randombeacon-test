@@ -61,6 +61,9 @@ impl Context {
         // unwrap below is panic-free in any production config.
         let mut state = SecMsgDstState::new(myid, n, t, dealer, prime, hash_state)
             .expect("SecMsgDstState::new given a Context-validated config");
+        let binary=self.gf2_profile.is_some();
+        state.set_message_limit(super::payload_limits::plaintext(self.batch_size,n,binary,binary,true)
+            .expect("Context-validated main payload bound"));
         // The immutable public RBC bundle fixes both transcript roots.
         // Sender construction precedes RBC; receiver construction follows it.
         if let Some((key, cipher)) = self.avss_public_bundles.get(&(round, dealer)).and_then(|bundle| bundle.secmsg_roots) {
@@ -136,7 +139,7 @@ impl Context {
         // Ordinary SEND is only an RBC input. Cache public content after delivery.
         let round = msg.round; let dealer = msg.origin;
         let payload = bincode::serialize(&crate::node::wire::PublicBundle {
-            version: 3, challenge_root: None,
+            version: crate::node::wire::PUBLIC_BUNDLE_VERSION, challenge_root: None,
             public: msg, secmsg_roots: None, reserve_roots: None }).expect("public bundle encoding");
         self.process_scoped_rbc(crate::node::wire::RbcScope::PublicCommit,
             round, dealer, crate::node::wire::RbcMessage::Send(payload), wire_sender).await;

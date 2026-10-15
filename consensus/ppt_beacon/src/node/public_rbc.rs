@@ -29,7 +29,7 @@ impl Context {
         match message {
             PptWire::TransformedShares{round,dealers,values}=>self.process_transformed_shares(round,dealers,values,sender).await,
             PptWire::AuditDisclosure{round,dealers,entries}=>self.process_full_audit_disclosure(round,dealers,entries,sender).await,
-            PptWire::AuditCertificate{round,dealers,rows}=>self.process_audit_certificate(round,dealers,rows,sender).await,
+            PptWire::AuditCertificate{..}=>{}, // Legacy slot: only direct provider rows enter audits.
             PptWire::AuditRecovered{round}=>self.note_audit_ack(round,sender),
             message @ PptWire::ReserveTransport{..}|message @ PptWire::ReserveRequest{..}|message @ PptWire::ReserveRecovered{..}=>self.process_reserve_wire(message,sender).await,
             PptWire::Rbc { scope, round, proposer, message } => {
@@ -52,8 +52,9 @@ impl Context {
         let proposer = bundle.public.origin;
         let payload = bincode::serialize(&bundle).expect("public AWSS bundle encoding");
         let myid = self.myid; let n = self.num_nodes; let f = self.num_faults;
+        let limit=super::payload_limits::public_bundle(self.batch_size,n,self.gf2_profile.is_some()).unwrap_or(0);
         let actions = self.avss_public_rbc.entry((round, proposer)).or_insert_with(||
-            RbcInstanceState::new(myid, proposer, n, f))
+            RbcInstanceState::new_bounded(myid, proposer, n, f, limit))
             .proposer_send(payload);
         self.dispatch_public_rbc(round, proposer, actions).await;
     }
@@ -72,8 +73,9 @@ impl Context {
         // Requests can still be served after local batch cleanup. A slow honest
         // recipient must not depend on the Byzantine proposer sending again.
         let myid = self.myid; let n = self.num_nodes; let f = self.num_faults;
+        let limit=super::payload_limits::public_bundle(self.batch_size,n,self.gf2_profile.is_some()).unwrap_or(0);
         let state = self.avss_public_rbc.entry((round, proposer))
-            .or_insert_with(|| RbcInstanceState::new(myid, proposer, n, f));
+            .or_insert_with(|| RbcInstanceState::new_bounded(myid, proposer, n, f, limit));
         let actions = match message {
             RbcMessage::Send(payload) => {
                 let bundle: PublicBundle = match bincode::deserialize(&payload) { Ok(value) => value, Err(_) => return };
@@ -123,7 +125,7 @@ impl Context {
         let public = &bundle.public;
         let round = public.round; let dealer = public.origin;
         let total = self.batch_size + super::context::PPT_COIN_RESERVE;
-        if bundle.version != 3 || !public.verify_transcript_root() || public.root_vec.len() != total
+        if bundle.version != wire::PUBLIC_BUNDLE_VERSION || !public.verify_transcript_root() || public.root_vec.len() != total
             || !super::batch_degree_test::public_shape(public, self.batch_size, self.num_nodes,
                 self.num_faults, self.gf2_profile) {
             log::warn!("[PPT][PUBLIC-RBC] rejected malformed public transcript round={} dealer={}", round, dealer);

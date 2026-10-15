@@ -31,6 +31,8 @@ pub struct RbcInstanceState {
     ready_by_sender: HashMap<Replica, Hash>,
     requested: HashSet<Hash>,
     requesters: HashMap<Hash, HashSet<Replica>>,
+    served: HashSet<(Replica, Hash)>,
+    max_payload_bytes: usize,
     own_echo_sent: bool,
     own_ready_sent: bool,
     delivered: bool,
@@ -42,14 +44,18 @@ impl RbcInstanceState {
             echo_senders_per_hash: HashMap::new(), ready_senders_per_hash: HashMap::new(),
             echo_by_sender: HashMap::new(), ready_by_sender: HashMap::new(),
             requested: HashSet::new(), requesters: HashMap::new(),
+            served: HashSet::new(), max_payload_bytes: usize::MAX,
             own_echo_sent: false, own_ready_sent: false, delivered: false }
+    }
+    pub fn new_bounded(myid:Replica,proposer:Replica,n:usize,f:usize,max_payload_bytes:usize)->Self {
+        let mut state=Self::new(myid,proposer,n,f);state.max_payload_bytes=max_payload_bytes;state
     }
     pub fn delivered(&self) -> bool { self.delivered }
     pub fn delivered_payload(&self) -> Option<&[u8]> {
         if self.delivered { self.payload.as_deref() } else { None }
     }
     pub fn proposer_send(&mut self, payload: Vec<u8>) -> Vec<RbcAction> {
-        if self.myid != self.proposer || self.payload.is_some() { return Vec::new(); }
+        if self.myid != self.proposer || self.payload.is_some() || payload.len()>self.max_payload_bytes { return Vec::new(); }
         let mut out = vec![RbcAction::SendSend { payload: payload.clone() }];
         out.extend(self.handle_send(self.proposer, payload));
         out
@@ -57,11 +63,13 @@ impl RbcInstanceState {
     fn answer_waiters(&mut self, hash: Hash) -> Vec<RbcAction> {
         if self.payload_hash != Some(hash) { return Vec::new(); }
         let payload = match self.payload.as_ref() { Some(value) => value, None => return Vec::new() };
-        self.requesters.remove(&hash).unwrap_or_default().into_iter()
+        let peers=self.requesters.remove(&hash).unwrap_or_default();
+        let peers:Vec<_>=peers.into_iter().filter(|peer|self.served.insert((*peer,hash))).collect();
+        peers.into_iter()
             .map(|recipient| RbcAction::SendPayload { recipient, payload_hash: hash, payload: payload.clone() }).collect()
     }
     pub fn handle_send(&mut self, sender: Replica, payload: Vec<u8>) -> Vec<RbcAction> {
-        if sender != self.proposer || sender >= self.n || self.own_echo_sent { return Vec::new(); }
+        if sender != self.proposer || sender >= self.n || self.own_echo_sent || payload.len()>self.max_payload_bytes { return Vec::new(); }
         let hash = do_hash(&payload);
         self.own_echo_sent = true;
         // A fetched quorum payload takes precedence over a late conflicting SEND.
@@ -88,9 +96,10 @@ impl RbcInstanceState {
         self.check_thresholds(hash)
     }
     pub fn handle_request(&mut self, sender: Replica, hash: Hash) -> Vec<RbcAction> {
-        if sender >= self.n { return Vec::new(); }
+        if sender >= self.n || self.served.contains(&(sender,hash)) { return Vec::new(); }
         if self.payload_hash == Some(hash) {
             if let Some(payload) = self.payload.as_ref() {
+                self.served.insert((sender,hash));
                 return vec![RbcAction::SendPayload { recipient: sender, payload_hash: hash, payload: payload.clone() }];
             }
         }
@@ -100,7 +109,8 @@ impl RbcInstanceState {
         Vec::new()
     }
     pub fn handle_payload(&mut self, sender: Replica, hash: Hash, payload: Vec<u8>) -> Vec<RbcAction> {
-        if sender >= self.n || self.delivered || !self.requested.contains(&hash) || do_hash(&payload) != hash {
+        if sender >= self.n || self.delivered || payload.len()>self.max_payload_bytes
+            || !self.requested.contains(&hash) || do_hash(&payload) != hash {
             return Vec::new();
         }
         self.payload = Some(payload); self.payload_hash = Some(hash);

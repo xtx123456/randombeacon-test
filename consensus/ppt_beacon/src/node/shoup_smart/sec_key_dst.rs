@@ -383,8 +383,9 @@ impl SecKeyDstState {
         if prime < BigUint::from(2u32) {
             return Err(SecKeyDstError::DegeneratePrime);
         }
-        let rmd = RelMsgDstState::new(myid, n, t, sender, hash_state)
+        let mut rmd = RelMsgDstState::new(myid, n, t, sender, hash_state)
             .map_err(SecKeyDstError::InvalidConfig)?;
+        rmd.set_message_limit(share_byte_len(&prime));
         Ok(Self {
             myid,
             n,

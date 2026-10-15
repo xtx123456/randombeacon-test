@@ -440,6 +440,11 @@ impl Context {
         }
         batch.checked_add(PPT_COIN_RESERVE)
             .ok_or_else(|| anyhow!("PPT total coin count overflows"))?;
+        if super::payload_limits::plaintext(batch,config.num_nodes,gf2_profile.is_some(),
+            gf2_profile.is_some()&&transport==AvssTransport::SecMsg,true).is_none()
+            ||super::payload_limits::public_bundle(batch,config.num_nodes,gf2_profile.is_some()).is_none() {
+            return Err(anyhow!("PPT canonical payload byte bound overflows"));
+        }
         let max_outputs = config.num_nodes - config.num_faults;
         batch.checked_mul(max_outputs)
             .ok_or_else(|| anyhow!("PPT output indices overflow"))?;

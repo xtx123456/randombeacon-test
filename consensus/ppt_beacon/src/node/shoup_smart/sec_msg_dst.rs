@@ -367,6 +367,8 @@ impl fmt::Debug for SecMsgDstState {
 }
 
 impl SecMsgDstState {
+    pub fn set_message_limit(&mut self,bytes:usize) { self.cipher.set_message_limit(bytes); }
+
     pub fn new(
         myid: Replica,
         n: usize,

@@ -14,6 +14,8 @@ impl Context {
     pub(crate) fn get_or_init_reserve(&mut self,round:Round,dealer:Replica)->&mut SecMsgDstState {
         if !self.reserve_state.contains_key(&(round,dealer)) {
             let mut state=SecMsgDstState::new(self.myid,self.num_nodes,self.num_faults,dealer,key_prime(),self.hash_context.clone()).expect("validated SecMsg configuration");
+            state.set_message_limit(super::payload_limits::plaintext(super::context::PPT_COIN_RESERVE,
+                self.num_nodes,self.gf2_profile.is_some(),false,false).expect("validated reserve payload bound"));
             if let Some((key,cipher))=self.avss_public_bundles.get(&(round,dealer)).and_then(|b|b.reserve_roots){state.bind_roots(key,cipher);}
             self.reserve_state.insert((round,dealer),state);
         }self.reserve_state.get_mut(&(round,dealer)).unwrap()

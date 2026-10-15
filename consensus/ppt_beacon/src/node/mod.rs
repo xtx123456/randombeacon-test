@@ -30,6 +30,7 @@ mod batch_degree_test;
 mod full_audit;
 mod reserve_transport;
 mod merkle;
+mod payload_limits;
 pub mod shoup_smart;
 
 mod avss_secmsg;

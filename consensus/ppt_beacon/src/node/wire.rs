@@ -17,9 +17,11 @@ pub(crate) enum RbcMessage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) enum ForwardTag { Complaint, Assist, Report }
 
+pub(crate) const PUBLIC_BUNDLE_VERSION: u16 = 4;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PublicBundle {
-    /// Version 3 authenticates GF2 main inputs with SecMsg, without coin paths.
+    /// Version 4 uses independently verified audit rows, without row bundles.
     pub version: u16,
     /// Explicit input root for the main RO challenge; verified against SecMsg.
     pub challenge_root: Option<Hash>,
@@ -41,6 +43,8 @@ pub(crate) enum RmdPacket {
 pub(crate) enum PptWire {
     TransformedShares { round: Round, dealers: Vec<Replica>, values: Vec<types::beacon::Val> },
     AuditDisclosure { round: Round, dealers: Vec<Replica>, entries: Vec<super::full_audit::DealerDisclosure> },
+    // Retain this unused slot so later bincode discriminants do not move.
+    // Version 4 never sends or imports third-party audit row certificates.
     AuditCertificate { round: Round, dealers: Vec<Replica>, rows: Vec<(Replica, Vec<super::full_audit::DealerDisclosure>)> },
     AuditRecovered { round: Round },
     ReserveTransport { round: Round, dealer: Replica, channel: super::shoup_smart::sec_msg_dst::SecMsgChannel, packet: RmdPacket },

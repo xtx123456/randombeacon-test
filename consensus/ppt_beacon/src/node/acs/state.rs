@@ -81,7 +81,8 @@ pub struct AcsRound {
 impl AcsRound {
     pub fn new(round: types::Round, myid: Replica, n: usize, f: usize) -> Self {
         let rbc: Vec<RbcInstanceState> = (0..n)
-            .map(|j| RbcInstanceState::new(myid, j as Replica, n, f))
+            .map(|j| RbcInstanceState::new_bounded(myid, j as Replica, n, f,
+                n.checked_mul(std::mem::size_of::<Replica>()).and_then(|v|v.checked_add(4)).unwrap_or(0)))
             .collect();
         Self {
             round,
