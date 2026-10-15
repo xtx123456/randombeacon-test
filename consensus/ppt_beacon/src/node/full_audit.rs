@@ -1,4 +1,4 @@
-//! Batch-complete disclosure and full original-commitment reconstruction.
+//! One authenticated disclosure per provider; full local commitment reconstruction.
 //! A bad provider proof is never evidence against the dealer. Dealer evidence
 //! is anchored to public RBC roots and replays the exact original encodings.
 use std::collections::{BTreeMap,HashSet};
@@ -35,7 +35,7 @@ struct AuditPacket { dealers:Vec<Replica>,entries:Arc<Vec<DealerDisclosure>> }
 pub(crate) struct FullAuditState {
     sent:bool,inflight:bool,version:u64,rows:BTreeMap<Replica,AuditPacket>,authenticated:HashSet<Replica>,
     completed_dealers:BTreeMap<Replica,Option<String>>,cache:Option<OecCache>,
-    pub complete:bool,certificate_sent:bool,acks:HashSet<Replica>,ack_sent:bool,
+    pub complete:bool,acks:HashSet<Replica>,ack_sent:bool,
 }
 pub(crate) struct FullAuditCompletion {
     round:Round,version:u64,results:Vec<(Replica,Option<String>)>,rejected:Vec<Replica>,cache:OecCache,
@@ -50,11 +50,21 @@ fn valid_row(row:&[EchoPayload],root:Hash,provider:Replica,n:usize,_hash:&HashSt
         &&e.frag_path.matches_leaf(provider,n)&&e.frag_path.root()==e.msg_root
         &&e.frag_path.item()==do_hash(e.fragment.as_bytes())&&crate::node::merkle::validate(&e.frag_path))
 }
-fn valid_entries(entries:&[DealerDisclosure],dealers:&[Replica],batch:usize,n:usize,proofless:bool)->bool {
+fn row_shape(row:&[EchoPayload],provider:Replica,n:usize,fragment_bytes:usize)->bool {
+    row.is_empty() || (row.len()==n && row.iter().enumerate().all(|(recipient,e)|
+        e.frag_idx==provider && e.fragment.len()<=fragment_bytes
+        &&e.meta_path.matches_leaf(recipient,n)&&e.frag_path.matches_leaf(provider,n)))
+}
+fn valid_entries(entries:&[DealerDisclosure],dealers:&[Replica],batch:usize,n:usize,
+    f:usize,provider:Replica,binary:bool,proofless:bool)->bool {
+    let plain=match super::payload_limits::plaintext(batch,n,binary,proofless,true){Some(v)=>v,None=>return false};
+    let cipher=match super::payload_limits::fragment(plain,n,f){Some(v)=>v,None=>return false};
+    let key=match super::payload_limits::fragment(66,n,f){Some(v)=>v,None=>return false};
     entries.len()==dealers.len()&&entries.iter().zip(dealers).all(|(e,d)|e.dealer==*d
-        &&(e.key_row.is_empty()||e.key_row.len()==n)&&(e.cipher_row.is_empty()||e.cipher_row.len()==n)
+        &&row_shape(&e.key_row,provider,n,key)&&row_shape(&e.cipher_row,provider,n,cipher)
         &&e.original.as_ref().map(|p|p.secrets.len()==batch&&p.nonces.len()==batch&&p.mask_shares.len()==batch
-            &&p.mps.len()==(if proofless{0}else{batch})&&p.f_large_shares.as_ref().map(|v|v.len()==batch).unwrap_or(true)).unwrap_or(true)
+            &&p.mps.len()==(if proofless{0}else{batch})&&p.mps.iter().all(|proof|proof.matches_leaf(provider,n))
+            &&p.f_large_shares.as_ref().map(|v|v.len()==batch).unwrap_or(true)).unwrap_or(true)
         &&e.recovered.as_ref().map(|p|p.secrets.len()==batch&&p.nonces.len()==batch&&p.masks.len()==batch
             &&p.f_large.as_ref().map(|v|v.len()==batch).unwrap_or(true)&&p.providers.len()<=n).unwrap_or(true)
         &&e.key.as_ref().map(|k|k.len()==66).unwrap_or(true))
@@ -236,25 +246,12 @@ impl Context {
     pub(crate) async fn process_full_audit_disclosure(&mut self,round:Round,dealers:Vec<Replica>,entries:Vec<DealerDisclosure>,sender:Replica) {
         if sender>=self.num_nodes||round>self.max_rounds||dealers.len()<self.num_nodes-self.num_faults||dealers.len()>self.num_nodes||dealers.windows(2).any(|w|w[0]>=w[1])
             ||dealers.iter().any(|d|*d>=self.num_nodes)||!valid_entries(&entries,&dealers,self.batch_size,self.num_nodes,
+                self.num_faults,sender,self.gf2_profile.is_some(),
                 self.gf2_profile.is_some()&&self.transport==super::context::AvssTransport::SecMsg){return;}
         if let Some(selected)=self.round_state.get(&round).and_then(|s|s.acs_decided_set.as_ref()){if selected!=&dealers{return;}}
         let state=self.full_audit.entry(round).or_default();if state.complete||state.authenticated.contains(&sender){return;}
         state.rows.insert(sender,AuditPacket{dealers,entries:Arc::new(entries)});state.authenticated.insert(sender);state.version+=1;
         self.try_run_full_audit(round).await;
-    }
-    #[async_recursion]
-    pub(crate) async fn process_audit_certificate(&mut self,round:Round,dealers:Vec<Replica>,rows:Vec<(Replica,Vec<DealerDisclosure>)>,sender:Replica) {
-        if sender>=self.num_nodes||round>self.max_rounds||rows.len()>self.num_nodes||dealers.len()<self.num_nodes-self.num_faults||dealers.len()>self.num_nodes
-            ||dealers.windows(2).any(|w|w[0]>=w[1])||dealers.iter().any(|d|*d>=self.num_nodes){return;}
-        let mut seen=HashSet::new();
-        for (provider,entries) in rows {
-            if provider>=self.num_nodes||!seen.insert(provider)||!valid_entries(&entries,&dealers,self.batch_size,self.num_nodes,
-                self.gf2_profile.is_some()&&self.transport==super::context::AvssTransport::SecMsg){continue;}
-            // Forwarded rows prove their fragment/point indices with Merkle paths.
-            // They cannot create authenticated provider-misconduct accusations.
-            let state=self.full_audit.entry(round).or_default();if state.complete{break;}
-            if !state.rows.contains_key(&provider){state.rows.insert(provider,AuditPacket{dealers:dealers.clone(),entries:Arc::new(entries)});state.version+=1;}
-        }self.try_run_full_audit(round).await;
     }
     #[async_recursion]
     pub(crate) async fn try_run_full_audit(&mut self,round:Round) {
@@ -288,10 +285,12 @@ impl Context {
         for provider in rejected{log::warn!("[PPT][AUDIT-PROVIDER-REJECT] node={} round={} provider={} (no dealer exclusion)",self.myid,round,provider);}
         if complete&&!state.complete {
             state.complete=true;let faults:Vec<_>=state.completed_dealers.iter().filter_map(|(d,r)|r.as_ref().map(|r|(*d,r.clone()))).collect();
-            let certificate=if !faults.is_empty()&&!state.certificate_sent {state.certificate_sent=true;Some(state.rows.iter().filter(|(_,p)|p.dealers==dealers).map(|(p,v)|(*p,v.entries.as_ref().clone())).collect::<Vec<_>>())}else{None};
+            // Every honest provider already sent its OWN row to every peer.
+            // SecMsg extractability supplies n-2f honest rows per channel;
+            // reliable delivery lets each peer reconstruct and audit locally.
+            // Re-broadcasting all collected rows here would add another n factor.
             for (dealer,reason) in faults{self.banned_dealers.insert(dealer);log::error!("[PPT][AUDIT-DEALER-PROVED] node={} round={} dealer={} reason={}; exclude only subsequent ACS rounds",self.myid,round,dealer,reason);}
             if let Some(state)=self.round_state.get_mut(&round){state.post_complaint_complete=true;state.audit_in_progress=false;}
-            if let Some(rows)=certificate{self.broadcast(wire::encode(&PptWire::AuditCertificate{round,dealers:dealers.clone(),rows}),round).await;}
             let state=self.full_audit.get_mut(&round).unwrap();if !state.ack_sent{state.ack_sent=true;state.acks.insert(self.myid);self.broadcast(wire::encode(&PptWire::AuditRecovered{round}),round).await;}
             log::info!("[PPT][FULL-AUDIT-COMPLETE] node={} round={} every selected commitment rebuilt",self.myid,round);
             self.maybe_release_round(round);self.note_audit_ack(round,self.myid);

@@ -20,9 +20,58 @@ The live PPT path is now:
 6. Rebuild all selected dealers' original polynomials, all sharing points, share
    trees, canonical plaintexts, encrypted messages and RS fragment/meta trees.
    Compare complete rebuilt roots with those delivered by public RBC.
-7. A complete transferable reconstruction certificate can prove dealer error.
-   Invalid provider proofs never establish dealer guilt. Preserve this round's
-   already-decided set; apply proven exclusions to subsequent ACS rounds.
+7. Every node audits the original commitments locally using direct authenticated
+   provider rows. Do not bundle/rebroadcast other providers' disclosures after
+   completion. Invalid provider proofs never establish dealer guilt. Preserve
+   this round's already-decided set; apply proven exclusions to subsequent ACS.
+
+## Audit dissemination (PublicBundle version 4)
+
+Each honest node sends its own `AuditDisclosure` exactly once, after opening the
+entire main batch. Audit workers accept rows only from the authenticated provider
+who sent that disclosure. The legacy `AuditCertificate` wire slot is retained to
+avoid shifting bincode discriminants, but is neither sent nor imported. A peer's
+completion ACK is not a dealer-fault verdict and cannot bypass local verification.
+
+For each SecMsg key/cipher root, reaching the distribution output stage implies
+at least n-2f honest holders accepted a complete dispersal row under that root:
+the first honest Bracha vote requires n-f echoes, at least n-2f of them honest.
+Each such holder retained one authenticated fragment for EVERY recipient. Key
+and cipher holder sets can differ; recovery counts each channel separately.
+Those holders eventually disclose their own rows over reliable channels, so
+every honest auditor can recover the same original commitments without a
+Byzantine response or a certificate assembled by another auditor. Incomplete or
+invalid provider evidence remains distinct from invalid committed codewords.
+Dealer exclusions still require local reconstruction, canonical plaintext and
+degree checks, and rebuilding all original roots.
+
+The existing all-participant ACK retention remains: a locally completed auditor
+must not discard serving material needed by slow peers. Byzantine ACK withholding
+can retain history; safe bounded storage/reconfiguration remains separate work.
+Main and reserve SecMsg states/keys remain independent and reserve ciphertexts
+are never opened by main audit. R=1 and field widths are unchanged.
+
+With n=3f+1, B main inputs per dealer and m selected dealers, the batch emits
+N=B(m-f)=Theta(Bn) field elements. In GF2+SecMsg mode, one provider's disclosure
+costs O(lambda*(Bn+n^2 log n)) bits. Each honest provider sends it to n-1 peers
+once, giving O(lambda*(Bn^3+n^4 log n)) total bits per batch and
+O(lambda*(n^2+n^3 log n/B)) per output. For B=Omega(n log n) this is
+O(lambda*n^2), including the audit data path even if a dealer is faulty. There is
+no additional factor n from n copies of complete n-row certificates. ACS rounds,
+transport retransmissions and application-level delivery costs are separate;
+this is not a deterministic termination/communication bound for the entire ACS.
+
+RBC retrieval serves a given (requester, payload hash) at most once, including
+requests buffered before payload arrival. This preserves late honest retrieval
+while preventing repeated requests from retransmitting an unchanged payload.
+Live public/proposal RBC payloads and main/reserve transport fragments have
+configuration-derived size limits. Honest holders reject oversized dispersal
+rows before echoing/storing them, rather than forwarding an oversized dealer
+message through a later audit. Proof dimensions and row lengths are bounded.
+
+Version 4 nodes must run together; version 3 public bundles are rejected. The
+build workflow runs only `cargo build --release --locked`; no tests or benchmarks
+are run for this change, as requested.
 
 Former dealer-secret-first recovery and point-proof-only audit remain labelled
 legacy comparison helpers. The PPT dispatcher rejects their reconstruction/audit
@@ -159,7 +208,7 @@ Round r+1 sharing may overlap round r reconstruction. Its ACS waits for the full
 round-r audit. The exact root-bound reconstruction rules give every honest node
 the same valid/fault verdict for each selected dealer, so subsequent ACS uses
 the same accumulated exclusions. Early ACS messages are buffered and replayed.
-Fault certificates relay original evidence without modifying a decided set.
+Direct provider disclosures supply original evidence without modifying a decided set.
 
 Keep original materials until batch output AND full audit complete. Selected
 share-serving evidence waits for ALL share ACKs; audit rows wait for all audit

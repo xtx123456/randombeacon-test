@@ -283,6 +283,7 @@ pub struct RelMsgDstState {
     encoder: RsEncoder,
     decoder: RsDecoder,
     hash_state: Arc<HashState>,
+    max_message_bytes: Option<usize>,
 
     // ---- Sender-side state ----
     /// Set once the sender has broadcast its `n` `SendDispersal`
@@ -388,6 +389,7 @@ impl RelMsgDstState {
             encoder,
             decoder,
             hash_state,
+            max_message_bytes: None,
             sender_dispersed: false,
             own_dispersal_accepted: false,
             own_meta_root: None,
@@ -401,6 +403,15 @@ impl RelMsgDstState {
             delivered: None,
             forwarding_cache: None,
         })
+    }
+
+    /// Set before dispersal. Honest holders must never echo/retain oversized
+    /// fragments that would later amplify an audit or a complaint.
+    pub fn set_message_limit(&mut self,bytes:usize) { self.max_message_bytes=Some(bytes); }
+    fn fragment_fits(&self,len:usize)->bool {
+        self.max_message_bytes.map(|limit|
+            super::super::payload_limits::fragment(limit,self.n,self.t)
+                .map(|maximum|len<=maximum).unwrap_or(false)).unwrap_or(true)
     }
 
     /// Bracha thresholds.
@@ -435,6 +446,11 @@ impl RelMsgDstState {
                 provided: messages.len(),
                 expected: self.n,
             });
+        }
+
+        if self.max_message_bytes.map(|limit|messages.iter().any(|m|m.len()>limit)).unwrap_or(false) {
+            return Err(RelMsgDstError::EncodeFailed(super::reed_solomon::RsCodingError::PayloadTooLarge {
+                len:messages.iter().map(Vec::len).max().unwrap_or(0) }));
         }
 
         // (1) Encode each message into n fragments.
@@ -521,6 +537,7 @@ impl RelMsgDstState {
         let myid_idx = self.myid as usize;
         let mut ordered: Vec<Option<DispersalEntry>> = vec![None; self.n];
         for entry in entries.into_iter() {
+            if !self.fragment_fits(entry.fragment.len()) { return Vec::new(); }
             if entry.msg_idx >= self.n {
                 return Vec::new();
             }
@@ -635,7 +652,7 @@ impl RelMsgDstState {
         wire_sender: Replica,
         echo: EchoPayload,
     ) -> Vec<RelMsgDstAction> {
-        if wire_sender >= self.n || echo.frag_idx >= self.n
+        if wire_sender >= self.n || echo.frag_idx >= self.n || !self.fragment_fits(echo.fragment.len())
             || self.bound_root.map(|root| root != echo.meta_root).unwrap_or(false)
             || !echo.frag_path.matches_leaf(echo.frag_idx, self.n)
             || !echo.meta_path.matches_leaf(self.myid, self.n) {
@@ -986,7 +1003,7 @@ impl RelMsgDstState {
         }
         let mut by_idx: HashMap<usize, Fragment> = HashMap::new();
         for (frag_idx, path, frag) in forward.fragments.iter() {
-            if *frag_idx >= self.n || !path.matches_leaf(*frag_idx, self.n)
+            if *frag_idx >= self.n || !self.fragment_fits(frag.len()) || !path.matches_leaf(*frag_idx, self.n)
                 || by_idx.contains_key(frag_idx) {
                 return vec![RelMsgDstAction::ForwardRejected {
                     source: wire_sender,
@@ -1039,6 +1056,10 @@ impl RelMsgDstState {
                 }];
             }
         };
+        if self.max_message_bytes.map(|limit|message.len()>limit).unwrap_or(false) {
+            return vec![RelMsgDstAction::ForwardRejected {
+                source:wire_sender,reason:ForwardReject::DecodeFailed("committed message exceeds protocol bound".into()) }];
+        }
 
         // (4) Re-encode m and rebuild the message-Merkle-tree;
         //     compare against `my_msg_root`. This is the paper's
