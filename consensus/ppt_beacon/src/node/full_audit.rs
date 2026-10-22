@@ -232,6 +232,9 @@ impl Context {
             state.requested=true;state.requests.insert(self.myid,root);
             self.broadcast(wire::encode(&PptWire::DealerAuditRequest{round,dealer,root}),round).await;
         }
+        let state=&self.full_audit[&(round,dealer)];
+        let has_unserved=state.requests.iter().any(|(peer,r)|*r==root && !state.served.contains(peer));
+        if !has_unserved {self.try_run_dealer_audit(round,dealer).await;return;}
         let (_,key_row,cipher_row)=match self.avss_secmsg_state.get(&(round,dealer)){Some(s)=>s.audit_material(),None=>return};
         let bundle=&self.avss_public_bundles[&(round,dealer)];let (kr,cr)=bundle.secmsg_roots.unwrap();
         // Missing rows never consume a reply latch. A later transport event retries.
@@ -253,12 +256,15 @@ impl Context {
         if self.awss_root(round,dealer).map(|r|r!=root).unwrap_or(false){return;}
         // A request is NOT authority to disclose. Keep only one small request per
         // authenticated peer; a valid local complaint is checked before serving.
-        self.full_audit.entry((round,dealer)).or_default().requests.entry(sender).or_insert(root);
+        let state=self.full_audit.entry((round,dealer)).or_default();
+        if state.requests.contains_key(&sender){return;}
+        state.requests.insert(sender,root);
         self.try_start_dealer_audit(round,dealer).await;
     }
 
     #[async_recursion]
     pub(crate) async fn process_dealer_audit(&mut self,round:Round,dealer:Replica,entry:DealerDisclosure,sender:Replica) {
+        if self.full_audit.get(&(round,dealer)).map(|s|s.complete||s.authenticated.contains(&sender)).unwrap_or(false){return;}
         if sender>=self.num_nodes || dealer>=self.num_nodes || round>self.max_rounds
             || !self.dealer_audit_authorized(round,dealer)
             || !valid_entries(std::slice::from_ref(&entry),&[dealer],self.batch_size,self.num_nodes,self.num_faults,sender,
