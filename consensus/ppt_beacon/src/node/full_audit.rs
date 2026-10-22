@@ -11,7 +11,7 @@ use crypto::gf2::Gf2Profile;
 use num_bigint::BigUint;
 use serde::{Serialize,Deserialize};
 use types::{Replica,Round};
-use types::beacon::{AvssRecipientPayload,Val,CoinMsg,WrapperMsg};
+use types::beacon::{AvssRecipientPayload,Val};
 use super::{Context,oec::{self,Field,OecCache},wire::{self,PptWire,PublicBundle},share_pipeline};
 use super::shoup_smart::{rel_msg_dst::{EchoPayload,ForwardPayload,RelMsgDstState},reed_solomon::RsEncoder,
     sec_msg_dst::{decrypt_with_share,encrypt_with_share},sec_key_dst::{parse_share,serialize_share}};
@@ -29,17 +29,16 @@ pub(crate) struct DealerDisclosure {
     /// Original provider shard of EVERY recipient's key/cipher message.
     pub key_row:Vec<EchoPayload>,pub cipher_row:Vec<EchoPayload>,
 }
-#[derive(Clone)]
-struct AuditPacket { dealers:Vec<Replica>,entries:Arc<Vec<DealerDisclosure>> }
+/// One complaint-authorized audit of one dealer's main batch.
 #[derive(Default)]
 pub(crate) struct FullAuditState {
-    sent:bool,inflight:bool,version:u64,rows:BTreeMap<Replica,AuditPacket>,authenticated:HashSet<Replica>,
-    completed_dealers:BTreeMap<Replica,Option<String>>,cache:Option<OecCache>,
-    pub complete:bool,acks:HashSet<Replica>,ack_sent:bool,
+    sent:bool,inflight:bool,version:u64,attempted:Option<u64>,
+    rows:BTreeMap<Replica,DealerDisclosure>,authenticated:HashSet<Replica>,
+    cache:Option<OecCache>,pub complete:bool,
 }
 pub(crate) struct FullAuditCompletion {
-    round:Round,version:u64,results:Vec<(Replica,Option<String>)>,rejected:Vec<Replica>,cache:OecCache,
-    error:Option<String>,
+    round:Round,dealer:Replica,version:u64,result:Option<Option<String>>,
+    rejected:Vec<Replica>,cache:OecCache,error:Option<String>,
 }
 
 fn public_root(bundle:&PublicBundle)->Hash {do_hash(&super::public_rbc::transcript(&bundle.public).serialize_ctrbc())}
@@ -204,105 +203,98 @@ fn audit_dealer(bundle:&PublicBundle,input:&[(Replica,DealerDisclosure)],batch:u
 }
 
 impl Context {
-    /// Every round uses the exclusions proven by ALL completed prior audits.
-    /// Next-round sharing may overlap, but ACS waits for this common frontier.
-    pub(crate) fn acs_audit_ready(&self,round:Round)->bool {round==0||self.full_audit.get(&(round-1)).map(|s|s.complete).unwrap_or(false)}
-    pub(crate) fn defer_acs_for_audit(&mut self,wrapper:&WrapperMsg)->bool {
-        let round=match &wrapper.protmsg {
-            CoinMsg::ACSRbcSend(r,_,_)|CoinMsg::ACSRbcEcho(r,_,_)|CoinMsg::ACSRbcReady(r,_,_)|
-            CoinMsg::ACSAbaBval(r,_,_,_)|CoinMsg::ACSAbaAux(r,_,_,_)|CoinMsg::ACSCoinReveal(r,_,_)=>Some(*r),
-            CoinMsg::PPTBExtension(bytes)=>match bincode::deserialize::<PptWire>(bytes){Ok(PptWire::Rbc{scope:super::wire::RbcScope::AcsProposal,round,..})=>Some(round),_=>None},_=>None,
-        };
-        let round=match round{Some(r) if !self.acs_audit_ready(r)=>r,_=>return false};
-        if round>self.max_rounds{return true;}
-        let pending=self.audit_acs_pending.entry(round).or_default();let bytes=bincode::serialize(&wrapper.protmsg).expect("wire encoding");let hash=do_hash(&bytes);
-        if !pending.iter().any(|m|m.sender==wrapper.sender&&do_hash(&bincode::serialize(&m.protmsg).unwrap())==hash){pending.push(wrapper.clone());}true
+    /// A verified complaint reveals only a corrupt dealer's MAIN instance.
+    /// Main and reserve transports are independently generated in batch_wssinit.
+    /// A malicious alias is rejected here rather than disclosing reserve material.
+    fn dealer_audit_authorized(&self,round:Round,dealer:Replica)->bool {
+        if !self.awss_selected(round,dealer) || !self.awss_recovery.get(&(round,dealer)).map(|s|s.has_complaint()).unwrap_or(false) {return false;}
+        let bundle=match self.avss_public_bundles.get(&(round,dealer)){Some(b)=>b,None=>return false};
+        match (bundle.secmsg_roots,bundle.reserve_roots) {
+            (Some((k,c)),Some((rk,rc)))=>k!=rk && k!=rc && c!=rk && c!=rc,
+            _=>false,
+        }
+    }
+
+    /// Compatibility hook: inspect only already-authorized complaint targets.
+    #[async_recursion]
+    pub(crate) async fn try_start_full_audit(&mut self,round:Round) {
+        let dealers:Vec<_>=self.awss_recovery.iter().filter(|((r,_),s)|*r==round && s.has_complaint()).map(|((_,d),_)|*d).collect();
+        for dealer in dealers {self.try_start_dealer_audit(round,dealer).await;}
     }
 
     #[async_recursion]
-    pub(crate) async fn try_start_full_audit(&mut self,round:Round) {
-        let state=match self.round_state.get(&round){Some(s) if !s.cleared&&s.batch_reconstruction_complete&&s.emitted_beacon_coins.len()==self.batch_size=>s,_=>return};
-        let dealers=match &state.acs_decided_set{Some(d)=>d.clone(),None=>return};
-        if !self.full_audit.entry(round).or_default().sent {
-            let mut entries=Vec::with_capacity(dealers.len());
-            for dealer in &dealers {
-                let root=match self.awss_root(round,*dealer){Some(r)=>r,None=>return};
-                let original=self.avss_beacon_bytes.get(&(round,*dealer)).and_then(|b|super::batch_degree_test::decode_payload(b,self.gf2_profile,self.batch_size,0))
-                    .or_else(||self.original_beacon_payload(round,*dealer));
-                let expected_proofs=if self.batch_input_root(round,*dealer).is_some(){0}else{self.batch_size};
-                let original=original.filter(|p|p.secrets.len()==self.batch_size&&p.nonces.len()==self.batch_size&&p.mask_shares.len()==self.batch_size&&p.mps.len()==expected_proofs);
-                let recovered=self.awss_recovery.get(&(round,*dealer)).and_then(|s|s.local_shares.as_ref()).map(|p|AuditValues{
-                    secrets:p.secrets.clone(),masks:p.masks.clone(),nonces:p.nonces.clone(),f_large:p.f_large.clone(),providers:p.providers.clone()});
-                let (key,key_row,cipher_row)=self.avss_secmsg_state.get(&(round,*dealer)).map(|s|s.audit_material()).unwrap_or_default();
-                entries.push(DealerDisclosure{dealer:*dealer,root,original,recovered,key,key_row,cipher_row});
-            }
-            self.full_audit.get_mut(&round).unwrap().sent=true;
-            log::info!("[PPT][FULL-AUDIT-DISCLOSE] node={} round={} selected={:?} (beacon materials only)",self.myid,round,dealers);
-            self.broadcast(wire::encode(&PptWire::AuditDisclosure{round,dealers:dealers.clone(),entries:entries.clone()}),round).await;
-            self.process_full_audit_disclosure(round,dealers,entries,self.myid).await;
-        }self.try_run_full_audit(round).await;
+    pub(crate) async fn try_start_dealer_audit(&mut self,round:Round,dealer:Replica) {
+        if !self.dealer_audit_authorized(round,dealer){return;}
+        let sent=self.full_audit.get(&(round,dealer)).map(|s|s.sent).unwrap_or(false);
+        if !sent {
+            let root=match self.awss_root(round,dealer){Some(r)=>r,None=>return};
+            let (_,key_row,cipher_row)=match self.avss_secmsg_state.get(&(round,dealer)){Some(s)=>s.audit_material(),None=>return};
+            let bundle=&self.avss_public_bundles[&(round,dealer)];let (kr,cr)=bundle.secmsg_roots.unwrap();
+            // Never consume the send latch while our authenticated row is missing.
+            if !valid_row(&key_row,kr,self.myid,self.num_nodes,&self.hash_context)
+                || !valid_row(&cipher_row,cr,self.myid,self.num_nodes,&self.hash_context){return;}
+            let entry=DealerDisclosure{dealer,root,original:None,recovered:None,key:None,key_row,cipher_row};
+            self.full_audit.entry((round,dealer)).or_default().sent=true;
+            self.broadcast(wire::encode(&PptWire::DealerAudit{round,dealer,entry:entry.clone()}),round).await;
+            self.process_dealer_audit(round,dealer,entry,self.myid).await;
+        }
+        self.try_run_dealer_audit(round,dealer).await;
     }
+
     #[async_recursion]
-    pub(crate) async fn process_full_audit_disclosure(&mut self,round:Round,dealers:Vec<Replica>,entries:Vec<DealerDisclosure>,sender:Replica) {
-        if sender>=self.num_nodes||round>self.max_rounds||dealers.len()<self.num_nodes-self.num_faults||dealers.len()>self.num_nodes||dealers.windows(2).any(|w|w[0]>=w[1])
-            ||dealers.iter().any(|d|*d>=self.num_nodes)||!valid_entries(&entries,&dealers,self.batch_size,self.num_nodes,
-                self.num_faults,sender,self.gf2_profile.is_some(),
-                self.gf2_profile.is_some()&&self.transport==super::context::AvssTransport::SecMsg){return;}
-        if let Some(selected)=self.round_state.get(&round).and_then(|s|s.acs_decided_set.as_ref()){if selected!=&dealers{return;}}
-        let state=self.full_audit.entry(round).or_default();if state.complete||state.authenticated.contains(&sender){return;}
-        state.rows.insert(sender,AuditPacket{dealers,entries:Arc::new(entries)});state.authenticated.insert(sender);state.version+=1;
-        self.try_run_full_audit(round).await;
+    pub(crate) async fn process_dealer_audit(&mut self,round:Round,dealer:Replica,entry:DealerDisclosure,sender:Replica) {
+        if sender>=self.num_nodes || dealer>=self.num_nodes || round>self.max_rounds
+            || !valid_entries(std::slice::from_ref(&entry),&[dealer],self.batch_size,self.num_nodes,self.num_faults,sender,
+                self.gf2_profile.is_some(),self.gf2_profile.is_some()&&self.transport==super::context::AvssTransport::SecMsg){return;}
+        // Rows can race ahead of the complaint/ACS decision. Cache bounded rows,
+        // but neither run an audit nor disclose anything until authorization.
+        let state=self.full_audit.entry((round,dealer)).or_default();
+        if state.complete || state.authenticated.contains(&sender){return;}
+        state.rows.insert(sender,entry);state.authenticated.insert(sender);state.version+=1;
+        self.try_run_dealer_audit(round,dealer).await;
     }
+
     #[async_recursion]
-    pub(crate) async fn try_run_full_audit(&mut self,round:Round) {
-        let dealers=match self.round_state.get(&round){Some(s) if !s.cleared&&s.batch_reconstruction_complete=>match &s.acs_decided_set{Some(d)=>d.clone(),None=>return},_=>return};
-        let state=self.full_audit.entry(round).or_default();if !state.sent||state.inflight||state.complete{return;}
-        let rows:BTreeMap<_,_>=state.rows.iter().filter(|(_,p)|p.dealers==dealers).map(|(p,v)|(*p,v.entries.clone())).collect();
-        if rows.len()<self.num_faults+1{return;}
-        let mut work=Vec::new();for (index,dealer) in dealers.iter().enumerate(){if !state.completed_dealers.contains_key(dealer){
-            let bundle=match self.avss_public_bundles.get(&(round,*dealer)){Some(b)=>b.clone(),None=>return};
-            work.push((bundle,rows.iter().map(|(p,entries)|(*p,entries[index].clone())).collect::<Vec<_>>()));
-        }}if work.is_empty(){return;}
-        state.inflight=true;let version=state.version;let authenticated=state.authenticated.clone();let mut cache=state.cache.take().unwrap_or_default();
+    async fn try_run_dealer_audit(&mut self,round:Round,dealer:Replica) {
+        if !self.dealer_audit_authorized(round,dealer){return;}
+        let state=self.full_audit.entry((round,dealer)).or_default();
+        if state.inflight || state.complete || state.attempted==Some(state.version) || state.rows.len()<self.num_nodes-2*self.num_faults{return;}
+        let bundle=match self.avss_public_bundles.get(&(round,dealer)){Some(b)=>b.clone(),None=>return};
+        let rows=state.rows.iter().map(|(p,e)|(*p,e.clone())).collect::<Vec<_>>();
+        let authenticated=state.authenticated.clone();let version=state.version;
+        state.inflight=true;state.attempted=Some(version);let mut cache=state.cache.take().unwrap_or_default();
         let batch=self.batch_size;let n=self.num_nodes;let f=self.num_faults;let small=self.secret_domain.clone();let large=self.nonce_domain.clone();let profile=self.gf2_profile;let hash=self.hash_context.clone();let tx=self.full_audit_tx.clone();
         tokio::spawn(async move{
-            let result=tokio::task::spawn_blocking(move||{let mut results=Vec::new();let mut rejected=Vec::new();
-                for (bundle,input) in work {if let DealerResult::Complete(reason)=audit_dealer(&bundle,&input,batch,n,f,&small,&large,profile,hash.clone(),&mut cache,&authenticated,&mut rejected){results.push((bundle.public.origin,reason));}}
-                rejected.sort_unstable();rejected.dedup();FullAuditCompletion{round,version,results,rejected,cache,error:None}
+            let result=tokio::task::spawn_blocking(move||{
+                let mut rejected=Vec::new();
+                let result=match audit_dealer(&bundle,&rows,batch,n,f,&small,&large,profile,hash,&mut cache,&authenticated,&mut rejected){
+                    DealerResult::Waiting=>None,DealerResult::Complete(reason)=>Some(reason)};
+                FullAuditCompletion{round,dealer,version,result,rejected,cache,error:None}
             }).await;
-            let completion=match result{Ok(c)=>c,Err(e)=>FullAuditCompletion{round,version,results:Vec::new(),rejected:Vec::new(),cache:OecCache::default(),error:Some(e.to_string())}};
+            let completion=match result {Ok(c)=>c,Err(e)=>FullAuditCompletion{round,dealer,version,result:None,rejected:Vec::new(),cache:OecCache::default(),error:Some(e.to_string())}};
             let _=tx.send(completion);
         });
     }
+
     #[async_recursion]
     pub(crate) async fn finalize_full_audit(&mut self,completion:FullAuditCompletion) {
-        let FullAuditCompletion{round,version,results,rejected,cache,error}=completion;
-        let dealers=match self.round_state.get(&round).and_then(|s|s.acs_decided_set.clone()){Some(d)=>d,None=>return};
-        let state=match self.full_audit.get_mut(&round){Some(s)=>s,None=>return};state.inflight=false;state.cache=Some(cache);
-        if let Some(error)=error{log::error!("[PPT][FULL-AUDIT] worker failed round={}: {}; audit remains pending",round,error);return;}
-        for (dealer,reason) in results{state.completed_dealers.entry(dealer).or_insert(reason);}
-        let changed=state.version!=version;let complete=dealers.iter().all(|d|state.completed_dealers.contains_key(d));
-        for provider in rejected{log::warn!("[PPT][AUDIT-PROVIDER-REJECT] node={} round={} provider={} (no dealer exclusion)",self.myid,round,provider);}
-        if complete&&!state.complete {
-            state.complete=true;let faults:Vec<_>=state.completed_dealers.iter().filter_map(|(d,r)|r.as_ref().map(|r|(*d,r.clone()))).collect();
-            // Every honest provider already sent its OWN row to every peer.
-            // SecMsg extractability supplies n-2f honest rows per channel;
-            // reliable delivery lets each peer reconstruct and audit locally.
-            // Re-broadcasting all collected rows here would add another n factor.
-            for (dealer,reason) in faults{self.banned_dealers.insert(dealer);log::error!("[PPT][AUDIT-DEALER-PROVED] node={} round={} dealer={} reason={}; exclude only subsequent ACS rounds",self.myid,round,dealer,reason);}
-            if let Some(state)=self.round_state.get_mut(&round){state.post_complaint_complete=true;state.audit_in_progress=false;}
-            let state=self.full_audit.get_mut(&round).unwrap();if !state.ack_sent{state.ack_sent=true;state.acks.insert(self.myid);self.broadcast(wire::encode(&PptWire::AuditRecovered{round}),round).await;}
-            log::info!("[PPT][FULL-AUDIT-COMPLETE] node={} round={} every selected commitment rebuilt",self.myid,round);
-            self.maybe_release_round(round);self.note_audit_ack(round,self.myid);
-            let next=round+1;let pending=self.audit_acs_pending.remove(&next).unwrap_or_default();
-            for wrapper in pending{self.choose_fn(wrapper).await;}
-            self.acs_note_local_change(next).await;
-        }else if changed&&!complete{self.try_run_full_audit(round).await;}
+        let FullAuditCompletion{round,dealer,version,result,rejected,cache,error}=completion;
+        let state=match self.full_audit.get_mut(&(round,dealer)){Some(s)=>s,None=>return};
+        state.inflight=false;state.cache=Some(cache);let changed=state.version!=version;
+        if let Some(error)=error {state.attempted=None;log::error!("[PPT][DEALER-AUDIT] worker failed round={} dealer={}: {}",round,dealer,error);return;}
+        for provider in rejected {log::warn!("[PPT][AUDIT-PROVIDER-REJECT] round={} dealer={} provider={} (not dealer evidence)",round,dealer,provider);}
+        if let Some(reason)=result {
+            state.complete=true;state.cache=None;state.rows.clear();
+            log::info!("[PPT][DEALER-AUDIT-COMPLETE] round={} dealer={} result={:?}",round,dealer,reason);
+            self.maybe_release_round(round);
+        }else if changed {self.try_run_dealer_audit(round,dealer).await;}
     }
-    pub(crate) fn note_audit_ack(&mut self,round:Round,sender:Replica) {
-        if sender>=self.num_nodes||round>self.max_rounds{return;}let state=self.full_audit.entry(round).or_default();state.acks.insert(sender);
-        if state.complete&&state.acks.len()==self.num_nodes&&self.round_state.get(&round).map(|s|s.cleared).unwrap_or(false){
-            state.rows.clear();state.cache=None;self.share_pipeline.remove(&round);
-        }
+
+    /// Evidence affects future local ABA inputs only, never transport membership.
+    #[async_recursion]
+    pub(crate) async fn note_verified_dealer_fault(&mut self,dealer:Replica) {
+        if !self.banned_dealers.insert(dealer){return;}
+        let rounds:Vec<_>=self.acs_state.iter().filter(|(_,s)|!s.finalized).map(|(r,_)|*r).collect();
+        for round in rounds {self.acs_note_local_change(round).await;}
     }
 }

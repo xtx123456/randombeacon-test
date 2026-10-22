@@ -21,7 +21,7 @@
 //! protocol on the **root r** (not the message itself). This
 //! drives the per-message communication complexity from
 //! `O(n^2 · |m|)` (plain Bracha) down to
-//! `O(|m| + λ · n^2 · log n)` (matching the bound stated in the
+//! `O(n · |m| + λ · n^2 · log n)` (matching the bound stated in the
 //! paper).
 //!
 //! ## State machine
@@ -87,6 +87,8 @@ pub enum CompactBroadcastAction {
     /// Local: this protocol instance has delivered `message`.
     /// Idempotent — at most one Delivered per state instance.
     Delivered { message: Vec<u8> },
+    /// Agreed commitment is not a canonical codeword (the paper outputs bottom).
+    Rejected { root: Hash },
 }
 
 /// One Π_CompactBroadcast state machine instance.
@@ -143,6 +145,11 @@ pub struct CompactBroadcastState {
     /// Final delivered message + the root it was decoded under.
     /// Latches once set; subsequent triggers are idempotent.
     delivered: Option<(Hash, Vec<u8>)>,
+    rejected: bool,
+    max_message: usize,
+    max_fragment: usize,
+    echo_roots: HashMap<Replica, Hash>,
+    vote_roots: HashMap<Replica, Hash>,
 }
 
 impl fmt::Debug for CompactBroadcastState {
@@ -237,7 +244,10 @@ impl CompactBroadcastState {
             own_vote_root: None,
             echo_per_root: HashMap::new(),
             vote_per_root: HashMap::new(),
-            delivered: None,
+            delivered: None, rejected: false,
+            max_message: (u32::MAX as usize)-5,
+            max_fragment: ((u32::MAX as usize)-1)/(n-2*t)+1,
+            echo_roots: HashMap::new(), vote_roots: HashMap::new(),
         })
     }
 
@@ -254,6 +264,12 @@ impl CompactBroadcastState {
     /// mirror it.
     fn n_minus_2t(&self) -> usize {
         self.n - 2 * self.t
+    }
+
+    /// Apply protocol-specific limits before any network fragment is accepted.
+    pub fn set_message_limit(&mut self, limit: usize) {
+        self.max_message = limit;
+        self.max_fragment = limit.saturating_add(4).saturating_add(self.n_minus_2t()-1)/self.n_minus_2t();
     }
 
     /// Has this instance delivered its message yet?
@@ -329,7 +345,7 @@ impl CompactBroadcastState {
         fragment: Fragment,
     ) -> Vec<CompactBroadcastAction> {
         // Only accept SEND from the rightful proposer.
-        if wire_sender != self.proposer {
+        if wire_sender != self.proposer || fragment.len()>self.max_fragment || !path.matches_leaf(self.myid,self.n) {
             return Vec::new();
         }
         // Idempotent: only first valid SEND is honoured (Bracha
@@ -409,7 +425,7 @@ impl CompactBroadcastState {
         fragment: Fragment,
         frag_idx: usize,
     ) -> Vec<CompactBroadcastAction> {
-        if frag_idx >= self.n {
+        if frag_idx >= self.n || wire_sender>=self.n || fragment.len()>self.max_fragment || !path.matches_leaf(frag_idx,self.n) {
             return Vec::new();
         }
         // Position binding (1/2): in CompactBroadcast every honest
@@ -462,6 +478,8 @@ impl CompactBroadcastState {
     /// `wire_sender`. Plain Bracha VOTE counting; carries no
     /// fragment.
     pub fn handle_vote(&mut self, wire_sender: Replica, root: Hash) -> Vec<CompactBroadcastAction> {
+        if wire_sender>=self.n || self.vote_roots.get(&wire_sender).map(|r|*r!=root).unwrap_or(false) { return Vec::new(); }
+        self.vote_roots.insert(wire_sender,root);
         let (vote_count, already_voted) = {
             let voters = self
                 .vote_per_root
@@ -477,6 +495,7 @@ impl CompactBroadcastState {
         let t_plus_one = self.t_plus_one();
         if vote_count >= t_plus_one && !already_voted {
             self.own_vote_root = Some(root);
+            self.vote_roots.insert(self.myid,root);
             // Self-tally so subsequent self-deliver of our own
             // VOTE is a no-op idempotent.
             self.vote_per_root
@@ -495,6 +514,8 @@ impl CompactBroadcastState {
     /// Internal: insert a (sender → frag_idx, fragment) entry into
     /// `echo_per_root[root]`. First-seen-per-sender wins.
     fn record_echo(&mut self, sender: Replica, root: Hash, frag_idx: usize, fragment: Fragment) {
+        if self.echo_roots.get(&sender).map(|r|*r!=root).unwrap_or(false) {return;}
+        self.echo_roots.insert(sender,root);
         let entry = self.echo_per_root.entry(root).or_insert_with(HashMap::new);
         entry.entry(sender).or_insert((frag_idx, fragment));
     }
@@ -512,6 +533,7 @@ impl CompactBroadcastState {
             .unwrap_or(0);
         if echo_count >= self.n_minus_t() {
             self.own_vote_root = Some(root);
+            self.vote_roots.insert(self.myid,root);
             // Pre-record our own vote so subsequent self-deliver
             // is idempotent.
             self.vote_per_root
@@ -530,7 +552,7 @@ impl CompactBroadcastState {
     ///   - `n-2t` valid fragments collected for `root` (Reed-Solomon
     ///     decode threshold)
     fn try_deliver(&mut self, root: Hash) -> Vec<CompactBroadcastAction> {
-        if self.delivered.is_some() {
+        if self.delivered.is_some() || self.rejected {
             return Vec::new();
         }
         let vote_count = self
@@ -568,6 +590,12 @@ impl CompactBroadcastState {
         let collected: Vec<(usize, Fragment)> = by_frag_idx.into_iter().collect();
         match self.decoder.decode(collected) {
             Ok(message) => {
+                // Fig. 5: inclusion proofs authenticate positions, not RS codeword validity.
+                let rebuilt = if message.len()<=self.max_message {self.encoder.encode(&message).ok().map(|fragments| {
+                    let leaves=fragments.iter().map(|f|do_hash(f.as_bytes())).collect();
+                    MerkleTree::new(leaves,&self.hash_state).root()
+                })}else{None};
+                if rebuilt!=Some(root) {self.rejected=true;return vec![CompactBroadcastAction::Rejected{root}];}
                 self.delivered = Some((root, message.clone()));
                 vec![CompactBroadcastAction::Delivered { message }]
             }
@@ -577,7 +605,8 @@ impl CompactBroadcastState {
                     self.myid,
                     e
                 );
-                Vec::new()
+                self.rejected=true;
+                vec![CompactBroadcastAction::Rejected{root}]
             }
         }
     }
@@ -670,7 +699,7 @@ mod tests {
                             }
                         }
                     }
-                    CompactBroadcastAction::Delivered { .. } => {}
+                    CompactBroadcastAction::Delivered { .. } | CompactBroadcastAction::Rejected { .. } => {}
                 }
             }
             pending = next;

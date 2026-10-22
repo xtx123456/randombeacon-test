@@ -207,7 +207,8 @@ pub struct Context {
     pub avss_secmsg_state:
         HashMap<(Round, Replica), crate::node::shoup_smart::sec_msg_dst::SecMsgDstState>,
     pub avss_secmsg_public: HashMap<(Round, Replica), types::beacon::AvssPublicCommitMsg>,
-    pub(crate) avss_public_rbc: HashMap<(Round, Replica), crate::node::acs::rbc::RbcInstanceState>,
+    pub(crate) avss_public_rbc: HashMap<(Round, Replica), crate::node::shoup_smart::compact_broadcast::CompactBroadcastState>,
+    pub(crate) acs_compact_rbc: HashMap<(Round, Replica), crate::node::shoup_smart::compact_broadcast::CompactBroadcastState>,
     pub(crate) avss_secmsg_pending: HashMap<(Round, Replica), Vec<(CoinMsg, Replica)>>,
     pub(crate) awss_recovery: HashMap<(Round, Replica), crate::node::awss_recovery::AwssRecoveryState>,
     pub(crate) avss_public_bundles: HashMap<(Round, Replica), crate::node::wire::PublicBundle>,
@@ -220,10 +221,10 @@ pub struct Context {
     pub(crate) share_pipeline: HashMap<Round, crate::node::share_pipeline::SharePipeline>,
     pub(crate) share_tx: mpsc::UnboundedSender<crate::node::share_pipeline::ShareCompletion>,
     pub(crate) share_rx: mpsc::UnboundedReceiver<crate::node::share_pipeline::ShareCompletion>,
-    pub(crate) full_audit: HashMap<Round, crate::node::full_audit::FullAuditState>,
+    pub(crate) full_audit: HashMap<(Round, Replica), crate::node::full_audit::FullAuditState>,
     pub(crate) full_audit_tx: mpsc::UnboundedSender<crate::node::full_audit::FullAuditCompletion>,
     pub(crate) full_audit_rx: mpsc::UnboundedReceiver<crate::node::full_audit::FullAuditCompletion>,
-    pub(crate) audit_acs_pending: HashMap<Round, Vec<WrapperMsg>>,
+
 
     // ---- ACS unpredictable common coin (PPT problem-1 fix) ----
     //
@@ -580,7 +581,7 @@ impl Context {
 
                 avss_secmsg_state: HashMap::default(),
                 avss_secmsg_public: HashMap::default(),
-                avss_public_rbc: HashMap::default(),
+                avss_public_rbc: HashMap::default(), acs_compact_rbc: HashMap::default(),
                 avss_public_bundles: HashMap::default(),
                 avss_secmsg_pending: HashMap::default(),
                 awss_recovery: HashMap::default(),
@@ -590,7 +591,7 @@ impl Context {
                 reserve_pending: HashMap::default(), reserve_serving: HashMap::default(),
                 share_pipeline: HashMap::default(), share_tx, share_rx,
                 full_audit: HashMap::default(), full_audit_tx, full_audit_rx,
-                audit_acs_pending: HashMap::default(),
+
 
                 coin_material: HashMap::default(),
                 coin_shares: HashMap::default(),

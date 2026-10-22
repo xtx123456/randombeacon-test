@@ -153,6 +153,7 @@ impl Context {
         }
         let pending = std::mem::take(&mut self.awss_recovery.get_mut(&(round, dealer)).unwrap().pending);
         for (message, sender) in pending { self.process_awss_wire(message, sender).await; }
+        self.try_start_dealer_audit(round,dealer).await;
         self.release_awss_serving_if_safe(round, dealer);
     }
 
@@ -250,14 +251,15 @@ impl Context {
                     || self.avss_secmsg_state.get(&(round, dealer)).and_then(|state| state.delivered_message())
                         .map(|bytes| self.awss_happy(round, dealer, self.myid, bytes)).unwrap_or(false);
                 if own_happy && !self.awss_recovery.get(&(round, dealer)).unwrap().assist_sent {
-                    self.awss_recovery.get_mut(&(round, dealer)).unwrap().assist_sent = true;
                     let recipient = (self.myid + 1) % self.num_nodes;
                     if let Some(SecMsgDstAction::SendMessageForward { payload, .. }) =
                         self.avss_secmsg_state.get(&(round, dealer)).and_then(|state| state.prepare_message_forward_for(recipient).ok()) {
+                        self.awss_recovery.get_mut(&(round,dealer)).unwrap().assist_sent=true;
                         self.broadcast_awss_proof(round, dealer, root, self.myid, ForwardTag::Assist, payload.clone()).await;
                         self.accept_awss_proof(round, dealer, root, self.myid, ForwardTag::Assist, payload).await;
                     }
                 }
+                self.note_verified_dealer_fault(dealer).await;
                 self.recover_awss_local_share(round, dealer).await;
                 self.drive_awss_recovery(round, dealer).await;
             }
@@ -274,28 +276,18 @@ impl Context {
         }
     }
 
-    /// Keep selected serving evidence until local audit finishes AND every
-    /// participant acknowledges its own share. A Byzantine can retain state by
-    /// withholding its ACK; a timeout cannot safely erase slow honest peers' data.
-    pub(crate) fn release_awss_serving_if_safe(&mut self, round: Round, dealer: Replica) {
-        let cleared = self.round_state.get(&round).map(|state| state.cleared).unwrap_or(false);
-        let acknowledged = self.awss_recovery.get(&(round, dealer))
-            .map(|state| state.recovered_peers.len() == self.num_nodes).unwrap_or(false);
-        if cleared && acknowledged {
-            self.avss_secmsg_state.remove(&(round, dealer));
-            self.avss_secmsg_delivered_bytes.remove(&(round,dealer));
-            self.avss_beacon_bytes.remove(&(round,dealer));
-            if !self.reserve_state.contains_key(&(round,dealer)) {
-                self.avss_secmsg_public.remove(&(round,dealer));
-                self.avss_public_bundles.remove(&(round,dealer));self.avss_public_rbc.remove(&(round,dealer));
-            }
-            // Preserve the selected/ack tombstone; release private evidence.
-            if let Some(state) = self.awss_recovery.get_mut(&(round, dealer)) {
-                state.assists.clear(); state.certificates.clear(); state.local_shares = None;
-                state.complaint = None; state.channels.clear(); state.pending.clear();
+    /// Retain original transport rows/public roots for delayed, valid complaints.
+    /// Without a retirement certificate, ACKs alone cannot prove that no delayed
+    /// complaint exists. Release derived work only; serving evidence stays live.
+    pub(crate) fn release_awss_serving_if_safe(&mut self,round:Round,dealer:Replica) {
+        let cleared=self.round_state.get(&round).map(|s|s.cleared).unwrap_or(false);
+        if let Some(state)=self.awss_recovery.get_mut(&(round,dealer)) {
+            if cleared && state.recovered_peers.len()==self.num_nodes {
+                state.local_shares=None;state.assists.clear();
             }
         }
     }
+
 }
 
 fn prime_weights(providers: &[Replica], target: Replica, prime: &BigUint) -> Vec<BigUint> {

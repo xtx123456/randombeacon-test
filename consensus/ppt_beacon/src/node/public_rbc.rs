@@ -3,7 +3,6 @@ use async_recursion::async_recursion;
 use types::{Replica, Round};
 use types::beacon::{BeaconMsg, WrapperMsg};
 use crate::node::{Context, CTRBCState};
-use super::acs::rbc::{RbcAction, RbcInstanceState};
 use super::wire::{self, PptWire, PublicBundle, RbcScope, RbcMessage};
 
 pub(crate) fn transcript(public: &types::beacon::AvssPublicCommitMsg) -> BeaconMsg {
@@ -27,11 +26,14 @@ impl Context {
     #[async_recursion]
     pub(crate) async fn process_ppt_wire(&mut self, message: PptWire, sender: Replica) {
         match message {
-            PptWire::TransformedShares{round,dealers,values}=>self.process_transformed_shares(round,dealers,values,sender).await,
-            PptWire::AuditDisclosure{round,dealers,entries}=>self.process_full_audit_disclosure(round,dealers,entries,sender).await,
+            PptWire::TransformedShares{..}=>{}, // v4 reconstruction is not accepted in v5
+            PptWire::AuditDisclosure{..}=>{}, // v4 all-dealer disclosures are not imported
             PptWire::AuditCertificate{..}=>{}, // Legacy slot: only direct provider rows enter audits.
-            PptWire::AuditRecovered{round}=>self.note_audit_ack(round,sender),
+            PptWire::AuditRecovered{..}=>{},
             message @ PptWire::ReserveTransport{..}|message @ PptWire::ReserveRequest{..}|message @ PptWire::ReserveRecovered{..}=>self.process_reserve_wire(message,sender).await,
+            PptWire::Compact{scope,round,proposer,message}=>self.process_compact_broadcast(scope,round,proposer,message,sender).await,
+            PptWire::BatchRec{round,context,stage,values}=>self.process_batch_rec(round,context,stage,values,sender).await,
+            PptWire::DealerAudit{round,dealer,entry}=>self.process_dealer_audit(round,dealer,entry,sender).await,
             PptWire::Rbc { scope, round, proposer, message } => {
                 self.process_scoped_rbc(scope, round, proposer, message, sender).await;
             }
@@ -46,79 +48,15 @@ impl Context {
         }
     }
 
-    #[async_recursion]
-    pub(crate) async fn start_public_rbc(&mut self, bundle: PublicBundle) {
-        let round = bundle.public.round;
-        let proposer = bundle.public.origin;
-        let payload = bincode::serialize(&bundle).expect("public AWSS bundle encoding");
-        let myid = self.myid; let n = self.num_nodes; let f = self.num_faults;
-        let limit=super::payload_limits::public_bundle(self.batch_size,n,self.gf2_profile.is_some()).unwrap_or(0);
-        let actions = self.avss_public_rbc.entry((round, proposer)).or_insert_with(||
-            RbcInstanceState::new_bounded(myid, proposer, n, f, limit))
-            .proposer_send(payload);
-        self.dispatch_public_rbc(round, proposer, actions).await;
+    pub(crate) async fn start_public_rbc(&mut self,bundle:PublicBundle) {
+        let round=bundle.public.round;let proposer=bundle.public.origin;
+        self.start_compact_broadcast(RbcScope::PublicCommit,round,proposer,
+            bincode::serialize(&bundle).expect("public AWSS encoding")).await;
     }
 
-    #[async_recursion]
-    pub(crate) async fn process_scoped_rbc(&mut self, scope: RbcScope, round: Round,
-        proposer: Replica, message: RbcMessage, sender: Replica) {
-        if sender >= self.num_nodes || proposer >= self.num_nodes { return; }
-        if matches!(&message, RbcMessage::Send(_)) && sender != proposer { return; }
-        if scope == RbcScope::AcsProposal {
-            self.process_acs_rbc_retrieval(round, proposer, sender, message).await;
-            return;
-        }
-        if self.round_state.get(&round).map(|state| state.cleared).unwrap_or(false)
-            && !self.avss_public_rbc.contains_key(&(round, proposer)) { return; }
-        // Requests can still be served after local batch cleanup. A slow honest
-        // recipient must not depend on the Byzantine proposer sending again.
-        let myid = self.myid; let n = self.num_nodes; let f = self.num_faults;
-        let limit=super::payload_limits::public_bundle(self.batch_size,n,self.gf2_profile.is_some()).unwrap_or(0);
-        let state = self.avss_public_rbc.entry((round, proposer))
-            .or_insert_with(|| RbcInstanceState::new_bounded(myid, proposer, n, f, limit));
-        let actions = match message {
-            RbcMessage::Send(payload) => {
-                let bundle: PublicBundle = match bincode::deserialize(&payload) { Ok(value) => value, Err(_) => return };
-                if bundle.public.origin != proposer || bundle.public.round != round
-                    || !bundle.public.verify_transcript_root() { return; }
-                state.handle_send(sender, payload)
-            }
-            RbcMessage::Echo(hash) => state.handle_echo(sender, hash),
-            RbcMessage::Ready(hash) => state.handle_ready(sender, hash),
-            RbcMessage::Request(hash) => state.handle_request(sender, hash),
-            RbcMessage::Payload(hash, payload) => state.handle_payload(sender, hash, payload),
-        };
-        self.dispatch_public_rbc(round, proposer, actions).await;
-    }
-
-    #[async_recursion]
-    async fn dispatch_public_rbc(&mut self, round: Round, proposer: Replica, actions: Vec<RbcAction>) {
-        for action in actions {
-            let message = match action {
-                RbcAction::SendSend { payload } => RbcMessage::Send(payload),
-                RbcAction::SendEcho { payload_hash } => RbcMessage::Echo(payload_hash),
-                RbcAction::SendReady { payload_hash } => RbcMessage::Ready(payload_hash),
-                RbcAction::RequestPayload { payload_hash } => RbcMessage::Request(payload_hash),
-                RbcAction::SendPayload { recipient, payload_hash, payload } => {
-                    self.send_ppt_wire(recipient, round, PptWire::Rbc {
-                        scope: RbcScope::PublicCommit, round, proposer,
-                        message: RbcMessage::Payload(payload_hash, payload) }).await;
-                    continue;
-                }
-                RbcAction::Delivered { payload } => {
-                    if let Ok(bundle) = bincode::deserialize::<PublicBundle>(&payload) {
-                        if bundle.public.origin == proposer && bundle.public.round == round {
-                            self.accept_public_bundle(bundle).await;
-                        }
-                    }
-                    continue;
-                }
-            };
-            let wire = PptWire::Rbc { scope: RbcScope::PublicCommit, round, proposer, message: message.clone() };
-            self.broadcast(wire::encode(&wire), round).await;
-            self.process_scoped_rbc(RbcScope::PublicCommit, round, proposer, message, self.myid).await;
-        }
-    }
+    // Old full-payload RBC wire slots remain decodable, but never enter v5 instances.
+    pub(crate) async fn process_scoped_rbc(&mut self,_scope:RbcScope,_round:Round,
+        _proposer:Replica,_message:RbcMessage,_sender:Replica) {}
 
     #[async_recursion]
     pub(crate) async fn accept_public_bundle(&mut self, bundle: PublicBundle) {

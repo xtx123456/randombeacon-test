@@ -49,7 +49,6 @@ use types::{
 };
 
 use super::aba_driver::AbaDriverAction;
-use super::rbc::RbcAction;
 use super::state::AcsRound;
 use crate::node::Context;
 
@@ -94,7 +93,7 @@ impl Context {
     /// follow-up ABA / RBC actions.
     #[async_recursion]
     pub async fn acs_note_local_change(&mut self, round: Round) {
-        if round>self.max_rounds||!self.acs_audit_ready(round){return;}
+        if round>self.max_rounds{return;}
         // Apply the global ban list to the per-round ACS state.
         let banned: HashSet<Replica> = self.permanently_banned_dealers();
         {
@@ -151,7 +150,7 @@ impl Context {
     /// cannot directly enable a `pump_coins` / `force_zero`
     /// transition; only ABA state changes can.
     #[async_recursion]
-    async fn acs_external_scan_finalize_only(&mut self, round: Round) {
+    pub(crate) async fn acs_external_scan_finalize_only(&mut self, round: Round) {
         self.acs_maybe_finalize(round).await;
     }
 
@@ -175,33 +174,9 @@ impl Context {
             return;
         }
 
-        let fire_actions: Option<Vec<RbcAction>> = {
-            let st = self.acs_round_mut(round);
-            if st.rbc_self_send_done {
-                None
-            } else {
-                st.rbc_self_send_done = true;
-                let acts = st.rbc[myid as usize].proposer_send(payload.clone());
-                Some(acts)
-            }
-        };
-
-        let acts = match fire_actions {
-            Some(a) => a,
-            None => return,
-        };
-
-        log::info!(
-            "[PPT][ACS-RBC] node {} round {} broadcasting RBC SEND (proposer={}, |V_i|={} bytes)",
-            self.myid,
-            round,
-            self.myid,
-            payload.len()
-        );
-
-        for a in acts {
-            self.dispatch_rbc_action(round, myid, a).await;
-        }
+        if self.acs_round_mut(round).rbc_self_send_done {return;}
+        self.acs_round_mut(round).rbc_self_send_done=true;
+        self.start_compact_broadcast(crate::node::wire::RbcScope::AcsProposal,round,myid,payload).await;
     }
 
     /// Re-evaluate deferred ABA inputs (RBC-delivered V_j whose
@@ -213,7 +188,7 @@ impl Context {
 
         let pending_proposers: Vec<usize> = {
             let st = self.acs_round_mut(round);
-            st.deferred_inputs.iter().copied().collect()
+            (0..st.n).filter(|j| !st.aba_input_fed[*j] && (st.deferred_inputs.contains(j)||banned.contains(j))).collect()
         };
 
         for j in pending_proposers {
@@ -477,67 +452,18 @@ impl Context {
         self.finalize_acs_round(round, dealers).await;
     }
 
-    // ---- RBC dispatch ----
-
-    /// Dispatch one `RbcAction` produced by `acs_state[round].rbc[*]`.
-    /// Maps:
-    ///   - `SendSend(payload)` → broadcast `ACSRbcSend` + self-deliver
-    ///   - `SendEcho(h)`       → broadcast `ACSRbcEcho` + self-deliver
-    ///   - `SendReady(h)`      → broadcast `ACSRbcReady` + self-deliver
-    ///   - `Delivered(payload)`→ record locally and feed ABA(j) input
-    ///
-    /// Self-deliver paths intentionally call the **`*_inner`**
-    /// variants of the inbound handlers, which skip the external
-    /// scan (`acs_external_scan_once`). The scan happens once at
-    /// the outer cascade boundary, not on every recursive
-    /// self-deliver step.
-    #[async_recursion]
-    async fn dispatch_rbc_action(
-        &mut self,
-        round: Round,
-        proposer: Replica,
-        action: RbcAction,
-    ) {
-        match action {
-            RbcAction::SendSend { payload } => {
-                let msg = CoinMsg::ACSRbcSend(round, proposer, payload.clone());
-                self.broadcast(msg, round).await;
-                // Self-deliver inner: feed our own SEND into our local
-                // RBC state so the ECHO/READY thresholds count us.
-                // No scan here -- it runs once at the outer boundary.
-                self.process_acs_rbc_send_inner(round, proposer, payload).await;
-            }
-            RbcAction::SendEcho { payload_hash } => {
-                let msg = CoinMsg::ACSRbcEcho(round, proposer, payload_hash);
-                self.broadcast(msg, round).await;
-                self.process_acs_rbc_echo_inner(round, proposer, self.myid, payload_hash).await;
-            }
-            RbcAction::SendReady { payload_hash } => {
-                let msg = CoinMsg::ACSRbcReady(round, proposer, payload_hash);
-                self.broadcast(msg, round).await;
-                self.process_acs_rbc_ready_inner(round, proposer, self.myid, payload_hash).await;
-            }
-            RbcAction::RequestPayload { payload_hash } => {
-                let message = crate::node::wire::PptWire::Rbc {
-                    scope: crate::node::wire::RbcScope::AcsProposal, round, proposer,
-                    message: crate::node::wire::RbcMessage::Request(payload_hash) };
-                self.broadcast(crate::node::wire::encode(&message), round).await;
-            }
-            RbcAction::SendPayload { recipient, payload_hash, payload } => {
-                self.send_ppt_wire(recipient, round, crate::node::wire::PptWire::Rbc {
-                    scope: crate::node::wire::RbcScope::AcsProposal, round, proposer,
-                    message: crate::node::wire::RbcMessage::Payload(payload_hash, payload) }).await;
-            }
-            RbcAction::Delivered { payload } => {
-                self.on_rbc_delivered(round, proposer, payload).await;
-            }
-        }
-    }
-
     /// Local RBC delivery: try to feed ABA(proposer) input=1 if
     /// dealer `proposer` is AVSS-completed locally; otherwise defer.
     #[async_recursion]
-    async fn on_rbc_delivered(&mut self, round: Round, proposer: Replica, payload: Vec<u8>) {
+    pub(crate) async fn on_rbc_delivered(&mut self, round: Round, proposer: Replica, payload: Vec<u8>) {
+        let width=std::mem::size_of::<Replica>();
+        let valid=if payload.len()>=4 {
+            let count=u32::from_be_bytes([payload[0],payload[1],payload[2],payload[3]]) as usize;
+            let ids:Vec<_>=payload[4..].chunks_exact(width).map(|v|Replica::from_be_bytes(v.try_into().unwrap())).collect();
+            count>=self.num_nodes-self.num_faults && count<=self.num_nodes && payload.len()==4+count*width
+                && ids.iter().all(|j|*j<self.num_nodes) && ids.windows(2).all(|w|w[0]<w[1])
+        }else{false};
+        if !valid {self.acs_reject_proposal(round,proposer).await;return;}
         let banned = self.permanently_banned_dealers();
         let local_complete = self.local_completed_dealers(round);
         let j = proposer as usize;
@@ -706,134 +632,19 @@ impl Context {
     /// `process.rs` already checked that the wrapper-level sender
     /// matches `proposer` (Bracha RBC SENDs are only authoritative
     /// from the proposer themselves).
-    #[async_recursion]
-    pub async fn process_acs_rbc_send(
-        &mut self,
-        round: Round,
-        proposer: Replica,
-        payload: Vec<u8>,
-    ) {
-        self.process_acs_rbc_send_inner(round, proposer, payload).await;
-        self.acs_external_scan_finalize_only(round).await;
-    }
+    // Old full-payload RBC wire slots cannot enter a v5 instance.
+    pub async fn process_acs_rbc_send(&mut self,_round:Round,_proposer:Replica,_payload:Vec<u8>) {}
+    pub async fn process_acs_rbc_echo(&mut self,_round:Round,_proposer:Replica,_sender:Replica,_hash:crypto::hash::Hash) {}
+    pub async fn process_acs_rbc_ready(&mut self,_round:Round,_proposer:Replica,_sender:Replica,_hash:crypto::hash::Hash) {}
 
     #[async_recursion]
-    async fn process_acs_rbc_send_inner(
-        &mut self,
-        round: Round,
-        proposer: Replica,
-        payload: Vec<u8>,
-    ) {
-        if self.permanently_banned_dealers().contains(&proposer) {
-            log::warn!(
-                "[PPT][BAN] dropping ACSRbcSend from banned proposer {} round {}",
-                proposer,
-                round
-            );
-            return;
-        }
-        if (proposer as usize) >= self.num_nodes {
-            return;
-        }
-
-        let acts = {
-            let st = self.acs_round_mut(round);
-            st.rbc[proposer as usize].handle_send(proposer, payload)
-        };
-
-        for a in acts {
-            self.dispatch_rbc_action(round, proposer, a).await;
-        }
-    }
-
-    #[async_recursion]
-    pub async fn process_acs_rbc_echo(
-        &mut self,
-        round: Round,
-        proposer: Replica,
-        sender: Replica,
-        payload_hash: crypto::hash::Hash,
-    ) {
-        self.process_acs_rbc_echo_inner(round, proposer, sender, payload_hash).await;
-        self.acs_external_scan_finalize_only(round).await;
-    }
-
-    #[async_recursion]
-    async fn process_acs_rbc_echo_inner(
-        &mut self,
-        round: Round,
-        proposer: Replica,
-        sender: Replica,
-        payload_hash: crypto::hash::Hash,
-    ) {
-        if self.permanently_banned_dealers().contains(&proposer) {
-            return;
-        }
-        if (proposer as usize) >= self.num_nodes {
-            return;
-        }
-
-        let acts = {
-            let st = self.acs_round_mut(round);
-            st.rbc[proposer as usize].handle_echo(sender, payload_hash)
-        };
-
-        for a in acts {
-            self.dispatch_rbc_action(round, proposer, a).await;
-        }
-    }
-
-    #[async_recursion]
-    pub async fn process_acs_rbc_ready(
-        &mut self,
-        round: Round,
-        proposer: Replica,
-        sender: Replica,
-        payload_hash: crypto::hash::Hash,
-    ) {
-        self.process_acs_rbc_ready_inner(round, proposer, sender, payload_hash).await;
-        self.acs_external_scan_finalize_only(round).await;
-    }
-
-    #[async_recursion]
-    async fn process_acs_rbc_ready_inner(
-        &mut self,
-        round: Round,
-        proposer: Replica,
-        sender: Replica,
-        payload_hash: crypto::hash::Hash,
-    ) {
-        if self.permanently_banned_dealers().contains(&proposer) {
-            return;
-        }
-        if (proposer as usize) >= self.num_nodes {
-            return;
-        }
-
-        let acts = {
-            let st = self.acs_round_mut(round);
-            st.rbc[proposer as usize].handle_ready(sender, payload_hash)
-        };
-
-        for a in acts {
-            self.dispatch_rbc_action(round, proposer, a).await;
-        }
-    }
-
-    #[async_recursion]
-    pub(crate) async fn process_acs_rbc_retrieval(&mut self, round: Round,
-        proposer: Replica, sender: Replica, message: crate::node::wire::RbcMessage) {
-        if proposer >= self.num_nodes || sender >= self.num_nodes { return; }
-        let actions = {
-            let state = &mut self.acs_round_mut(round).rbc[proposer];
-            match message {
-                crate::node::wire::RbcMessage::Request(hash) => state.handle_request(sender, hash),
-                crate::node::wire::RbcMessage::Payload(hash, payload) => state.handle_payload(sender, hash, payload),
-                _ => return,
-            }
-        };
-        for action in actions { self.dispatch_rbc_action(round, proposer, action).await; }
-        self.acs_external_scan_finalize_only(round).await;
+    pub(crate) async fn acs_reject_proposal(&mut self,round:Round,proposer:Replica) {
+        let st=self.acs_round_mut(round);let j=proposer as usize;
+        if j>=st.n || st.aba_input_fed[j] {return;}
+        st.aba_input_fed[j]=true;st.deferred_inputs.remove(&j);
+        let actions=st.aba.set_input(j,false);
+        for action in actions {self.dispatch_aba_action(round,self.myid,action).await;}
+        self.acs_external_scan_full(round).await;
     }
 
     #[async_recursion]

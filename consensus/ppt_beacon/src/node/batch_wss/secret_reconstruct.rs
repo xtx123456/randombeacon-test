@@ -566,8 +566,6 @@ impl Context {
                     && state.next_output_coin == self.batch_size
                     && state.pending_beacon_outputs.is_empty()
                     && state.first_match_complete
-                    && state.post_complaint_complete
-                    && !state.audit_in_progress
                     && !state.cleared
             }
             None => false,
@@ -578,7 +576,7 @@ impl Context {
 
         if let Some(state) = self.round_state.get_mut(&round) {
             log::info!(
-                "[PPT][ROUND-RELEASE] node {} round {} releasing transient state (batch + audit complete)",
+                "[PPT][ROUND-RELEASE] node {} round {} releasing output work (serving evidence retained)",
                 self.myid,
                 round
             );
@@ -589,16 +587,18 @@ impl Context {
         // All-participant ACKs are required; n-f ACKs would still allow an honest
         // recipient to be left behind. No timer substitutes for delivery.
         let mut selected: HashSet<Replica> = self.awss_recovery.iter()
-            .filter(|((r, _), state)| *r == round && state.selected && state.recovered_peers.len() < self.num_nodes)
+            .filter(|((r, _), state)| *r == round && state.selected)
             .map(|((_, dealer), _)| *dealer).collect();
         selected.extend(self.reserve_state.keys().filter(|(r,_)|*r==round).map(|(_,d)|*d));
         let released: Vec<Replica> = self.awss_recovery.iter()
             .filter(|((r, _), state)| *r == round && state.selected && state.recovered_peers.len() == self.num_nodes)
             .map(|((_, dealer), _)| *dealer).collect();
         for dealer in released { self.release_awss_serving_if_safe(round, dealer); }
-        self.avss_secmsg_pending.retain(|(r, _), _| *r != round);
+        self.avss_secmsg_pending.retain(|(r,d),_|*r!=round||selected.contains(d));
         self.avss_beacon_bytes.retain(|(r,d),_|*r!=round||selected.contains(d));
         self.avss_public_rbc.retain(|(r, d), _| *r != round || selected.contains(d));
+        self.acs_compact_rbc.retain(|(r,_),_|*r!=round);
+        self.share_pipeline.remove(&round);
         self.avss_public_bundles.retain(|(r, d), _| *r != round || selected.contains(d));
         let removed_state = {
             let before = self.avss_secmsg_state.len();

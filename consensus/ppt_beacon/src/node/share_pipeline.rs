@@ -1,6 +1,5 @@
 //! PPT share-level extraction followed by polynomial OEC.
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use async_recursion::async_recursion;
 use crypto::aes_hash::HashState;
 use crypto::gf2::{Gf2Element,Gf2Profile};
@@ -10,15 +9,19 @@ use types::beacon::{AvssPublicCommitMsg,AvssRecipientPayload,Val};
 use super::{Context,oec::{self,Field,OecCache},wire::{self,PptWire}};
 
 #[derive(Clone)]
-struct SharePacket { dealers:Vec<Replica>, values:Arc<Vec<Val>> }
+struct RecPacket { context:crypto::hash::Hash, points:BTreeMap<usize,Val> }
 #[derive(Default)]
 pub(crate) struct SharePipeline {
-    matrix_inflight:bool, sent:bool, points:BTreeMap<Replica,SharePacket>,
-    version:u64, decoding:bool, cache:Option<OecCache>, decoded:Vec<Option<Vec<u8>>>,
+    matrix_inflight:bool,sent:bool,
+    inner:BTreeMap<Replica,RecPacket>,outer:BTreeMap<Replica,RecPacket>,
+    version:u64,attempted:Option<u64>,decoding:bool,
+    inner_cache:Option<OecCache>,outer_cache:Option<OecCache>,
+    owned:Vec<Option<Val>>,decoded:Vec<Option<Vec<u8>>>,
 }
 pub(crate) enum ShareCompletion {
-    Transformed { round:Round, dealers:Vec<Replica>, values:Result<Vec<Val>,String> },
-    Decoded { round:Round,version:u64,decoded:Vec<Option<Vec<u8>>>,cache:OecCache,errors:Vec<Replica> },
+    Transformed {round:Round,dealers:Vec<Replica>,packets:Result<Vec<Vec<Val>>,String>},
+    Decoded {round:Round,version:u64,owned:Vec<Option<Val>>,decoded:Vec<Option<Vec<u8>>>,
+        inner_cache:OecCache,outer_cache:OecCache,errors:Vec<Replica>},
     Failed {round:Round,error:String},
 }
 
@@ -133,9 +136,9 @@ impl Context {
         let state=self.round_state.get(&round).unwrap();let binary=state.gf2_super_inv_extractor.clone();
         let prime=state.super_inv_extractor.clone();let profile=self.gf2_profile;let batch=self.batch_size;
         self.share_pipeline.get_mut(&round).unwrap().matrix_inflight=true;
-        let tx=self.share_tx.clone();
+        let tx=self.share_tx.clone();let field=self.beacon_oec_field();let n=self.num_nodes;let f=self.num_faults;
         tokio::spawn(async move{
-            let result=tokio::task::spawn_blocking(move||->Result<Vec<Val>,String>{
+            let result=tokio::task::spawn_blocking(move||->Result<Vec<Vec<Val>>,String>{
                 let mut values=Vec::new();
                 for coin in 0..batch {
                     if let Some(profile)=profile {
@@ -145,24 +148,29 @@ impl Context {
                         let column=input.iter().map(|v|BigUint::from_bytes_be(&v[coin])).collect::<Vec<_>>();
                         for v in prime.as_ref().ok_or("missing matrix")?.transform_shares(&column)?{values.push(Context::pad_shares(v));}
                     }
-                }Ok(values)
+                }
+                let k=f+1;
+                // At n=3f+1, n-k=2f: exactly f correctable errors.
+                if n<3*f+1 || n-k<2*f || !field.distinct_points(n){return Err("invalid BatchRec point/error budget".into());}
+                let blocks=(values.len()+k-1)/k;let mut packets=vec![Vec::with_capacity(blocks);n];
+                for block in values.chunks(k) {
+                    let mut coefficients=block.to_vec();coefficients.resize(k,[0u8;32]);
+                    let encoded=field.encode_block(&coefficients,n).ok_or("noncanonical BatchRec coefficient")?;
+                    for (recipient,value) in encoded.into_iter().enumerate(){packets[recipient].push(value);}
+                }
+                Ok(packets)
             }).await.map_err(|e|e.to_string()).and_then(|v|v);
-            let _=tx.send(ShareCompletion::Transformed{round,dealers,values:result});
+            let _=tx.send(ShareCompletion::Transformed{round,dealers,packets:result});
         });
     }
 
-    #[async_recursion]
-    pub(crate) async fn process_transformed_shares(&mut self,round:Round,dealers:Vec<Replica>,values:Vec<Val>,sender:Replica) {
-        if sender>=self.num_nodes||round>self.max_rounds||dealers.len()<self.num_nodes-self.num_faults||dealers.len()>self.num_nodes
-            ||dealers.iter().any(|d|*d>=self.num_nodes)||dealers.windows(2).any(|w|w[0]>=w[1])
-            ||values.len()!=self.batch_size*(dealers.len()-self.num_faults)
-            ||self.round_state.get(&round).map(|s|s.cleared).unwrap_or(false){return;}
-        let field=self.beacon_oec_field();if values.iter().any(|v|!field.canonical(v)){return;}
-        if let Some(selected)=self.round_state.get(&round).and_then(|s|s.acs_decided_set.as_ref()){if selected!=&dealers{return;}}
-        let pipeline=self.share_pipeline.entry(round).or_default();
-        if pipeline.points.contains_key(&sender){return;}
-        pipeline.points.insert(sender,SharePacket{dealers,values:Arc::new(values)});pipeline.version+=1;
-        self.try_decode_transformed(round).await;
+
+    fn reconstruction_context(&self,round:Round)->Option<(crypto::hash::Hash,usize)> {
+        let dealers=self.round_state.get(&round)?.acs_decided_set.as_ref()?;
+        let count=self.batch_size.checked_mul(dealers.len().checked_sub(self.num_faults)?)?;
+        let bytes=bincode::serialize(&(b"PPTB_BATCHREC_V1",round,dealers,self.batch_size,self.num_nodes,self.num_faults,
+            self.secret_domain.to_bytes_be(),self.gf2_profile.map(|p|(p.w_p,p.w_q)))).ok()?;
+        Some((crypto::hash::do_hash(&bytes),count))
     }
 
     pub(crate) fn beacon_oec_field(&self)->Field {match self.gf2_profile {
@@ -170,61 +178,122 @@ impl Context {
     }}
 
     #[async_recursion]
-    pub(crate) async fn try_decode_transformed(&mut self,round:Round) {
-        let dealers=match self.round_state.get(&round){Some(s) if !s.cleared=>match &s.acs_decided_set{Some(d)=>d.clone(),None=>return},_=>return};
-        let field=self.beacon_oec_field();let f=self.num_faults;let n=self.num_nodes;let coordinates=self.batch_size*(dealers.len()-f);
+    pub(crate) async fn process_batch_rec(&mut self,round:Round,context:crypto::hash::Hash,stage:u8,values:Vec<(usize,Val)>,sender:Replica) {
+        if sender>=self.num_nodes || stage>1 || round>self.max_rounds
+            || self.round_state.get(&round).map(|s|s.cleared).unwrap_or(false){return;}
+        let k=self.num_faults+1;
+        let max_coordinates=match self.batch_size.checked_mul(self.num_nodes-self.num_faults){Some(n)=>n,None=>return};
+        let max_blocks=(max_coordinates+k-1)/k;
+        if values.is_empty() || values.len()>max_blocks || values.iter().any(|(block,_)|*block>=max_blocks){return;}
+        let field=self.beacon_oec_field();if values.iter().any(|(_,v)|!field.canonical(v)){return;}
+        if let Some((expected,count))=self.reconstruction_context(round) {
+            if context!=expected || values.iter().any(|(block,_)|*block>=(count+k-1)/k){return;}
+        }
         let pipeline=self.share_pipeline.entry(round).or_default();
-        if pipeline.decoding{return;}
-        let points:BTreeMap<_,_>=pipeline.points.iter().filter(|(_,p)|p.dealers==dealers).map(|(s,p)|(*s,p.values.clone())).collect();
-        if points.len()<2*f+1{return;}
-        pipeline.decoded.resize(coordinates,None);
-        if pipeline.decoded.iter().all(Option::is_some){return;}
-        pipeline.decoding=true;let version=pipeline.version;let mut decoded=pipeline.decoded.clone();let mut cache=pipeline.cache.take().unwrap_or_default();
+        let map=if stage==0 {&mut pipeline.inner}else{&mut pipeline.outer};
+        let packet=map.entry(sender).or_insert_with(||RecPacket{context,points:BTreeMap::new()});
+        if packet.context!=context{return;}
+        let mut changed=false;
+        for (block,value) in values {if !packet.points.contains_key(&block){packet.points.insert(block,value);changed=true;}}
+        if changed {pipeline.version+=1;self.try_decode_transformed(round).await;}
+    }
+
+    #[async_recursion]
+    pub(crate) async fn try_decode_transformed(&mut self,round:Round) {
+        if self.round_state.get(&round).map(|s|s.cleared).unwrap_or(true){return;}
+        let (context,coordinates)=match self.reconstruction_context(round){Some(v)=>v,None=>return};
+        let field=self.beacon_oec_field();let f=self.num_faults;let n=self.num_nodes;let k=f+1;let blocks=(coordinates+k-1)/k;
+        let pipeline=self.share_pipeline.entry(round).or_default();
+        if pipeline.decoding || pipeline.attempted==Some(pipeline.version){return;}
+        let collect=|map:&BTreeMap<Replica,RecPacket>|map.iter().filter(|(_,p)|p.context==context)
+            .map(|(provider,p)|(*provider,p.points.clone())).collect::<BTreeMap<_,_>>();
+        let inner=collect(&pipeline.inner);let outer=collect(&pipeline.outer);
+        if inner.len()<2*f+1 && outer.len()<k+f{return;}
+        pipeline.owned.resize(blocks,None);pipeline.decoded.resize(coordinates,None);
+        pipeline.decoding=true;pipeline.attempted=Some(pipeline.version);let version=pipeline.version;
+        let mut owned=pipeline.owned.clone();let mut decoded=pipeline.decoded.clone();
+        let mut inner_cache=pipeline.inner_cache.take().unwrap_or_default();let mut outer_cache=pipeline.outer_cache.take().unwrap_or_default();
         let tx=self.share_tx.clone();
         tokio::spawn(async move{
             let result=tokio::task::spawn_blocking(move||{
                 let mut errors=Vec::new();
-                for coordinate in 0..coordinates {if decoded[coordinate].is_some(){continue;}
-                    let input=points.iter().map(|(p,v)|(*p,v[coordinate].to_vec())).collect();
-                    if let Some(poly)=oec::decode(&field,f,f,n,&input,&mut cache){errors.extend(poly.errors.iter().copied());decoded[coordinate]=Some(poly.at_zero());}
-                }errors.sort_unstable();errors.dedup();(decoded,cache,errors)
+                for block in 0..blocks {
+                    if owned[block].is_none() {
+                        let points=inner.iter().filter_map(|(p,rows)|rows.get(&block).map(|v|(*p,v.to_vec()))).collect();
+                        if let Some(poly)=oec::decode(&field,f,f,n,&points,&mut inner_cache){
+                            owned[block]=oec::val(&poly.at_zero());errors.extend(poly.errors);
+                        }
+                    }
+                    let start=block*k;let end=(start+k).min(coordinates);
+                    if decoded[start..end].iter().all(Option::is_some){continue;}
+                    let points=outer.iter().filter_map(|(p,rows)|rows.get(&block).map(|v|(*p,v.to_vec()))).collect();
+                    if let Some(poly)=oec::decode(&field,k-1,f,n,&points,&mut outer_cache){
+                        let coefficients=poly.coefficients();
+                        for (offset,value) in coefficients.into_iter().take(end-start).enumerate(){decoded[start+offset]=Some(value);}
+                        errors.extend(poly.errors);
+                    }
+                }
+                errors.sort_unstable();errors.dedup();(owned,decoded,inner_cache,outer_cache,errors)
             }).await;
             match result {
-                Ok((decoded,cache,errors))=>{let _=tx.send(ShareCompletion::Decoded{round,version,decoded,cache,errors});}
+                Ok((owned,decoded,inner_cache,outer_cache,errors))=>{let _=tx.send(ShareCompletion::Decoded{round,version,owned,decoded,inner_cache,outer_cache,errors});}
                 Err(error)=>{let _=tx.send(ShareCompletion::Failed{round,error:error.to_string()});}
             }
         });
     }
 
     #[async_recursion]
+    async fn emit_decoded_batch(&mut self,round:Round) {
+        let pipeline=match self.share_pipeline.get(&round){Some(p)=>p,None=>return};
+        // A fast node may decode using Byzantine owners that later withhold from
+        // slow peers. Finish ALL our own first/second-stage duties before release.
+        if !pipeline.sent || pipeline.owned.is_empty() || pipeline.owned.iter().any(Option::is_none){return;}
+        let state=match self.round_state.get_mut(&round){Some(s) if !s.cleared=>s,_=>return};
+        let outputs=match &state.acs_decided_set{Some(d)=>d.len()-self.num_faults,None=>return};
+        for coin in 0..self.batch_size {
+            if state.recovered_coins.contains(&coin){continue;}
+            let values=pipeline.decoded[coin*outputs..(coin+1)*outputs].iter().cloned().collect::<Option<Vec<_>>>();
+            if let Some(values)=values {state.recovered_coins.insert(coin);state.pending_beacon_outputs.insert(coin,values);}
+        }
+        state.batch_reconstruction_complete=state.recovered_coins.len()==self.batch_size;
+        self.flush_pending_beacon_outputs(round,"two-layer BatchRec").await;
+    }
+
+    #[async_recursion]
     pub(crate) async fn finalize_share_completion(&mut self,completion:ShareCompletion) {
         match completion {
             ShareCompletion::Failed{round,error}=>{
-                if let Some(p)=self.share_pipeline.get_mut(&round){p.decoding=false;}
-                log::error!("[PPT][OEC] worker failed round={}: {}; waiting for a retry, no output accepted",round,error);
+                if let Some(p)=self.share_pipeline.get_mut(&round){p.decoding=false;p.attempted=None;}
+                log::error!("[PPT][BATCHREC] worker failed round={}: {}",round,error);
             }
-            ShareCompletion::Transformed{round,dealers,values}=>{
+            ShareCompletion::Transformed{round,dealers,packets}=>{
+                let (context,_)=match self.reconstruction_context(round){Some(v)=>v,None=>return};
+                if self.round_state.get(&round).and_then(|s|s.acs_decided_set.as_ref())!=Some(&dealers){return;}
                 let state=self.share_pipeline.entry(round).or_default();state.matrix_inflight=false;
-                let values=match values{Ok(v)=>v,Err(e)=>{log::error!("[PPT][MATRIX] round={} failed: {}",round,e);return;}};
+                let packets=match packets {Ok(v)=>v,Err(e)=>{log::error!("[PPT][MATRIX] round={} failed: {}",round,e);return;}};
                 if state.sent{return;}state.sent=true;
-                log::info!("[PPT][LOCAL-MATRIX] node={} round={} dealers={:?} output_shares={}",self.myid,round,dealers,values.len());
-                self.broadcast(wire::encode(&PptWire::TransformedShares{round,dealers:dealers.clone(),values:values.clone()}),round).await;
-                self.process_transformed_shares(round,dealers,values,self.myid).await;
-            }
-            ShareCompletion::Decoded{round,version,decoded,cache,errors}=>{
-                let pipeline=match self.share_pipeline.get_mut(&round){Some(p)=>p,None=>return};pipeline.decoding=false;pipeline.cache=Some(cache);pipeline.decoded=decoded;
-                let changed=pipeline.version!=version;
-                let state=match self.round_state.get_mut(&round){Some(s) if !s.cleared=>s,_=>return};
-                let outputs=match &state.acs_decided_set{Some(d)=>d.len()-self.num_faults,None=>return};
-                for coin in 0..self.batch_size {if state.recovered_coins.contains(&coin){continue;}
-                    let values=pipeline.decoded[coin*outputs..(coin+1)*outputs].iter().cloned().collect::<Option<Vec<_>>>();
-                    if let Some(values)=values{state.recovered_coins.insert(coin);state.pending_beacon_outputs.insert(coin,values);}
+                for (recipient,row) in packets.into_iter().enumerate() {
+                    let values=row.into_iter().enumerate().collect();
+                    self.send_ppt_wire(recipient,round,PptWire::BatchRec{round,context,stage:0,values}).await;
                 }
-                state.batch_reconstruction_complete=state.recovered_coins.len()==self.batch_size;
-                if !errors.is_empty(){log::warn!("[PPT][OEC-PROVIDER] round={} rejected output points from {:?}",round,errors);}
-                self.flush_pending_beacon_outputs(round,"share-level OEC").await;
-                self.try_start_full_audit(round).await;
-                if changed{self.try_decode_transformed(round).await;}
+                self.try_decode_transformed(round).await;
+                self.emit_decoded_batch(round).await;
+            }
+            ShareCompletion::Decoded{round,version,owned,decoded,inner_cache,outer_cache,errors}=>{
+                let (context,_)=match self.reconstruction_context(round){Some(v)=>v,None=>return};
+                let pipeline=match self.share_pipeline.get_mut(&round){Some(p)=>p,None=>return};
+                let fresh:Vec<_>=owned.iter().enumerate().filter_map(|(block,value)|
+                    if pipeline.owned.get(block).and_then(|v|v.as_ref()).is_none(){value.map(|v|(block,v))}else{None}).collect();
+                pipeline.decoding=false;pipeline.inner_cache=Some(inner_cache);pipeline.outer_cache=Some(outer_cache);
+                pipeline.owned=owned;pipeline.decoded=decoded;
+                if !errors.is_empty(){log::warn!("[PPT][BATCHREC-PROVIDER] round={} errors={:?} (not dealer evidence)",round,errors);}
+                if !fresh.is_empty() {
+                    self.broadcast(wire::encode(&PptWire::BatchRec{round,context,stage:1,values:fresh.clone()}),round).await;
+                    self.process_batch_rec(round,context,1,fresh,self.myid).await;
+                }
+                // Including arrivals during the worker and our own new outer points.
+                if self.share_pipeline.get(&round).map(|p|p.version!=version).unwrap_or(false){self.try_decode_transformed(round).await;}
+                self.emit_decoded_batch(round).await;
             }
         }
     }

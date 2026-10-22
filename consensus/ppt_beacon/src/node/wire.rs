@@ -6,7 +6,7 @@ use aes::{Aes256, cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray}};
 use rand::RngCore;
 use crypto::hash::Hash;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) enum RbcScope { PublicCommit, AcsProposal }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,11 +17,18 @@ pub(crate) enum RbcMessage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) enum ForwardTag { Complaint, Assist, Report }
 
-pub(crate) const PUBLIC_BUNDLE_VERSION: u16 = 4;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) enum CompactMessage {
+    Dispersal {root:Hash,path:crypto::aes_hash::Proof,fragment:super::shoup_smart::reed_solomon::Fragment},
+    Echo {root:Hash,path:crypto::aes_hash::Proof,fragment:super::shoup_smart::reed_solomon::Fragment,index:usize},
+    Vote(Hash),
+}
+
+pub(crate) const PUBLIC_BUNDLE_VERSION: u16 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PublicBundle {
-    /// Version 4 uses independently verified audit rows, without row bundles.
+    /// Version 5 uses Compact Broadcast, complaint-scoped audits and BatchRec.
     pub version: u16,
     /// Explicit input root for the main RO challenge; verified against SecMsg.
     pub challenge_root: Option<Hash>,
@@ -66,6 +73,9 @@ pub(crate) enum PptWire {
         nonce: [u8; 32],
         ciphertext: Vec<u8>,
     },
+    Compact {scope:RbcScope,round:Round,proposer:Replica,message:CompactMessage},
+    BatchRec {round:Round,context:Hash,stage:u8,values:Vec<(usize,types::beacon::Val)>},
+    DealerAudit {round:Round,dealer:Replica,entry:super::full_audit::DealerDisclosure},
 }
 
 pub(crate) fn encode(message: &PptWire) -> CoinMsg {

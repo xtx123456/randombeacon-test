@@ -59,6 +59,15 @@ impl Field {
     }) }
     fn id(&self)->Vec<u8> { match self { Self::Prime(p)=>{let mut b=vec![0];b.extend(p.to_bytes_be());b},Self::Binary(p)=>vec![1,(p.w_p/8) as u8,(p.w_q/8) as u8] } }
     pub(crate) fn canonical(&self,bytes:&[u8])->bool { self.parse(bytes).is_some() }
+    pub(crate) fn encode_block(&self,coefficients:&[types::beacon::Val],n:usize)->Option<Vec<types::beacon::Val>> {
+        let coefficients=coefficients.iter().map(|v|self.parse(v)).collect::<Option<Vec<_>>>()?;
+        (0..n).map(|j|val(&self.bytes(&evaluate(self,&coefficients,&self.point(j))))).collect()
+    }
+    pub(crate) fn distinct_points(&self,n:usize)->bool {
+        let mut seen=std::collections::HashSet::new();
+        (0..n).all(|j|{let p=self.point(j);!is_zero(&p)&&seen.insert(self.bytes(&p))})
+    }
+
 }
 fn is_zero(a:&Scalar)->bool { match a { Scalar::Prime(a)=>a.is_zero(),Scalar::Binary(a)=>a.is_zero() } }
 fn equal(a:&Scalar,b:&Scalar)->bool { match (a,b) { (Scalar::Prime(a),Scalar::Prime(b))=>a==b,(Scalar::Binary(a),Scalar::Binary(b))=>a.as_bytes()==b.as_bytes(),_=>false } }
@@ -67,6 +76,7 @@ fn evaluate(field:&Field,coeffs:&[Scalar],x:&Scalar)->Scalar { coeffs.iter().rev
 #[derive(Clone, Debug)]
 pub(crate) struct Polynomial { field:Field, coefficients:Vec<Scalar>, pub support:Vec<Replica>, pub errors:Vec<Replica> }
 impl Polynomial {
+    pub(crate) fn coefficients(&self)->Vec<Vec<u8>> {self.coefficients.iter().map(|v|self.field.bytes(v)).collect()}
     pub(crate) fn at_point(&self,provider:Replica)->Vec<u8> { self.field.bytes(&evaluate(&self.field,&self.coefficients,&self.field.point(provider))) }
     pub(crate) fn at_zero(&self)->Vec<u8> { self.field.bytes(&self.coefficients[0]) }
 }
