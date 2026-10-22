@@ -23,6 +23,7 @@ pub mod coin_mapper;
 pub mod options;
 mod wire;
 mod public_rbc;
+mod coded_broadcast;
 mod awss_recovery;
 mod oec;
 mod share_pipeline;

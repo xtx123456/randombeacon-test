@@ -162,8 +162,8 @@ pub struct Context {
     // ---- ACS state ----
     pub acs_state: std::collections::HashMap<Round, crate::node::acs::state::AcsRound>,
 
-    /// Legacy field retained for compatibility, kept empty until an agreed
-    /// exclusion protocol exists. Do not insert local suspicions here.
+    /// Locally verified dealer faults: selection input 0 only. Never controls
+    /// RBC participation, replica membership or an already decided dealer set.
     pub banned_dealers: HashSet<Replica>,
     /// Local suspicion is diagnostic only, never a consensus membership rule.
     pub suspected_dealers: HashSet<Replica>,
@@ -207,7 +207,8 @@ pub struct Context {
     pub avss_secmsg_state:
         HashMap<(Round, Replica), crate::node::shoup_smart::sec_msg_dst::SecMsgDstState>,
     pub avss_secmsg_public: HashMap<(Round, Replica), types::beacon::AvssPublicCommitMsg>,
-    pub(crate) avss_public_rbc: HashMap<(Round, Replica), crate::node::acs::rbc::RbcInstanceState>,
+    pub(crate) avss_public_rbc: HashMap<(Round, Replica), crate::node::shoup_smart::compact_broadcast::CompactBroadcastState>,
+    pub(crate) acs_compact_rbc: HashMap<(Round, Replica), crate::node::shoup_smart::compact_broadcast::CompactBroadcastState>,
     pub(crate) avss_secmsg_pending: HashMap<(Round, Replica), Vec<(CoinMsg, Replica)>>,
     pub(crate) awss_recovery: HashMap<(Round, Replica), crate::node::awss_recovery::AwssRecoveryState>,
     pub(crate) avss_public_bundles: HashMap<(Round, Replica), crate::node::wire::PublicBundle>,
@@ -220,10 +221,10 @@ pub struct Context {
     pub(crate) share_pipeline: HashMap<Round, crate::node::share_pipeline::SharePipeline>,
     pub(crate) share_tx: mpsc::UnboundedSender<crate::node::share_pipeline::ShareCompletion>,
     pub(crate) share_rx: mpsc::UnboundedReceiver<crate::node::share_pipeline::ShareCompletion>,
-    pub(crate) full_audit: HashMap<Round, crate::node::full_audit::FullAuditState>,
+    pub(crate) full_audit: HashMap<(Round, Replica), crate::node::full_audit::FullAuditState>,
     pub(crate) full_audit_tx: mpsc::UnboundedSender<crate::node::full_audit::FullAuditCompletion>,
     pub(crate) full_audit_rx: mpsc::UnboundedReceiver<crate::node::full_audit::FullAuditCompletion>,
-    pub(crate) audit_acs_pending: HashMap<Round, Vec<WrapperMsg>>,
+
 
     // ---- ACS unpredictable common coin (PPT problem-1 fix) ----
     //
@@ -418,7 +419,7 @@ impl Context {
     ) -> anyhow::Result<oneshot::Sender<()>> {
         options.validate(&config, gf2_profile, transport)?;
         log::info!("[PPT][ASSUMPTIONS] channel={:?} target128={} adaptive total corruption f={} n={}; randomness remains PR10; no full protocol security claim", options.channel, options.target128, config.num_faults, config.num_nodes);
-        log::info!("[PPT][PATH] local-share matrix -> polynomial OEC (degree={}, matching points={}) -> complete batch commitment audit; PPTB SHA-256 Merkle",config.num_faults,2*config.num_faults+1);
+        log::info!("[PPT][PATH] local-share matrix -> two-layer BatchRec (degree={}, matching points={}); complaint-only dealer audit; PPTB SHA-256 Merkle",config.num_faults,2*config.num_faults+1);
         if options.channel == crate::node::options::PptChannel::Benchmark {
             log::warn!("[PPT][ASSUMPTIONS] plaintext TCP+HMAC: benchmark only; sharing confidentiality is NOT provided");
         }
@@ -438,6 +439,12 @@ impl Context {
         {
             return Err(anyhow!("PPT currently requires n=3f+1, f>=1 and id<n"));
         }
+        let packing=config.num_faults+1;
+        if config.num_nodes.checked_sub(packing).map(|r|r<2*config.num_faults).unwrap_or(true) {
+            return Err(anyhow!("BatchRec requires n-k >= 2f"));
+        }
+        super::shoup_smart::reed_solomon::RsEncoder::new(config.num_nodes,config.num_faults)
+            .map_err(|e|anyhow!("unsupported Compact Broadcast configuration: {}",e))?;
         batch.checked_add(PPT_COIN_RESERVE)
             .ok_or_else(|| anyhow!("PPT total coin count overflows"))?;
         if super::payload_limits::plaintext(batch,config.num_nodes,gf2_profile.is_some(),
@@ -580,7 +587,7 @@ impl Context {
 
                 avss_secmsg_state: HashMap::default(),
                 avss_secmsg_public: HashMap::default(),
-                avss_public_rbc: HashMap::default(),
+                avss_public_rbc: HashMap::default(), acs_compact_rbc: HashMap::default(),
                 avss_public_bundles: HashMap::default(),
                 avss_secmsg_pending: HashMap::default(),
                 awss_recovery: HashMap::default(),
@@ -590,7 +597,7 @@ impl Context {
                 reserve_pending: HashMap::default(), reserve_serving: HashMap::default(),
                 share_pipeline: HashMap::default(), share_tx, share_rx,
                 full_audit: HashMap::default(), full_audit_tx, full_audit_rx,
-                audit_acs_pending: HashMap::default(),
+
 
                 coin_material: HashMap::default(),
                 coin_shares: HashMap::default(),
@@ -672,7 +679,6 @@ impl Context {
                 .avss_completed_dealers
                 .iter()
                 .copied()
-                .filter(|dealer| !self.banned_dealers.contains(dealer))
                 .collect(),
             None => HashSet::new(),
         }

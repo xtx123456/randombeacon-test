@@ -102,13 +102,12 @@ impl AcsRound {
         }
     }
 
-    /// External-validity / banning hook: drop any pending input
-    /// candidate for `dealer` and never feed it again. Idempotent.
+    /// Queue local input zero; the driver actually feeds it. Never stop RBC/ABA.
     pub fn ban_dealer(&mut self, dealer: Replica) {
         self.banned_snapshot.insert(dealer);
         let dealer_idx = dealer as usize;
         if dealer_idx < self.n {
-            self.deferred_inputs.remove(&dealer_idx);
+            if !self.aba_input_fed[dealer_idx] {self.deferred_inputs.insert(dealer_idx);}
         }
     }
 

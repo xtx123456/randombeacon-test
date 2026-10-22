@@ -630,7 +630,7 @@ impl CTRBCState {
     }
 
     /// Wipe transient state when the round is fully finished (every
-    /// coin emitted, post-ACS audit complete). Bookkeeping needed for
+    /// coin emitted and local BatchRec duties finished). Bookkeeping needed for
     /// the long-running `Context::banned_dealers` set is intentionally
     /// left untouched — it lives in `Context`, not here.
     pub fn clear(&mut self) {

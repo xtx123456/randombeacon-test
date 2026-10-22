@@ -548,15 +548,8 @@ fn build_local_batch_beacon_construct(
 }
 
 impl Context {
-    /// Release a round's transient state once it is fully done:
-    ///   - every coin in the batch has emitted its beacon output
-    ///     (`recon_secrets.contains(batch_size - 1)`), AND
-    ///   - the post-ACS audit quorum (n-f recovered-share multicasts)
-    ///     has completed (`post_complaint_complete == true`).
-    ///
-    /// Calling this in place (rather than removing the entry from
-    /// `round_state`) keeps the `cleared` sentinel so any very-late
-    /// arriving messages are safely ignored by the ingest paths.
+    /// Release output work after publication. Complaint and slow-recipient
+    /// serving evidence has an independent lifetime; no audit barrier is used.
     pub(crate) fn maybe_release_round(&mut self, round: Round) {
         let should_release = match self.round_state.get(&round) {
             Some(state) => {
@@ -566,8 +559,6 @@ impl Context {
                     && state.next_output_coin == self.batch_size
                     && state.pending_beacon_outputs.is_empty()
                     && state.first_match_complete
-                    && state.post_complaint_complete
-                    && !state.audit_in_progress
                     && !state.cleared
             }
             None => false,
@@ -578,7 +569,7 @@ impl Context {
 
         if let Some(state) = self.round_state.get_mut(&round) {
             log::info!(
-                "[PPT][ROUND-RELEASE] node {} round {} releasing transient state (batch + audit complete)",
+                "[PPT][ROUND-RELEASE] node {} round {} releasing output work (serving evidence retained)",
                 self.myid,
                 round
             );
@@ -589,16 +580,18 @@ impl Context {
         // All-participant ACKs are required; n-f ACKs would still allow an honest
         // recipient to be left behind. No timer substitutes for delivery.
         let mut selected: HashSet<Replica> = self.awss_recovery.iter()
-            .filter(|((r, _), state)| *r == round && state.selected && state.recovered_peers.len() < self.num_nodes)
+            .filter(|((r, _), state)| *r == round && state.selected)
             .map(|((_, dealer), _)| *dealer).collect();
         selected.extend(self.reserve_state.keys().filter(|(r,_)|*r==round).map(|(_,d)|*d));
         let released: Vec<Replica> = self.awss_recovery.iter()
             .filter(|((r, _), state)| *r == round && state.selected && state.recovered_peers.len() == self.num_nodes)
             .map(|((_, dealer), _)| *dealer).collect();
         for dealer in released { self.release_awss_serving_if_safe(round, dealer); }
-        self.avss_secmsg_pending.retain(|(r, _), _| *r != round);
+        self.avss_secmsg_pending.retain(|(r,d),_|*r!=round||selected.contains(d));
         self.avss_beacon_bytes.retain(|(r,d),_|*r!=round||selected.contains(d));
         self.avss_public_rbc.retain(|(r, d), _| *r != round || selected.contains(d));
+        self.acs_compact_rbc.retain(|(r,_),_|*r!=round);
+        self.share_pipeline.remove(&round);
         self.avss_public_bundles.retain(|(r, d), _| *r != round || selected.contains(d));
         let removed_state = {
             let before = self.avss_secmsg_state.len();
@@ -1088,7 +1081,7 @@ impl Context {
     /// `MulticastRecoveredShares` is sent **once per round** with
     /// the full disclosure set, so post-ACS audit completeness
     /// (every coin's commitment validation) is preserved verbatim.
-    /// ACS three-property and PQ-safety are unchanged.
+    /// Live v5 hook: recovery/BatchRec and only authorized dealer audits.
     #[async_recursion]
     pub(crate) async fn maybe_recover_ready_coins(&mut self, round: Round) {
         self.try_send_local_transform(round).await;

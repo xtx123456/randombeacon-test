@@ -515,7 +515,6 @@ impl Context {
     }
 
     pub(crate) async fn choose_fn(self: &mut Context, wrapper_msg: WrapperMsg) {
-        if self.defer_acs_for_audit(&wrapper_msg){return;}
         // Destructure WrapperMsg by ownership rather than cloning
         // `protmsg` just to match on it. The old `wrapper_msg.clone()
         // .protmsg` pattern cloned the entire inbound payload --
@@ -905,14 +904,7 @@ impl Context {
         dealer: Replica,
         round: Round,
     ) {
-        if self.banned_dealers.contains(&dealer) {
-            log::warn!(
-                "[PPT][BAN] dropping AVSSSend from banned dealer {} round {}",
-                dealer,
-                round
-            );
-            return;
-        }
+        // Verified local faults do not interrupt in-flight AVSS service.
 
         let main_binding=self.batch_input_root(round,dealer);
         if self.gf2_profile.is_some()&&self.transport==super::context::AvssTransport::SecMsg {
@@ -1047,18 +1039,7 @@ impl Context {
             result,
         } = completion;
 
-        // Dealer may have been banned between spawn and finalize
-        // (e.g. via the post-ACS audit / another concurrent
-        // validation failure). Drop late results for banned
-        // dealers to avoid spurious AVSSReady broadcasts.
-        if self.banned_dealers.contains(&dealer) {
-            log::warn!(
-                "[PPT][AVSS-FINALIZE] dropping AVSS validation result for \
-                 banned dealer {} round {}",
-                dealer, round
-            );
-            return;
-        }
+        // Verified local faults do not interrupt in-flight AVSS service.
 
         match result {
             Ok(()) => {}
@@ -1123,14 +1104,7 @@ impl Context {
         sender: Replica,
         round: Round,
     ) {
-        if self.banned_dealers.contains(&dealer) {
-            log::warn!(
-                "[PPT][BAN] dropping AVSSReady for banned dealer {} round {}",
-                dealer,
-                round
-            );
-            return;
-        }
+        // Verified local faults do not interrupt in-flight AVSS service.
 
         if !self.round_state.contains_key(&round) {
             let rbc_new_state = crate::node::CTRBCState::new(self.secret_domain.clone(), self.num_nodes);
@@ -1153,14 +1127,7 @@ impl Context {
         sender: Replica,
         round: Round,
     ) {
-        if self.banned_dealers.contains(&dealer) {
-            log::warn!(
-                "[PPT][BAN] dropping AVSSComplete for banned dealer {} round {}",
-                dealer,
-                round
-            );
-            return;
-        }
+        // Verified local faults do not interrupt in-flight AVSS service.
 
         if !self.round_state.contains_key(&round) {
             let rbc_new_state = crate::node::CTRBCState::new(self.secret_domain.clone(), self.num_nodes);

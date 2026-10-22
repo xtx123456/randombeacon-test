@@ -546,15 +546,7 @@ impl Context {
             );
             return;
         }
-        if self.banned_dealers.contains(&dealer) {
-            log::warn!(
-                "[PPT][AVSS-LITE][PRIVATE] dropping AVSSPrivatePayload from \
-                 banned dealer {} for round {}",
-                dealer,
-                round
-            );
-            return;
-        }
+        // Verified local faults do not interrupt in-flight AVSS service.
         // Phase F2 -- once the AVSS validation cascade has completed
         // for this (round, dealer), the cached plaintext payload is
         // no longer needed (BeaconMsg already stored in CTRBCState;
@@ -676,15 +668,7 @@ impl Context {
         if !self.avss_secmsg_delivered_bytes.contains_key(&(round, dealer)) {
             return;
         }
-        // Skip if banned.
-        if self.banned_dealers.contains(&dealer) {
-            log::warn!(
-                "[PPT][SECMSG-AVSS][FINALIZE] dropping finalize for banned \
-                 dealer {} round {}",
-                dealer, round
-            );
-            return;
-        }
+        // Verified local faults do not interrupt in-flight AVSS service.
         // Skip if already finalized through this or any earlier path.
         if let Some(rs) = self.round_state.get(&round) {
             if rs.avss_local_valid.contains(&dealer) {

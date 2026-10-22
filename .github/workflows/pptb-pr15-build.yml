@@ -1,0 +1,22 @@
+name: PPTB complaint recovery and BatchRec build
+
+on:
+  push:
+    branches:
+      - fix/pptb-complaint-driven-batch-reconstruction
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release-build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.65
+        run: |
+          rustup toolchain install 1.65.0 --profile minimal
+          rustup default 1.65.0
+      - name: Build workspace (no tests)
+        run: cargo build --release --locked
