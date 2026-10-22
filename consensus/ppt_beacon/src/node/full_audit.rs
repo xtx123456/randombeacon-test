@@ -239,7 +239,7 @@ impl Context {
             || !valid_row(&cipher_row,cr,self.myid,self.num_nodes,&self.hash_context){return;}
         let entry=DealerDisclosure{dealer,root,original:None,recovered:None,key:None,key_row,cipher_row};
         let state=self.full_audit.get_mut(&(round,dealer)).unwrap();
-        let recipients:Vec<_>=state.requests.iter().filter(|(peer,r)|**r==root && !state.served.contains(peer)).map(|(peer,_)|*peer).collect();
+        let recipients:Vec<_>=state.requests.iter().filter(|(peer,r)|**r==root && !state.served.contains(*peer)).map(|(peer,_)|*peer).collect();
         for recipient in recipients {
             self.full_audit.get_mut(&(round,dealer)).unwrap().served.insert(recipient);
             self.send_ppt_wire(recipient,round,PptWire::DealerAudit{round,dealer,entry:entry.clone()}).await;
