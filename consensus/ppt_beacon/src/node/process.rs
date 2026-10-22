@@ -1039,10 +1039,6 @@ impl Context {
             result,
         } = completion;
 
-        // Dealer may have been banned between spawn and finalize
-        // (e.g. via the post-ACS audit / another concurrent
-        // validation failure). Drop late results for banned
-        // dealers to avoid spurious AVSSReady broadcasts.
         // Verified local faults do not interrupt in-flight AVSS service.
 
         match result {

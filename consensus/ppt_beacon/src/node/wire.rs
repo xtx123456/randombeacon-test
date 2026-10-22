@@ -76,6 +76,7 @@ pub(crate) enum PptWire {
     Compact {scope:RbcScope,round:Round,proposer:Replica,message:CompactMessage},
     BatchRec {round:Round,context:Hash,stage:u8,values:Vec<(usize,types::beacon::Val)>},
     DealerAudit {round:Round,dealer:Replica,entry:super::full_audit::DealerDisclosure},
+    DealerAuditRequest {round:Round,dealer:Replica,root:Hash},
 }
 
 pub(crate) fn encode(message: &PptWire) -> CoinMsg {

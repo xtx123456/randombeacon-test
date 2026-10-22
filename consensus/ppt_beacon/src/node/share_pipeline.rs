@@ -293,6 +293,16 @@ impl Context {
                 }
                 // Including arrivals during the worker and our own new outer points.
                 if self.share_pipeline.get(&round).map(|p|p.version!=version).unwrap_or(false){self.try_decode_transformed(round).await;}
+                let pending=self.share_pipeline.get(&round).map(|p|p.owned.iter().any(Option::is_none)||p.decoded.iter().any(Option::is_none)).unwrap_or(false);
+                if pending {
+                    let dealers=self.round_state.get(&round).and_then(|s|s.acs_decided_set.clone()).unwrap_or_default();
+                    for dealer in dealers {
+                        if self.original_beacon_payload(round,dealer).is_none()
+                            && self.awss_recovery.get(&(round,dealer)).and_then(|s|s.local_shares.as_ref()).is_none() {
+                            self.drive_awss_recovery(round,dealer).await;
+                        }
+                    }
+                }
                 self.emit_decoded_batch(round).await;
             }
         }

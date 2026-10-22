@@ -668,7 +668,6 @@ impl Context {
         if !self.avss_secmsg_delivered_bytes.contains_key(&(round, dealer)) {
             return;
         }
-        // Skip if banned.
         // Verified local faults do not interrupt in-flight AVSS service.
         // Skip if already finalized through this or any earlier path.
         if let Some(rs) = self.round_state.get(&round) {

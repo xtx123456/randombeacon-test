@@ -548,15 +548,8 @@ fn build_local_batch_beacon_construct(
 }
 
 impl Context {
-    /// Release a round's transient state once it is fully done:
-    ///   - every coin in the batch has emitted its beacon output
-    ///     (`recon_secrets.contains(batch_size - 1)`), AND
-    ///   - the post-ACS audit quorum (n-f recovered-share multicasts)
-    ///     has completed (`post_complaint_complete == true`).
-    ///
-    /// Calling this in place (rather than removing the entry from
-    /// `round_state`) keeps the `cleared` sentinel so any very-late
-    /// arriving messages are safely ignored by the ingest paths.
+    /// Release output work after publication. Complaint and slow-recipient
+    /// serving evidence has an independent lifetime; no audit barrier is used.
     pub(crate) fn maybe_release_round(&mut self, round: Round) {
         let should_release = match self.round_state.get(&round) {
             Some(state) => {
@@ -1088,7 +1081,7 @@ impl Context {
     /// `MulticastRecoveredShares` is sent **once per round** with
     /// the full disclosure set, so post-ACS audit completeness
     /// (every coin's commitment validation) is preserved verbatim.
-    /// ACS three-property and PQ-safety are unchanged.
+    /// Live v5 hook: recovery/BatchRec and only authorized dealer audits.
     #[async_recursion]
     pub(crate) async fn maybe_recover_ready_coins(&mut self, round: Round) {
         self.try_send_local_transform(round).await;

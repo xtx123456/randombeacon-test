@@ -162,8 +162,8 @@ pub struct Context {
     // ---- ACS state ----
     pub acs_state: std::collections::HashMap<Round, crate::node::acs::state::AcsRound>,
 
-    /// Legacy field retained for compatibility, kept empty until an agreed
-    /// exclusion protocol exists. Do not insert local suspicions here.
+    /// Locally verified dealer faults: selection input 0 only. Never controls
+    /// RBC participation, replica membership or an already decided dealer set.
     pub banned_dealers: HashSet<Replica>,
     /// Local suspicion is diagnostic only, never a consensus membership rule.
     pub suspected_dealers: HashSet<Replica>,
@@ -419,7 +419,7 @@ impl Context {
     ) -> anyhow::Result<oneshot::Sender<()>> {
         options.validate(&config, gf2_profile, transport)?;
         log::info!("[PPT][ASSUMPTIONS] channel={:?} target128={} adaptive total corruption f={} n={}; randomness remains PR10; no full protocol security claim", options.channel, options.target128, config.num_faults, config.num_nodes);
-        log::info!("[PPT][PATH] local-share matrix -> polynomial OEC (degree={}, matching points={}) -> complete batch commitment audit; PPTB SHA-256 Merkle",config.num_faults,2*config.num_faults+1);
+        log::info!("[PPT][PATH] local-share matrix -> two-layer BatchRec (degree={}, matching points={}); complaint-only dealer audit; PPTB SHA-256 Merkle",config.num_faults,2*config.num_faults+1);
         if options.channel == crate::node::options::PptChannel::Benchmark {
             log::warn!("[PPT][ASSUMPTIONS] plaintext TCP+HMAC: benchmark only; sharing confidentiality is NOT provided");
         }
@@ -439,6 +439,12 @@ impl Context {
         {
             return Err(anyhow!("PPT currently requires n=3f+1, f>=1 and id<n"));
         }
+        let packing=config.num_faults+1;
+        if config.num_nodes.checked_sub(packing).map(|r|r<2*config.num_faults).unwrap_or(true) {
+            return Err(anyhow!("BatchRec requires n-k >= 2f"));
+        }
+        super::shoup_smart::reed_solomon::RsEncoder::new(config.num_nodes,config.num_faults)
+            .map_err(|e|anyhow!("unsupported Compact Broadcast configuration: {}",e))?;
         batch.checked_add(PPT_COIN_RESERVE)
             .ok_or_else(|| anyhow!("PPT total coin count overflows"))?;
         if super::payload_limits::plaintext(batch,config.num_nodes,gf2_profile.is_some(),
@@ -673,7 +679,6 @@ impl Context {
                 .avss_completed_dealers
                 .iter()
                 .copied()
-                .filter(|dealer| !self.banned_dealers.contains(dealer))
                 .collect(),
             None => HashSet::new(),
         }

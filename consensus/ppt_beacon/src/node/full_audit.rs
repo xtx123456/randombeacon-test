@@ -32,7 +32,8 @@ pub(crate) struct DealerDisclosure {
 /// One complaint-authorized audit of one dealer's main batch.
 #[derive(Default)]
 pub(crate) struct FullAuditState {
-    sent:bool,inflight:bool,version:u64,attempted:Option<u64>,
+    requested:bool,requests:BTreeMap<Replica,Hash>,served:HashSet<Replica>,
+    inflight:bool,version:u64,attempted:Option<u64>,
     rows:BTreeMap<Replica,DealerDisclosure>,authenticated:HashSet<Replica>,
     cache:Option<OecCache>,pub complete:bool,
 }
@@ -225,29 +226,45 @@ impl Context {
     #[async_recursion]
     pub(crate) async fn try_start_dealer_audit(&mut self,round:Round,dealer:Replica) {
         if !self.dealer_audit_authorized(round,dealer){return;}
-        let sent=self.full_audit.get(&(round,dealer)).map(|s|s.sent).unwrap_or(false);
-        if !sent {
-            let root=match self.awss_root(round,dealer){Some(r)=>r,None=>return};
-            let (_,key_row,cipher_row)=match self.avss_secmsg_state.get(&(round,dealer)){Some(s)=>s.audit_material(),None=>return};
-            let bundle=&self.avss_public_bundles[&(round,dealer)];let (kr,cr)=bundle.secmsg_roots.unwrap();
-            // Never consume the send latch while our authenticated row is missing.
-            if !valid_row(&key_row,kr,self.myid,self.num_nodes,&self.hash_context)
-                || !valid_row(&cipher_row,cr,self.myid,self.num_nodes,&self.hash_context){return;}
-            let entry=DealerDisclosure{dealer,root,original:None,recovered:None,key:None,key_row,cipher_row};
-            self.full_audit.entry((round,dealer)).or_default().sent=true;
-            self.broadcast(wire::encode(&PptWire::DealerAudit{round,dealer,entry:entry.clone()}),round).await;
-            self.process_dealer_audit(round,dealer,entry,self.myid).await;
+        let root=match self.awss_root(round,dealer){Some(r)=>r,None=>return};
+        let state=self.full_audit.entry((round,dealer)).or_default();
+        if !state.requested {
+            state.requested=true;state.requests.insert(self.myid,root);
+            self.broadcast(wire::encode(&PptWire::DealerAuditRequest{round,dealer,root}),round).await;
+        }
+        let (_,key_row,cipher_row)=match self.avss_secmsg_state.get(&(round,dealer)){Some(s)=>s.audit_material(),None=>return};
+        let bundle=&self.avss_public_bundles[&(round,dealer)];let (kr,cr)=bundle.secmsg_roots.unwrap();
+        // Missing rows never consume a reply latch. A later transport event retries.
+        if !valid_row(&key_row,kr,self.myid,self.num_nodes,&self.hash_context)
+            || !valid_row(&cipher_row,cr,self.myid,self.num_nodes,&self.hash_context){return;}
+        let entry=DealerDisclosure{dealer,root,original:None,recovered:None,key:None,key_row,cipher_row};
+        let state=self.full_audit.get_mut(&(round,dealer)).unwrap();
+        let recipients:Vec<_>=state.requests.iter().filter(|(peer,r)|**r==root && !state.served.contains(peer)).map(|(peer,_)|*peer).collect();
+        for recipient in recipients {
+            self.full_audit.get_mut(&(round,dealer)).unwrap().served.insert(recipient);
+            self.send_ppt_wire(recipient,round,PptWire::DealerAudit{round,dealer,entry:entry.clone()}).await;
         }
         self.try_run_dealer_audit(round,dealer).await;
     }
 
     #[async_recursion]
+    pub(crate) async fn process_dealer_audit_request(&mut self,round:Round,dealer:Replica,root:Hash,sender:Replica) {
+        if sender>=self.num_nodes || dealer>=self.num_nodes || round>self.max_rounds {return;}
+        if self.awss_root(round,dealer).map(|r|r!=root).unwrap_or(false){return;}
+        // A request is NOT authority to disclose. Keep only one small request per
+        // authenticated peer; a valid local complaint is checked before serving.
+        self.full_audit.entry((round,dealer)).or_default().requests.entry(sender).or_insert(root);
+        self.try_start_dealer_audit(round,dealer).await;
+    }
+
+    #[async_recursion]
     pub(crate) async fn process_dealer_audit(&mut self,round:Round,dealer:Replica,entry:DealerDisclosure,sender:Replica) {
         if sender>=self.num_nodes || dealer>=self.num_nodes || round>self.max_rounds
+            || !self.dealer_audit_authorized(round,dealer)
             || !valid_entries(std::slice::from_ref(&entry),&[dealer],self.batch_size,self.num_nodes,self.num_faults,sender,
                 self.gf2_profile.is_some(),self.gf2_profile.is_some()&&self.transport==super::context::AvssTransport::SecMsg){return;}
-        // Rows can race ahead of the complaint/ACS decision. Cache bounded rows,
-        // but neither run an audit nor disclose anything until authorization.
+        // Only a node that has verified the complaint requests rows. Early or
+        // unsolicited bulk rows are discarded, avoiding pre-complaint row caches.
         let state=self.full_audit.entry((round,dealer)).or_default();
         if state.complete || state.authenticated.contains(&sender){return;}
         state.rows.insert(sender,entry);state.authenticated.insert(sender);state.version+=1;

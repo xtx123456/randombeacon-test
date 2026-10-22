@@ -34,6 +34,7 @@ impl Context {
             PptWire::Compact{scope,round,proposer,message}=>self.process_compact_broadcast(scope,round,proposer,message,sender).await,
             PptWire::BatchRec{round,context,stage,values}=>self.process_batch_rec(round,context,stage,values,sender).await,
             PptWire::DealerAudit{round,dealer,entry}=>self.process_dealer_audit(round,dealer,entry,sender).await,
+            PptWire::DealerAuditRequest{round,dealer,root}=>self.process_dealer_audit_request(round,dealer,root,sender).await,
             PptWire::Rbc { scope, round, proposer, message } => {
                 self.process_scoped_rbc(scope, round, proposer, message, sender).await;
             }

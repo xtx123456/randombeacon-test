@@ -1,11 +1,11 @@
-//! New PPT ACS pipeline: Bracha RBC + n parallel Mostefaoui-Moumen-
+//! PPT ACS pipeline: Compact Broadcast + n parallel Mostefaoui-Moumen-
 //! Raynal ABA + self-bootstrap common coin.
 //!
 //! This module replaces the previous 4-phase witness-gathering ACS,
 //! which did not satisfy Agreement under asynchrony. The pipeline is:
 //!
 //! Phase 1 (RBC):
-//!     Each node `i` runs a Bracha RBC instance as proposer with
+//!     Each node `i` runs a Compact Broadcast instance as proposer with
 //!     payload `V_i = bytes(local AVSS-completed dealers)`. RBC
 //!     guarantees that every honest node delivers the same payload
 //!     bytes for sender `i` (or the proposer is silent / Byzantine
@@ -158,8 +158,7 @@ impl Context {
     /// AVSS-completed dealer set as the proposal. Idempotent: only
     /// fires once per round, and only after we have ≥ n-f locally
     /// completed dealers (ensures the proposal carries non-trivial
-    /// content; banned dealers are excluded by
-    /// `local_completed_dealers`).
+    /// content). Local evidence controls ABA inputs only.
     #[async_recursion]
     async fn acs_try_start_self_rbc(&mut self, round: Round) {
         let threshold = self.acs_threshold();
@@ -493,10 +492,8 @@ impl Context {
             return;
         }
 
-        // External validity: dealer j must be AVSS-completed locally
-        // and not banned. If not, defer (NOT abstain) — AVSS totality
-        // guarantees that an honest proposer's dealer eventually
-        // becomes locally AVSS-completed.
+        // Input policy: proven faults give 0; other delivered proposals wait
+        // for local AVSS completion. This never changes RBC participation.
         let bit_opt: Option<bool> = if banned.contains(&proposer) {
             Some(false)
         } else if local_complete.contains(&proposer) {

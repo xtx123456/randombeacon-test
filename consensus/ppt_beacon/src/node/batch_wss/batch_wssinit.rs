@@ -316,14 +316,7 @@ impl Context {
             return;
         }
 
-        if self.banned_dealers.contains(&self.myid) {
-            log::error!(
-                "[PPT][ROUND-START] node {} is permanently banned; not launching round {} as dealer",
-                self.myid,
-                target_round
-            );
-            return;
-        }
+
 
         log::info!(
             "[PPT][ROUND-START] node {} launching round {} as PPT dealer (full-committee mode)",
