@@ -261,7 +261,10 @@ impl Context {
                 }
                 self.note_verified_dealer_fault(dealer).await;
                 self.recover_awss_local_share(round, dealer).await;
-                self.drive_awss_recovery(round, dealer).await;
+                // Recovery success drives the ACK/transform itself. If an assist
+                // proof is not ready, wait for a new transport event rather than
+                // recursively re-entering the same report with unchanged state.
+                self.try_start_dealer_audit(round,dealer).await;
             }
             ForwardTag::Assist => {
                 if !happy { return; }
