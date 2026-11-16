@@ -1,0 +1,7 @@
+=== honest_b32 (batch=32) ===
+beacon outputs           : 91456
+TPS (outputs/sec)        : 3161.8
+e2e BATCH-START->out    : median    29.0 ms | mean    28.9 ms | p95    34.0 ms | n=1055
+  agreement (->ACS)     : median    22.0 ms | mean    21.9 ms | p95    26.0 ms | n=1055
+  reconstruction        : median     7.0 ms | mean     7.1 ms | p95    10.0 ms | n=1051
+CSV,honest_b32,32,91456,3161.832,0.029000,0.022000,0.007000

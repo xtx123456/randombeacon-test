@@ -541,6 +541,38 @@ impl Context {
         }
         debug_assert_eq!(recipient_payload_bytes.len(), self.num_nodes);
 
+        // ---- Evaluation-only fault injection (OFF by default) ----
+        // Gated entirely by the `PPT_FAULTY_DEALER` environment variable so
+        // honest benchmarks are byte-for-byte unaffected when it is unset. When
+        // this node's id equals `PPT_FAULTY_DEALER`, it tampers with exactly one
+        // recipient's already-committed share bytes. The public Merkle roots in
+        // `roots_vec` were fixed from the honest leaves above, so the victim's
+        // delivered share no longer matches the public commitment: the victim
+        // becomes unhappy, files a post-ACS complaint, and the complaint-driven
+        // dealer audit attributes the inconsistency to this dealer and bans it.
+        // The other n-1 recipients stay happy, so the dealer still reaches the
+        // n-t selection threshold and is placed in D before being evicted --
+        // exactly the "verify and remove one bad dealer" path we want to time.
+        if let Ok(spec) = std::env::var("PPT_FAULTY_DEALER") {
+            if spec.split(',').filter_map(|s| s.trim().parse::<Replica>().ok()).any(|d| d == self.myid) {
+                let victim = std::env::var("PPT_FAULT_VICTIM").ok()
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or((self.myid + 1) % self.num_nodes)
+                    .min(self.num_nodes - 1);
+                let victim = if victim == self.myid { (self.myid + 1) % self.num_nodes } else { victim };
+                if let Some(bytes) = recipient_payload_bytes.get_mut(victim) {
+                    if !bytes.is_empty() {
+                        let pos = bytes.len() / 2;
+                        bytes[pos] ^= 0xFF;
+                        log::error!(
+                            "[PPT][FAULT-INJECT] dealer {} round {} corrupted recipient {}'s share byte {} (eval-only)",
+                            self.myid, new_round, victim, pos
+                        );
+                    }
+                }
+            }
+        }
+
         // ----- Step 3: transport-specific dispatch -----
         match self.transport {
             crate::node::context::AvssTransport::Lite => {

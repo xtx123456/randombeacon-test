@@ -1,0 +1,7 @@
+=== honest_b4 (batch=4) ===
+beacon outputs           : 17180
+TPS (outputs/sec)        : 593.1
+e2e BATCH-START->out    : median    19.0 ms | mean    19.4 ms | p95    23.0 ms | n=1545
+  agreement (->ACS)     : median    16.0 ms | mean    16.2 ms | p95    20.0 ms | n=1545
+  reconstruction        : median     3.0 ms | mean     3.2 ms | p95     5.0 ms | n=1523
+CSV,honest_b4,4,17180,593.109,0.019000,0.016000,0.003000

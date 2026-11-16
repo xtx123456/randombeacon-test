@@ -1,0 +1,10 @@
+=== elim_faulty_b32 (batch=32) ===
+beacon outputs           : 76704
+TPS (outputs/sec)        : 2649.3
+e2e BATCH-START->out    : median    26.0 ms | mean    26.5 ms | p95    30.0 ms | n=1158
+  agreement (->ACS)     : median    20.0 ms | mean    20.7 ms | p95    24.0 ms | n=1158
+  reconstruction        : median     6.0 ms | mean     5.8 ms | p95     7.0 ms | n=1158
+first COMPLAINT at       : +22 ms from first BATCH-START
+first BAN (dealer 3) at   : +22 ms from first BATCH-START
+decided-set D shrinks at : round 1 (banned dealer excluded)
+CSV,elim_faulty_b32,32,76704,2649.259,0.026000,0.020000,0.006000

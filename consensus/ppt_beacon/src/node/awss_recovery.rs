@@ -240,7 +240,10 @@ impl Context {
             ForwardTag::Complaint | ForwardTag::Report => {
                 if happy { return; }
                 let state = self.awss_recovery.get_mut(&(round, dealer)).unwrap();
-                if state.complaint.is_none() { state.complaint = Some((source, proof.clone())); }
+                if state.complaint.is_none() {
+                    state.complaint = Some((source, proof.clone()));
+                    log::error!("[PPT][STAGE][COMPLAINT] node {} round {} dealer {} source {}",self.myid,round,dealer,source);
+                }
                 // Evidence is public; membership and the decided set stay fixed.
                 self.suspected_dealers.insert(dealer);
                 if !self.awss_recovery.get(&(round, dealer)).unwrap().report_sent {
