@@ -11,6 +11,8 @@ evaluation needs:
                       reconstruction window (RECON-START -> last output).
   * elimination    -- first COMPLAINT / first BAN wall-clock offsets, and the
                       round at which the banned dealer leaves the decided set D.
+  * per-round rows  -- untrimmed "ROUND,<r>,<e2e>,<agree>,<recon>" lines, so a
+                      one-time cost can be read off the round it happened in.
 
 Latency statistics skip the first/last `--warmup` rounds so startup and the
 truncated final round do not distort steady-state numbers.
@@ -91,7 +93,8 @@ def main():
         win = (max(out_ts) - min(out_ts)).total_seconds()
         tps = out_events / win if win > 0 else None
 
-    rounds = sorted(r for r in bs if r in last_out)
+    all_rounds = sorted(r for r in bs if r in last_out)
+    rounds = all_rounds
     if len(rounds) > 2 * args.warmup:
         rounds = rounds[args.warmup:-args.warmup]
 
@@ -156,6 +159,21 @@ def main():
         print(f"first BAN (dealer {banned}) at   : +{(ban_ts - t0).total_seconds()*1000:.0f} ms from first BATCH-START")
     if evict_round is not None:
         print(f"decided-set D shrinks at : round {evict_round} (banned dealer excluded)")
+
+    # Untrimmed per-round rows. The verify+evict cost is a one-time event in the
+    # eviction round, so it has to be read off that round directly -- a longer
+    # run cannot produce a second sample of it, and the steady-state median
+    # averages it away.
+    def f6(x):
+        return "" if x is None else f"{x:.6f}"
+
+    for r in all_rounds:
+        print("ROUND," + ",".join([
+            str(r),
+            f6((last_out[r] - bs[r]).total_seconds()),
+            f6((ad[r] - bs[r]).total_seconds() if r in ad else None),
+            f6((last_out[r] - rs[r]).total_seconds() if r in rs else None),
+        ]))
 
     # Machine-readable one-liner for CSV aggregation.
     se = stats(e2e); sa = stats(agree); sr = stats(recon)

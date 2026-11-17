@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """Plot player-elimination overhead vs injected delay.
 
-Input CSV (from elim_netem_sweep.sh):
-    delay_ms,batch,honest_e2e_ms,faulty_e2e_ms,overhead_ms,complaint_ms,ban_ms
+Input CSV (from elim_netem_sweep.sh): one row per delay per repeat, carrying
+honest_e2e_ms / faulty_e2e_ms (the eviction round in each run) and overhead_ms.
+Repeats of the same delay are collapsed by median, since a run yields exactly
+one sample of the one-time verify+evict cost.
 
-Renders grouped bars (honest vs one-bad-dealer median e2e) per delay, with the
-overhead (faulty - honest) printed above each pair.
+Renders grouped bars (honest vs one-bad-dealer) per delay, with the overhead
+(faulty - honest) printed above each pair.
 """
 import argparse
 import csv
+import statistics
+from collections import OrderedDict
 
 import matplotlib
 matplotlib.use("Agg")
@@ -30,27 +34,33 @@ def main():
     ap.add_argument("--title", default="")
     args = ap.parse_args()
 
-    delays, batches, honest, faulty, over = [], [], [], [], []
+    reps = OrderedDict()
     with open(args.csv) as f:
         for row in csv.DictReader(f):
             try:
-                delays.append(int(row["delay_ms"]))
+                d = int(row["delay_ms"])
             except (ValueError, KeyError):
                 continue
-            batches.append(row.get("batch", ""))
-            honest.append(num(row.get("honest_e2e_ms")))
-            faulty.append(num(row.get("faulty_e2e_ms")))
-            over.append(num(row.get("overhead_ms")))
+            e = reps.setdefault(d, {"batch": row.get("batch", ""),
+                                    "h": [], "f": [], "o": []})
+            for key, col in (("h", "honest_e2e_ms"), ("f", "faulty_e2e_ms"),
+                             ("o", "overhead_ms")):
+                v = num(row.get(col))
+                if np.isfinite(v):
+                    e[key].append(v)
 
-    if not delays:
+    if not reps:
         raise SystemExit("no usable rows in CSV")
 
-    order = np.argsort(delays)
-    delays = [delays[i] for i in order]
-    batches = [batches[i] for i in order]
-    honest = [honest[i] for i in order]
-    faulty = [faulty[i] for i in order]
-    over = [over[i] for i in order]
+    def med(xs):
+        return statistics.median(xs) if xs else float("nan")
+
+    delays = sorted(reps)
+    batches = [reps[d]["batch"] for d in delays]
+    honest = [med(reps[d]["h"]) for d in delays]
+    faulty = [med(reps[d]["f"]) for d in delays]
+    over = [med(reps[d]["o"]) for d in delays]
+    nreps = max(len(reps[d]["o"]) for d in delays)
 
     # Name the batch per tick only when the sweet spot differs across delays.
     if len(set(batches)) > 1:
@@ -70,7 +80,8 @@ def main():
     ax.set_xticks(x)
     ax.set_xticklabels(ticks)
     ax.set_xlabel("Injected one-way delay (ms)")
-    ax.set_ylabel("Median end-to-end latency (ms)")
+    ax.set_ylabel("Eviction-round end-to-end latency (ms)"
+                  + (f", median of {nreps} runs" if nreps > 1 else ""))
     ax.set_title(args.title or "PraHRand n=4: player-elimination overhead vs delay")
     ax.legend()
     ax.spines[["top", "right"]].set_visible(False)
