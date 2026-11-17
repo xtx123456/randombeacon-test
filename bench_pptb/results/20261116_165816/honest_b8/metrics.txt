@@ -1,0 +1,7 @@
+=== honest_b8 (batch=8) ===
+beacon outputs           : 32568
+TPS (outputs/sec)        : 1126.0
+e2e BATCH-START->out    : median    21.0 ms | mean    20.7 ms | p95    24.0 ms | n=1453
+  agreement (->ACS)     : median    17.0 ms | mean    16.9 ms | p95    20.0 ms | n=1453
+  reconstruction        : median     4.0 ms | mean     3.9 ms | p95     5.0 ms | n=1442
+CSV,honest_b8,8,32568,1125.985,0.021000,0.017000,0.004000

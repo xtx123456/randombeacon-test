@@ -118,3 +118,6 @@ baseline_records/
 *.orig
 consensus/ppt_beacon/src/node/gather/gather.rs_102_47
 consensus/ppt_beacon/src/node/gather/gather.rs_147_26
+
+# PPTB bench raw logs (large); keep summaries only
+bench_pptb/results/**/*.log

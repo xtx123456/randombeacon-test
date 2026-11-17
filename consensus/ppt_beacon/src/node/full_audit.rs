@@ -317,6 +317,7 @@ impl Context {
     #[async_recursion]
     pub(crate) async fn note_verified_dealer_fault(&mut self,dealer:Replica) {
         if !self.banned_dealers.insert(dealer){return;}
+        log::error!("[PPT][STAGE][BAN] node {} banned dealer {} (verified fault)",self.myid,dealer);
         let rounds:Vec<_>=self.acs_state.iter().filter(|(_,s)|!s.finalized).map(|(r,_)|*r).collect();
         for round in rounds {self.acs_note_local_change(round).await;}
     }
