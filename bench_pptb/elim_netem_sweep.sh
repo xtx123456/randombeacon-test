@@ -1,45 +1,56 @@
 #!/usr/bin/env bash
-# Player-elimination one-time overhead vs injected network delay (n=4, f=1).
+# Player-elimination overhead vs injected network delay (default n=16, f=5).
 #
-# For each injected one-way delay, run an honest batch and a one-bad-dealer batch
-# at a fixed (sweet-spot) batch size, and report how much extra end-to-end
-# latency the fault path (complaint -> assist -> recovery -> ban -> audit) adds
-# over the honest path. Overhead is defined exactly as in sweep.sh/plot.py:
+# For each injected one-way delay, run an honest batch and a bad-dealer batch at a
+# fixed (sweet-spot) batch size, and report how much extra end-to-end latency the
+# fault path (complaint -> assist -> recovery -> ban -> audit) adds over the
+# honest path. Overhead is defined exactly as in sweep.sh/plot.py:
 #   overhead = faulty-run median e2e  -  honest-run median e2e.
 # The first-COMPLAINT and first-BAN offsets from the faulty run are also recorded
 # so the complaint->ban->audit timeline is visible.
+#
+# The advisor's experiment is "verify + remove ONE bad dealer", so FAULTY is a
+# single id by default. f=N is only the tolerance bound, not the number of
+# evictions: one bad dealer is still caught and evicted in ~1 round regardless of
+# f. To test the worst case (evict several at once) pass a comma list, e.g.
+# FAULTY="3,5,7,9,11" for 5 faulty dealers at n=16, f=5.
 #
 # Needs root (tc netem on lo); mirrors netem_sweep.sh's tc handling and always
 # removes the qdisc on exit.
 #
 # env:
+#   NODES     committee size (3f+1)   (default 16; resolves TESTDIR=testdata/cc_<NODES>)
+#   TESTDIR   explicit config dir     (default testdata/cc_$NODES)
 #   DELAYS    one-way delays ms       (default "0 10 30 40 50")
 #   BATCH     sweet-spot batch size   (default 500)
-#   FAULTY    bad dealer id           (default 3; victim defaults to (id+1) mod n)
+#   FAULTY    bad dealer id or list   (default 3; victim defaults to (id+1) mod n)
 #   TRANSPORT secmsg|lite             (default secmsg; secmsg carries the complaint evidence)
 #   FREQ      --frequency             (default 1)
-#   RUNTIME   seconds per run         (default 120)
+#   RUNTIME   seconds per run         (default 180; raise for large n/batch/delay)
 #   WARMUP    rounds trimmed per end  (default 2; small so the eviction rounds count)
 #   NETEM_IFACE loopback iface        (default lo)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+NODES="${NODES:-16}"
 DELAYS="${DELAYS:-0 10 30 40 50}"
 BATCH="${BATCH:-500}"
 FAULTY="${FAULTY:-3}"
 TRANSPORT="${TRANSPORT:-secmsg}"
 FREQ="${FREQ:-1}"
-RUNTIME="${RUNTIME:-120}"
+RUNTIME="${RUNTIME:-180}"
 WARMUP="${WARMUP:-2}"
 NETEM_IFACE="${NETEM_IFACE:-lo}"
-TESTDIR="$ROOT/testdata/cc_4"
+TESTDIR="${TESTDIR:-$ROOT/testdata/cc_$NODES}"
 IP="$TESTDIR/ip_file"
 
 [ "$(id -u)" -eq 0 ] || { echo "tc netem needs root; re-run as root"; exit 1; }
 command -v tc >/dev/null || { echo "tc not found (install iproute2)"; exit 1; }
+[ -d "$TESTDIR" ] && [ -f "$TESTDIR/nodes-0.json" ] || {
+  echo "config dir not found: $TESTDIR (expected testdata/cc_$NODES; generate it with nodes_sweep.sh's genconfig step, or set TESTDIR)"; exit 1; }
 
-# derive the gitignored cc_4 ip_file from the committed net_map when absent
+# derive the gitignored ip_file from the committed net_map when absent
 if [ ! -f "$IP" ]; then
   python3 - "$TESTDIR/nodes-0.json" "$IP" <<'PY'
 import json, sys
@@ -95,6 +106,7 @@ cleanup_netem
 echo
 echo "CSV: $CSV"
 column -s, -t "$CSV" || cat "$CSV"
-python3 "$ROOT/bench_pptb/elim_plot.py" --csv "$CSV" --out "$OUT/elim_overhead.png" || true
+python3 "$ROOT/bench_pptb/elim_plot.py" --csv "$CSV" --out "$OUT/elim_overhead.png" \
+  --title "PraHRand n=$NODES: player-elimination overhead vs delay" || true
 echo "plot: $OUT/elim_overhead.png"
 echo "results dir: $OUT"
