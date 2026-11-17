@@ -27,6 +27,53 @@ def num(x):
         return float("nan")
 
 
+def audit_plot(args):
+    """complaint -> ban per delay: how long detecting and evicting the dealer took.
+
+    Unlike overhead_ms this is read straight off two markers in one run, so it
+    is not a difference of two noisy medians.
+    """
+    reps = OrderedDict()
+    with open(args.csv) as f:
+        for row in csv.DictReader(f):
+            try:
+                d = int(row["delay_ms"])
+            except (ValueError, KeyError):
+                continue
+            gap = num(row.get("ban_ms")) - num(row.get("complaint_ms"))
+            e = reps.setdefault(d, {"batch": row.get("batch", ""), "gap": []})
+            if np.isfinite(gap):
+                e["gap"].append(gap)
+
+    if not reps:
+        raise SystemExit("no usable rows in CSV")
+
+    delays = sorted(reps)
+    batches = [reps[d]["batch"] for d in delays]
+    gaps = [statistics.median(reps[d]["gap"]) if reps[d]["gap"] else float("nan")
+            for d in delays]
+
+    x = np.arange(len(delays))
+    fig, ax = plt.subplots(figsize=(1.8 + 1.1 * len(delays), 5))
+    ax.bar(x, gaps, 0.55, color="#DD8452")
+    for i, g in enumerate(gaps):
+        if np.isfinite(g):
+            ax.text(x[i], g, f"{g:.0f} ms", ha="center", va="bottom", fontsize=9)
+    top = np.nanmax(gaps)
+    if np.isfinite(top):
+        ax.set_ylim(0, top * 1.18)
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"{d}\nB={b}" for d, b in zip(delays, batches)]
+                       if len(set(batches)) > 1 else [str(d) for d in delays])
+    ax.set_xlabel("Injected one-way delay (ms)")
+    ax.set_ylabel(args.ylabel or "First COMPLAINT -> first BAN (ms)")
+    ax.set_title(args.title or "PraHRand: detecting and evicting one bad dealer")
+    ax.spines[["top", "right"]].set_visible(False)
+    fig.tight_layout()
+    fig.savefig(args.out, dpi=150)
+    print("wrote", args.out)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", required=True)
@@ -35,7 +82,15 @@ def main():
     ap.add_argument("--ylabel", default="",
                     help="override for pre-eviction-round CSVs, whose bars are "
                          "steady-state medians rather than a single round")
+    ap.add_argument("--metric", choices=("overhead", "audit"), default="overhead",
+                    help="overhead: honest vs faulty bars. audit: the measured "
+                         "complaint->ban interval, which is a direct reading "
+                         "rather than a difference of two medians")
     args = ap.parse_args()
+
+    if args.metric == "audit":
+        audit_plot(args)
+        return
 
     reps = OrderedDict()
     with open(args.csv) as f:
