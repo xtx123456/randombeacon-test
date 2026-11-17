@@ -34,7 +34,9 @@
 #   PAIRS     per-delay batch sizes as "<delay>:<batch> ..." -- use this when the
 #             sweet spot differs per delay, e.g. PAIRS="0:800 10:1000 30:500".
 #             When set it overrides DELAYS/BATCH.
-#   FAULTY    bad dealer id or list   (default 3; victim defaults to (id+1) mod n)
+#   FAULTY    bad dealer NODE ID, or a comma-separated list of them -- not a
+#             count (default 3, i.e. one bad dealer, the node whose id is 3;
+#             its victim defaults to node (id+1) mod n)
 #   TRANSPORT secmsg|lite             (default secmsg; secmsg carries the complaint evidence)
 #   FREQ      --frequency             (default 1)
 #   RUNTIME   seconds per run         (default 240; only has to cover the

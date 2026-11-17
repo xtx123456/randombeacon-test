@@ -4,7 +4,10 @@
 # TESTDIR. Every child PID is tracked and stopped by PID -- never pkill/killall.
 #
 # usage:
-#   run_once_n.sh <batch> <freq> <runtime_sec> <transport> <outdir> <label> <testdir> <ipfile> [faulty_dealer_id]
+#   run_once_n.sh <batch> <freq> <runtime_sec> <transport> <outdir> <label> <testdir> <ipfile> [faulty_dealer_ids]
+#
+# faulty_dealer_ids is a node id or comma-separated list of node ids -- NOT a
+# count. "3" injects one bad dealer, the node whose id is 3.
 #
 # optional env:
 #   WARMUP          rounds trimmed at each end by analyze.py (default 20)
@@ -46,7 +49,7 @@ for ((i=0; i<NODE_COUNT; i++)); do
   PIDS+=($!)
 done
 
-echo "[run_once_n] label=$LABEL n=$NODE_COUNT batch=$BATCH freq=$FREQ transport=$TRANSPORT faulty=${FAULTY:-none} runtime=${RUNTIME}s pids=${PIDS[*]}"
+echo "[run_once_n] label=$LABEL n=$NODE_COUNT batch=$BATCH freq=$FREQ transport=$TRANSPORT faulty_dealer_ids=${FAULTY:-none} runtime=${RUNTIME}s pids=${PIDS[*]}"
 sleep 2
 sleep "$RUNTIME"
 
