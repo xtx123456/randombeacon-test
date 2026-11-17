@@ -67,6 +67,28 @@ the form `n=3f+1` (4, 7, 10, 13, 16, ...) and missing config dirs are generated
 on the fly with `genconfig`. Each sweep writes `heatmap.csv` + a rendered PNG
 under `bench_pptb/results/`; `heatmap.py --xcol {delay_ms,nodes}` renders either.
 
+## Latency breakdown (at the sweet spot)
+
+The agreement vs reconstruction split that `analyze.py` reports per run is saved
+in every run dir's `metrics.txt` (the `CSV,...` line's `agree_s` / `recon_s`
+fields). `breakdown.py` turns those into the stacked per-batch breakdown figure
+without re-running anything — point it at a sweep's results dir and a run-label
+prefix:
+
+```bash
+# node-count sweep, the n=16 series:
+python3 bench_pptb/breakdown.py --results bench_pptb/results/nodes_heatmap_<stamp> \
+    --prefix n16_b --out ~/breakdown_n16.png --title "PraHRand n=16 latency breakdown"
+
+# netem sweep, the 0 ms-delay series:
+python3 bench_pptb/breakdown.py --results bench_pptb/results/heatmap_<stamp> \
+    --prefix d0_b --out ~/breakdown_d0.png
+```
+
+Each bar stacks agreement (BATCH-START -> ACS decide D), the transform/setup gap
+(ACS-decide -> recon-start), and reconstruction (RECON-START -> last output), so
+the bars add up to the end-to-end latency.
+
 ## Fault injection
 
 Set `PPT_FAULTY_DEALER=<id>` (comma list allowed) in a node's environment. That
