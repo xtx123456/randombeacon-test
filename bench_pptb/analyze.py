@@ -143,10 +143,20 @@ def main():
         if mb and ban_ts is None:
             ban_ts = ts(line)
             banned = int(mb.group(1))
+    # The round that was running when the ban fired. The complaint -> assist ->
+    # recovery -> ban work happens inside it, so this is the round that pays the
+    # one-time cost.
+    audit_round = None
+    if ban_ts is not None:
+        started = [r for r in sorted(bs) if bs[r] <= ban_ts]
+        if started:
+            audit_round = started[-1]
+
     # First round that began after the ban and left the banned dealer out of D.
-    # |D| alone is not a signal: it varies round to round with who finished
-    # sharing in time, and a dealer can be missing from an early D just for
-    # being slow, which is why the round has to start after the ban to count.
+    # This one is the first to run on a smaller D, so it tends to be *faster*
+    # than the honest baseline -- it carries the benefit of eviction, not its
+    # cost. |D| alone is not a signal either: it varies round to round with who
+    # finished sharing in time, which is why the round must start after the ban.
     evict_round = None
     if banned is not None and ban_ts is not None:
         for r in sorted(dset):
@@ -171,11 +181,13 @@ def main():
     if ban_ts and bs:
         t0 = min(bs.values())
         print(f"first BAN (dealer {banned}) at   : +{(ban_ts - t0).total_seconds()*1000:.0f} ms from first BATCH-START")
+    if audit_round is not None:
+        print(f"audit round (ban fired in): round {audit_round}")
+        if all_rounds and audit_round == all_rounds[-1]:
+            print("WARNING: the audit round is this run's last round, which shutdown "
+                  "distorts -- raise RUNTIME so the comparison lands mid-run")
     if evict_round is not None:
         print(f"banned dealer leaves D at: round {evict_round}")
-        if all_rounds and evict_round == all_rounds[-1]:
-            print("WARNING: the eviction round is this run's last round, which shutdown "
-                  "distorts -- raise RUNTIME so a later round carries the comparison")
     elif banned is not None:
         print("WARNING: dealer was banned but no later round left it out of D -- the run "
               "ended too early to observe the eviction; raise RUNTIME")

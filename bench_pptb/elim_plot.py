@@ -142,7 +142,7 @@ def main():
     ax.set_xticks(x)
     ax.set_xticklabels(ticks)
     ax.set_xlabel("Injected one-way delay (ms)")
-    ax.set_ylabel(args.ylabel or ("Eviction-round end-to-end latency (ms)"
+    ax.set_ylabel(args.ylabel or ("Audit-round end-to-end latency (ms)"
                                   + (f", median of {nreps} runs" if nreps > 1 else "")))
     ax.set_title(args.title or "PraHRand n=4: player-elimination overhead vs delay")
     ax.legend()

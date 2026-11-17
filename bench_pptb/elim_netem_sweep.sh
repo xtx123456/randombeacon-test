@@ -118,8 +118,8 @@ for item in $WORK; do
     row=$(elim_row "$hm" "$fm" "$d" "$b" "$rep")
     echo "$row" >> "$CSV"
     case "$row" in
-      *,NA,NA,NA,NA,*) echo "!! delay=${d}ms batch=${b} rep=${rep}: no eviction observed before the run ended -- raise RUNTIME" ;;
-      *,NA,*|*,NA) echo "!! delay=${d}ms batch=${b} rep=${rep}: the eviction round is missing from one of the runs -- raise RUNTIME so it completes" ;;
+      *",NA,NA,NA,NA,"*) echo "!! delay=${d}ms batch=${b} rep=${rep}: no ban observed before the run ended -- raise RUNTIME" ;;
+      *",NA,"*) echo "!! delay=${d}ms batch=${b} rep=${rep}: the audit round is missing from one of the runs -- raise RUNTIME so it completes" ;;
     esac
   done
 done
