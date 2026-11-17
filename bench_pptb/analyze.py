@@ -249,7 +249,14 @@ def main():
     se = stats(e2e); sa = stats(agree); sr = stats(recon)
     if se is None or se["n"] < MIN_SAMPLES:
         got = 0 if se is None else se["n"]
-        print(f"WARNING: only {got} round(s) left after trimming {args.warmup} per end "
+        # Naming the trim when it was skipped sends the reader after the wrong
+        # cause: on a short run the shortfall is rounds that never completed.
+        if args.warmup > 0 and len(all_rounds) > 2 * args.warmup:
+            why = f"after trimming {args.warmup} per end from {len(all_rounds)} round(s)"
+        else:
+            why = (f"from {len(all_rounds)} completed round(s); --warmup "
+                   f"{args.warmup} was skipped, too few rounds to trim")
+        print(f"WARNING: only {got} usable round(s) {why} "
               f"({len(bs)} BATCH-START, {len(last_out)} completed at the syncer) -- "
               f"raise RUNTIME before trusting these medians")
     print("CSV," + ",".join(str(x) for x in [

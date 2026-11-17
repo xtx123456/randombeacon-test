@@ -19,17 +19,23 @@
 #   {h,f}_d<delay>_b<batch>[_r<k>] elim_netem_sweep.sh  -> elim_overhead.csv
 #
 # env:
-#   WARMUP  rounds trimmed per end (default 10, matching both heatmap sweeps;
-#           pass 2 for an elimination results dir)
+#   WARMUP  rounds trimmed per end. Defaults to 10 for the heatmap sweeps and 2
+#           for an elimination dir, whose runs are far shorter.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$ROOT/bench_pptb/lib_metrics.sh"
-WARMUP="${WARMUP:-10}"
 
 DIR="${1:-}"
 [ -n "$DIR" ] && [ -d "$DIR" ] || { echo "usage: reanalyze.sh <results_dir>"; exit 1; }
 DIR="$(cd "$DIR" && pwd)"
+
+# Pick the trim before rescoring: an elimination dir holds a handful of rounds
+# per run, so the heatmap default would be asked to trim more than exist.
+if [ -z "${WARMUP:-}" ]; then
+  if ls "$DIR"/h_d*_b*/syncer.log >/dev/null 2>&1; then WARMUP=2; else WARMUP=10; fi
+  echo "using WARMUP=$WARMUP (override by setting WARMUP)"
+fi
 
 rescored=0
 for d in "$DIR"/*/; do
@@ -88,6 +94,8 @@ else
 fi
 
 echo
+# A clean rescore makes grep exit 1, and under pipefail that would fail the
+# whole script -- breaking any `reanalyze.sh ... && plot` the caller chains.
 grep -l 'WARNING' "$DIR"/*/metrics.txt 2>/dev/null | while read -r m; do
   echo "$(basename "$(dirname "$m")"): $(grep -h 'WARNING' "$m" | head -1)"
-done
+done || true
