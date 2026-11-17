@@ -93,8 +93,17 @@ def main():
         return
 
     reps = OrderedDict()
+    round_col = None
     with open(args.csv) as f:
-        for row in csv.DictReader(f):
+        rd = csv.DictReader(f)
+        # Which round the bars compare is a property of the CSV, not of the
+        # caller: pre-fix CSVs are scored on the post-ban eviction round, whose
+        # smaller D makes the faulty run legitimately faster.
+        for col in ("audit_round", "evict_round"):
+            if col in (rd.fieldnames or ()):
+                round_col = col
+                break
+        for row in rd:
             try:
                 d = int(row["delay_ms"])
             except (ValueError, KeyError):
@@ -132,9 +141,16 @@ def main():
     ax.bar(x - w / 2, honest, w, label="honest path", color="#4C72B0")
     ax.bar(x + w / 2, faulty, w, label="one bad dealer (verify + evict)", color="#DD8452")
     for i in range(len(delays)):
-        top = max(honest[i], faulty[i])
+        top = np.nanmax([honest[i], faulty[i]])
         if np.isfinite(over[i]) and np.isfinite(top):
-            ax.text(x[i], top, f"+{over[i]:.0f} ms", ha="center", va="bottom", fontsize=9)
+            # Signed: a post-eviction round on a smaller D can be faster, and
+            # "+-24219 ms" would read as a formatting bug rather than a speedup.
+            ax.text(x[i], top, f"{over[i]:+.0f} ms", ha="center", va="bottom", fontsize=9)
+        elif np.isfinite(top):
+            # Say why a bar is missing, so a run that ended before the round
+            # completed does not read as a measured zero.
+            ax.text(x[i], top, "no\nsample", ha="center", va="bottom", fontsize=8,
+                    color="#B04C4C")
     # Headroom so the legend clears the annotations above the tallest pair.
     top = np.nanmax(np.concatenate([honest, faulty]))
     if np.isfinite(top):
@@ -142,7 +158,10 @@ def main():
     ax.set_xticks(x)
     ax.set_xticklabels(ticks)
     ax.set_xlabel("Injected one-way delay (ms)")
-    ax.set_ylabel(args.ylabel or ("Audit-round end-to-end latency (ms)"
+    which = {"audit_round": "Audit-round (ban fires in it)",
+             "evict_round": "Eviction-round (first round after the ban)"}.get(
+                 round_col, "Compared-round")
+    ax.set_ylabel(args.ylabel or (f"{which} end-to-end latency (ms)"
                                   + (f", median of {nreps} runs" if nreps > 1 else "")))
     ax.set_title(args.title or "PraHRand n=4: player-elimination overhead vs delay")
     ax.legend()
