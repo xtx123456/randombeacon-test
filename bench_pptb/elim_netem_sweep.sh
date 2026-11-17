@@ -22,7 +22,10 @@
 #   NODES     committee size (3f+1)   (default 16; resolves TESTDIR=testdata/cc_<NODES>)
 #   TESTDIR   explicit config dir     (default testdata/cc_$NODES)
 #   DELAYS    one-way delays ms       (default "0 10 30 40 50")
-#   BATCH     sweet-spot batch size   (default 500)
+#   BATCH     sweet-spot batch size   (default 500), used for every delay
+#   PAIRS     per-delay batch sizes as "<delay>:<batch> ..." -- use this when the
+#             sweet spot differs per delay, e.g. PAIRS="0:800 10:1000 30:500".
+#             When set it overrides DELAYS/BATCH.
 #   FAULTY    bad dealer id or list   (default 3; victim defaults to (id+1) mod n)
 #   TRANSPORT secmsg|lite             (default secmsg; secmsg carries the complaint evidence)
 #   FREQ      --frequency             (default 1)
@@ -36,6 +39,7 @@ cd "$ROOT"
 NODES="${NODES:-16}"
 DELAYS="${DELAYS:-0 10 30 40 50}"
 BATCH="${BATCH:-500}"
+PAIRS="${PAIRS:-}"
 FAULTY="${FAULTY:-3}"
 TRANSPORT="${TRANSPORT:-secmsg}"
 FREQ="${FREQ:-1}"
@@ -79,27 +83,34 @@ marker_ms() {  # $1 metrics.txt ; $2 text pattern -> the "+N ms" offset value
   grep "$2" "$1" 2>/dev/null | grep -oE '\+[0-9]+ ms' | grep -oE '[0-9]+' | head -1
 }
 
-for d in $DELAYS; do
+# Work list of "<delay>:<batch>" items: PAIRS verbatim, else DELAYS x BATCH.
+WORK="$PAIRS"
+if [ -z "$WORK" ]; then
+  for d in $DELAYS; do WORK="$WORK $d:$BATCH"; done
+fi
+
+for item in $WORK; do
+  d="${item%%:*}"; b="${item##*:}"
   cleanup_netem
   if [ "$d" -gt 0 ]; then
     tc qdisc add dev "$NETEM_IFACE" root netem delay "${d}ms"
-    echo "########## netem delay ${d}ms ##########"
+    echo "########## netem delay ${d}ms, batch ${b} ##########"
   else
-    echo "########## no netem (0ms) ##########"
+    echo "########## no netem (0ms), batch ${b} ##########"
   fi
 
-  hl="h_d${d}"; fl="f_d${d}"
+  hl="h_d${d}_b${b}"; fl="f_d${d}_b${b}"
   WARMUP="$WARMUP" BOOT_OFFSET_MS="${BOOT_OFFSET_MS:-8000}" \
-    bash "$ROOT/bench_pptb/run_once_n.sh" "$BATCH" "$FREQ" "$RUNTIME" "$TRANSPORT" "$OUT" "$hl" "$TESTDIR" "$IP"
+    bash "$ROOT/bench_pptb/run_once_n.sh" "$b" "$FREQ" "$RUNTIME" "$TRANSPORT" "$OUT" "$hl" "$TESTDIR" "$IP"
   WARMUP="$WARMUP" BOOT_OFFSET_MS="${BOOT_OFFSET_MS:-8000}" \
-    bash "$ROOT/bench_pptb/run_once_n.sh" "$BATCH" "$FREQ" "$RUNTIME" "$TRANSPORT" "$OUT" "$fl" "$TESTDIR" "$IP" "$FAULTY"
+    bash "$ROOT/bench_pptb/run_once_n.sh" "$b" "$FREQ" "$RUNTIME" "$TRANSPORT" "$OUT" "$fl" "$TESTDIR" "$IP" "$FAULTY"
 
   he=$(e2e_ms "$OUT/$hl/metrics.txt")
   fe=$(e2e_ms "$OUT/$fl/metrics.txt")
   ov=$(awk -v f="$fe" -v h="$he" 'BEGIN{ if (f==""||h=="") print ""; else printf "%.1f", f-h }')
   cm=$(marker_ms "$OUT/$fl/metrics.txt" "first COMPLAINT at")
   bm=$(marker_ms "$OUT/$fl/metrics.txt" "first BAN")
-  echo "$d,$BATCH,${he:-NA},${fe:-NA},${ov:-NA},${cm:-NA},${bm:-NA}" >> "$CSV"
+  echo "$d,$b,${he:-NA},${fe:-NA},${ov:-NA},${cm:-NA},${bm:-NA}" >> "$CSV"
 done
 cleanup_netem
 

@@ -30,13 +30,14 @@ def main():
     ap.add_argument("--title", default="")
     args = ap.parse_args()
 
-    delays, honest, faulty, over = [], [], [], []
+    delays, batches, honest, faulty, over = [], [], [], [], []
     with open(args.csv) as f:
         for row in csv.DictReader(f):
             try:
                 delays.append(int(row["delay_ms"]))
             except (ValueError, KeyError):
                 continue
+            batches.append(row.get("batch", ""))
             honest.append(num(row.get("honest_e2e_ms")))
             faulty.append(num(row.get("faulty_e2e_ms")))
             over.append(num(row.get("overhead_ms")))
@@ -46,9 +47,16 @@ def main():
 
     order = np.argsort(delays)
     delays = [delays[i] for i in order]
+    batches = [batches[i] for i in order]
     honest = [honest[i] for i in order]
     faulty = [faulty[i] for i in order]
     over = [over[i] for i in order]
+
+    # Name the batch per tick only when the sweet spot differs across delays.
+    if len(set(batches)) > 1:
+        ticks = [f"{d}\nB={b}" for d, b in zip(delays, batches)]
+    else:
+        ticks = [str(d) for d in delays]
 
     x = np.arange(len(delays))
     w = 0.38
@@ -60,7 +68,7 @@ def main():
         if np.isfinite(over[i]) and np.isfinite(top):
             ax.text(x[i], top, f"+{over[i]:.0f} ms", ha="center", va="bottom", fontsize=9)
     ax.set_xticks(x)
-    ax.set_xticklabels([str(d) for d in delays])
+    ax.set_xticklabels(ticks)
     ax.set_xlabel("Injected one-way delay (ms)")
     ax.set_ylabel("Median end-to-end latency (ms)")
     ax.set_title(args.title or "PraHRand n=4: player-elimination overhead vs delay")
