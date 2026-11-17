@@ -28,6 +28,9 @@ BATCH_START = re.compile(r"\[PPT\]\[STAGE\]\[BATCH-START\].*round (\d+)")
 ACS_DECIDE = re.compile(r"\[PPT\]\[STAGE\]\[ACS-DECIDE\].*round (\d+) dealers \[([0-9, ]*)\]")
 RECON_START = re.compile(r"\[PPT\]\[STAGE\]\[RECON-START\].*round (\d+)")
 RECON_DONE = re.compile(r"completed reconstruction for round (\d+) and index (\d+)")
+# Despite its wording the line above fires at 2n/3 reports, so it can predate
+# this node's own reconstruction. These two fire only once all n have reported.
+ALL_DONE = re.compile(r"\[BEACON-(?:AGREE|DISAGREE)\] round (\d+) index (\d+)")
 COMPLAINT = re.compile(r"\[PPT\]\[STAGE\]\[COMPLAINT\].*dealer (\d+)")
 BAN = re.compile(r"\[PPT\]\[STAGE\]\[BAN\].*banned dealer (\d+)")
 
@@ -74,18 +77,27 @@ def main():
             members = [x for x in m.group(2).split(",") if x.strip() != ""]
             dset.setdefault(r, len(members))
 
-    last_out = {}
-    out_events = 0
-    out_ts = []
-    for line in Path(args.syncer).read_text(errors="ignore").splitlines():
-        m = RECON_DONE.search(line)
-        t = ts(line)
-        if m and t:
-            r = int(m.group(1))
-            out_events += 1
-            out_ts.append(t)
-            if r not in last_out or t > last_out[r]:
-                last_out[r] = t
+    syncer_lines = Path(args.syncer).read_text(errors="ignore").splitlines()
+
+    def completions(pat):
+        last, events, times = {}, 0, []
+        for line in syncer_lines:
+            m = pat.search(line)
+            t = ts(line)
+            if m and t:
+                r = int(m.group(1))
+                events += 1
+                times.append(t)
+                if r not in last or t > last[r]:
+                    last[r] = t
+        return last, events, times
+
+    # An all-n completion is never earlier than this node's own reconstruction,
+    # so the windows below stay non-negative. Older logs only have the 2n/3 line.
+    last_out, out_events, out_ts = completions(ALL_DONE)
+    quorum_only = not last_out
+    if quorum_only:
+        last_out, out_events, out_ts = completions(RECON_DONE)
 
     # TPS over the active output window.
     tps = None
@@ -95,7 +107,7 @@ def main():
 
     all_rounds = sorted(r for r in bs if r in last_out)
     rounds = all_rounds
-    if len(rounds) > 2 * args.warmup:
+    if args.warmup > 0 and len(rounds) > 2 * args.warmup:
         rounds = rounds[args.warmup:-args.warmup]
 
     def stats(xs):
@@ -113,6 +125,13 @@ def main():
     e2e = [(last_out[r] - bs[r]).total_seconds() for r in rounds]
     agree = [(ad[r] - bs[r]).total_seconds() for r in rounds if r in ad]
     recon = [(last_out[r] - rs[r]).total_seconds() for r in rounds if r in rs]
+
+    # stats() drops negatives, so say when that happened rather than silently
+    # reporting a window over fewer rounds than the others.
+    neg = sum(1 for xs in (e2e, agree, recon) for x in xs if x < 0)
+    if neg:
+        print(f"WARNING: dropped {neg} negative window(s) -- this node's markers were "
+              "compared against a completion timestamp recorded before it finished")
 
     # Elimination markers (earliest across the node log provided).
     comp_ts = ban_ts = None
@@ -142,7 +161,8 @@ def main():
         return "NA" if s is None else f"{s*1000:.1f}ms(med {s and ''})"
 
     print(f"=== {args.label} (batch={args.batch}) ===")
-    print(f"beacon outputs           : {out_events}")
+    print(f"beacon outputs           : {out_events}"
+          + (" (2n/3 quorum -- no all-n markers in this log)" if quorum_only else " (all n nodes)"))
     print(f"TPS (outputs/sec)        : {tps:.1f}" if tps else "TPS: NA")
     for name, s in (("e2e BATCH-START->out", stats(e2e)),
                     ("  agreement (->ACS)", stats(agree)),
