@@ -7,11 +7,10 @@ contains a metrics.txt whose machine-readable line is
     CSV,<label>,<batch>,<outputs>,<tps>,<e2e_s>,<agree_s>,<recon_s>
 
 This scans the run dirs matching a label prefix, and renders the per-batch
-median latency split into the agreement window (BATCH-START -> ACS decide D)
-and the reconstruction window (RECON-START -> last beacon output), stacked, the
-way the advisor's "latency breakdown at the sweet point" asks for. The gap
-between the two windows (ACS-decide -> recon-start, i.e. local transform/setup)
-is shown as a third segment so the bars add up to the end-to-end latency.
+median latency split into the two measured windows -- the agreement window
+(BATCH-START -> ACS decide D) and the reconstruction window (RECON-START ->
+last beacon output) -- stacked, the way the advisor's "latency breakdown at
+the sweet point" asks for.
 
 Usage:
     breakdown.py --results <results_dir> --prefix n16_b --out breakdown.png
@@ -73,17 +72,14 @@ def main():
     B = [r["batch"] for r in rows]
     agree = np.array([r["agree"] * 1000 for r in rows])
     recon = np.array([r["recon"] * 1000 for r in rows])
-    e2e = np.array([(r["e2e"] or 0) * 1000 for r in rows])
-    # The leftover window between ACS-decide and recon-start (local transform).
-    other = np.clip(e2e - agree - recon, 0, None)
 
+    agree_color, recon_color = "#4C72B0", "#DD8452"
     x = range(len(B))
     fig, ax = plt.subplots(figsize=(1.6 + 1.0 * len(B), 5))
-    ax.bar(x, agree, label="agreement (BATCH-START -> ACS decide D)", color="tab:orange")
-    ax.bar(x, other, bottom=agree, label="transform/setup (ACS-decide -> recon-start)", color="tab:gray")
-    ax.bar(x, recon, bottom=agree + other, label="reconstruction (two-layer OEC)", color="tab:green")
+    ax.bar(x, agree, label="agreement (BATCH-START -> ACS decide D)", color=agree_color)
+    ax.bar(x, recon, bottom=agree, label="reconstruction (two-layer OEC)", color=recon_color)
     for i in x:
-        ax.text(i, (agree + other + recon)[i], f"{(agree+other+recon)[i]:.0f} ms",
+        ax.text(i, (agree + recon)[i], f"{(agree + recon)[i]:.0f} ms",
                 ha="center", va="bottom", fontsize=8)
     ax.set_xticks(list(x))
     ax.set_xticklabels([str(b) for b in B])
@@ -91,6 +87,7 @@ def main():
     ax.set_ylabel("Median latency (ms)")
     ax.set_title(args.title or "PraHRand per-batch latency breakdown")
     ax.legend()
+    ax.spines[["top", "right"]].set_visible(False)
     fig.tight_layout()
     fig.savefig(args.out, dpi=150)
     print("wrote", args.out)

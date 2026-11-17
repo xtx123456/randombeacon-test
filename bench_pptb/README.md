@@ -85,9 +85,8 @@ python3 bench_pptb/breakdown.py --results bench_pptb/results/heatmap_<stamp> \
     --prefix d0_b --out ~/breakdown_d0.png
 ```
 
-Each bar stacks agreement (BATCH-START -> ACS decide D), the transform/setup gap
-(ACS-decide -> recon-start), and reconstruction (RECON-START -> last output), so
-the bars add up to the end-to-end latency.
+Each bar stacks the two measured windows: agreement (BATCH-START -> ACS decide D)
+and reconstruction (RECON-START -> last output).
 
 ## Fault injection
 
