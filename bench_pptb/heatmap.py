@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""Render the (batch x injected network-delay) heatmap.
+"""Render a (batch x <x-axis>) heatmap.
 
 Color encodes throughput (beacons/s); the text inside each cell shows both the
 throughput and the median end-to-end latency (ms). This mirrors the HashRand
 Figure 3 style (one metric as color, the number printed in the cell) while
 folding in the latency/throughput trade-off that defines the batch sweet spot.
 
-Input CSV columns: delay_ms,batch,tps,e2e_median_ms
+The x-axis column is selectable with --xcol so the same renderer serves both
+experiments:
+  * injected network delay  (--xcol delay_ms, from netem_sweep.sh)
+  * committee size           (--xcol nodes,    from nodes_sweep.sh)
+
+Input CSV columns: <xcol>,batch,tps,e2e_median_ms
 """
 import argparse
 import csv
@@ -22,6 +27,10 @@ def main():
     ap.add_argument("--csv", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--n", default="")
+    ap.add_argument("--xcol", default="delay_ms",
+                    help="CSV column to use as the x-axis (e.g. delay_ms or nodes)")
+    ap.add_argument("--xlabel", default="Injected one-way delay (ms)",
+                    help="x-axis label shown on the figure")
     args = ap.parse_args()
 
     tps, lat = {}, {}
@@ -29,7 +38,7 @@ def main():
     with open(args.csv) as f:
         for row in csv.DictReader(f):
             try:
-                d = int(row["delay_ms"])
+                d = int(row[args.xcol])
                 b = int(row["batch"])
             except (ValueError, KeyError):
                 continue
@@ -52,7 +61,7 @@ def main():
     ax.set_xticklabels([str(d) for d in delays])
     ax.set_yticks(range(len(batches)))
     ax.set_yticklabels([str(b) for b in batches])
-    ax.set_xlabel("Injected one-way delay (ms)")
+    ax.set_xlabel(args.xlabel)
     ax.set_ylabel("Batch size B")
     cbar = fig.colorbar(im, ax=ax)
     cbar.set_label("Throughput (beacons/s)")

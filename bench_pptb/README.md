@@ -46,6 +46,27 @@ python3 bench_pptb/plot.py bench_pptb/results/<stamp>/summary.csv /opt/cursor/ar
 
 Arguments to `run_once.sh`: `<batch> <freq> <runtime_sec> <transport> <outdir> <label> [faulty_dealer_id]`.
 
+## Heatmaps (batch sweet-spot trade-off)
+
+Two sweeps render the HashRand-Figure-3-style heatmap (color = throughput,
+cell text = throughput + median end-to-end latency, y-axis = batch size):
+
+```bash
+# x-axis = injected one-way network delay (needs root + CAP_NET_ADMIN + sch_netem):
+DELAYS="0 10 30 60" RUNTIME=180 BATCHES="8 32 64 128 256" bash bench_pptb/netem_sweep.sh
+
+# x-axis = committee size n (no privileges/netem needed; runs anywhere):
+NODES="4 7 13 16 22 31" RUNTIME=180 BATCHES="8 32 64 128 256" bash bench_pptb/nodes_sweep.sh
+```
+
+`netem_sweep.sh` emulates the delay with `tc netem` on `lo`, so it only works on
+a host where you have root and the kernel exposes `sch_netem` (a shared container
+such as AutoDL that lacks `CAP_NET_ADMIN` cannot run it). `nodes_sweep.sh` varies
+the committee size instead, so it has no such requirement; node counts must be of
+the form `n=3f+1` (4, 7, 10, 13, 16, ...) and missing config dirs are generated
+on the fly with `genconfig`. Each sweep writes `heatmap.csv` + a rendered PNG
+under `bench_pptb/results/`; `heatmap.py --xcol {delay_ms,nodes}` renders either.
+
 ## Fault injection
 
 Set `PPT_FAULTY_DEALER=<id>` (comma list allowed) in a node's environment. That
