@@ -87,6 +87,12 @@ elif ls "$DIR"/h_d*_b*/metrics.txt >/dev/null 2>&1; then
     elim_row "$h/metrics.txt" "$f/metrics.txt" "$delay" "$batch" "$rep" >> "$CSV"
   done
   echo "rebuilt $CSV"
+  # A header with no rows plots as "no usable rows in CSV", which says nothing
+  # about why. Name the cause here, where the pairing is known.
+  if [ "$(wc -l < "$CSV")" -le 1 ]; then
+    echo "WARNING: $CSV has no data rows -- no h_d<delay>_b<batch> run was paired" \
+         "with an f_ run of the same name"
+  fi
 
 else
   echo "no recognised sweep labels; metrics.txt files were still rewritten"

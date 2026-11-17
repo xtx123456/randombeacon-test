@@ -7,8 +7,14 @@
 # and its untrimmed per-round lines are:
 #   ROUND,<round>,<e2e_s>,<agree_s>,<recon_s>
 
+# Every reader below answers "what does this run say about X", and "nothing"
+# is a real answer: a run can end before it bans a dealer, or before recovery
+# completes. So each returns empty and exits 0 rather than letting grep's
+# no-match status reach the caller -- under the callers' `set -euo pipefail` a
+# missing marker would abort the whole sweep or rescore mid-CSV.
+
 csv_field() {  # $1 metrics.txt ; $2 1-based field -> raw value
-  grep '^CSV,' "$1" 2>/dev/null | tail -1 | cut -d, -f"$2"
+  { grep '^CSV,' "$1" 2>/dev/null || true; } | tail -1 | cut -d, -f"$2"
 }
 
 tps_of() { csv_field "$1" 5; }
@@ -22,7 +28,8 @@ e2e_n() {  # rounds behind that median
 }
 
 marker_ms() {  # $1 metrics.txt ; $2 text pattern -> the "+N ms" offset value
-  grep "$2" "$1" 2>/dev/null | grep -oE '\+[0-9]+ ms' | grep -oE '[0-9]+' | head -1
+  { grep "$2" "$1" 2>/dev/null || true; } \
+    | { grep -oE '\+[0-9]+ ms' || true; } | { grep -oE '[0-9]+' || true; } | head -1
 }
 
 round_ms() {  # $1 metrics.txt ; $2 round -> that single round's e2e in ms
@@ -30,14 +37,14 @@ round_ms() {  # $1 metrics.txt ; $2 round -> that single round's e2e in ms
 }
 
 audit_round_of() {  # round that was running when the ban fired -- pays the cost
-  grep 'audit round (ban fired' "$1" 2>/dev/null \
-    | grep -oE 'round [0-9]+' | grep -oE '[0-9]+' | head -1
+  { grep 'audit round (ban fired' "$1" 2>/dev/null || true; } \
+    | { grep -oE 'round [0-9]+' || true; } | { grep -oE '[0-9]+' || true; } | head -1
 }
 
 evict_round_of() {  # first round that left the banned dealer out of D
   # Second pattern is the wording used before the detection was corrected.
-  grep -E 'banned dealer leaves D|decided-set D shrinks at' "$1" 2>/dev/null \
-    | grep -oE 'round [0-9]+' | grep -oE '[0-9]+' | head -1
+  { grep -E 'banned dealer leaves D|decided-set D shrinks at' "$1" 2>/dev/null || true; } \
+    | { grep -oE 'round [0-9]+' || true; } | { grep -oE '[0-9]+' || true; } | head -1
 }
 
 diff_ms() {  # $1 faulty ms ; $2 honest ms -> difference, or empty
