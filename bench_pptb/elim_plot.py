@@ -158,9 +158,11 @@ def main():
     ax.set_xticks(x)
     ax.set_xticklabels(ticks)
     ax.set_xlabel("Injected one-way delay (ms)")
+    # No round column at all means the oldest CSVs, whose bars are steady-state
+    # medians over the whole run rather than one round.
     which = {"audit_round": "Audit-round (ban fires in it)",
              "evict_round": "Eviction-round (first round after the ban)"}.get(
-                 round_col, "Compared-round")
+                 round_col, "Steady-state median")
     ax.set_ylabel(args.ylabel or (f"{which} end-to-end latency (ms)"
                                   + (f", median of {nreps} runs" if nreps > 1 else "")))
     ax.set_title(args.title or "PraHRand n=4: player-elimination overhead vs delay")
