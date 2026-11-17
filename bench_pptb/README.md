@@ -88,6 +88,26 @@ python3 bench_pptb/breakdown.py --results bench_pptb/results/heatmap_<stamp> \
 Each bar stacks the two measured windows: agreement (BATCH-START -> ACS decide D)
 and reconstruction (RECON-START -> last output).
 
+## Player-elimination overhead vs injected delay (n=4)
+
+`elim_netem_sweep.sh` measures how much the fault path (complaint -> assist ->
+recovery -> ban -> audit) adds over the honest path, across injected one-way
+delays, at a fixed sweet-spot batch (needs root for `tc netem`):
+
+```bash
+sudo env DELAYS="0 10 30 40 50" BATCH=500 FAULTY=3 RUNTIME=120 \
+    bash bench_pptb/elim_netem_sweep.sh
+```
+
+Per delay it runs an honest batch and a one-bad-dealer batch at `n=4`, and writes
+`elim_overhead.csv` (`delay_ms,batch,honest_e2e_ms,faulty_e2e_ms,overhead_ms,complaint_ms,ban_ms`)
+plus `elim_overhead.png` (grouped honest-vs-faulty bars, `elim_plot.py`). Overhead
+is `faulty median e2e - honest median e2e`, the same definition as `plot.py`.
+
+Note: the bad dealer is evicted around round 1 (`decided-set D shrinks`), so the
+faulty run's median mostly reflects the post-eviction `|D|=3` regime; the
+one-time audit timeline is in the `complaint_ms` / `ban_ms` columns.
+
 ## Fault injection
 
 Set `PPT_FAULTY_DEALER=<id>` (comma list allowed) in a node's environment. That
