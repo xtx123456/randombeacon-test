@@ -32,6 +32,9 @@ def main():
     ap.add_argument("--csv", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--title", default="")
+    ap.add_argument("--ylabel", default="",
+                    help="override for pre-eviction-round CSVs, whose bars are "
+                         "steady-state medians rather than a single round")
     args = ap.parse_args()
 
     reps = OrderedDict()
@@ -77,11 +80,15 @@ def main():
         top = max(honest[i], faulty[i])
         if np.isfinite(over[i]) and np.isfinite(top):
             ax.text(x[i], top, f"+{over[i]:.0f} ms", ha="center", va="bottom", fontsize=9)
+    # Headroom so the legend clears the annotations above the tallest pair.
+    top = np.nanmax(np.concatenate([honest, faulty]))
+    if np.isfinite(top):
+        ax.set_ylim(0, top * 1.22)
     ax.set_xticks(x)
     ax.set_xticklabels(ticks)
     ax.set_xlabel("Injected one-way delay (ms)")
-    ax.set_ylabel("Eviction-round end-to-end latency (ms)"
-                  + (f", median of {nreps} runs" if nreps > 1 else ""))
+    ax.set_ylabel(args.ylabel or ("Eviction-round end-to-end latency (ms)"
+                                  + (f", median of {nreps} runs" if nreps > 1 else "")))
     ax.set_title(args.title or "PraHRand n=4: player-elimination overhead vs delay")
     ax.legend()
     ax.spines[["top", "right"]].set_visible(False)
