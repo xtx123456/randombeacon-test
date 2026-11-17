@@ -100,19 +100,50 @@ sudo env NODES=16 DELAYS="0 10 30 40 50" BATCH=500 FAULTY=3 RUNTIME=180 \
     bash bench_pptb/elim_netem_sweep.sh
 ```
 
-Per delay it runs an honest batch and a bad-dealer batch at `n=NODES`, and writes
-`elim_overhead.csv` (`delay_ms,batch,honest_e2e_ms,faulty_e2e_ms,overhead_ms,complaint_ms,ban_ms`)
-plus `elim_overhead.png` (grouped honest-vs-faulty bars, `elim_plot.py`). Overhead
-is `faulty median e2e - honest median e2e`, the same definition as `plot.py`.
+Per delay it runs an honest batch and a bad-dealer batch at `n=NODES` and writes
+`elim_overhead.csv` (columns in `ELIM_CSV_HEADER`, `lib_metrics.sh`) plus
+`elim_overhead.png`. `PAIRS="0:800 10:1000 30:500"` gives each delay its own
+sweet-spot batch; `REPS` repeats a delay, since one run yields exactly one
+sample of a one-time cost.
+
+Eviction is a one-time event, and the two rounds around it move in opposite
+directions, so the CSV keeps them apart:
+
+* `overhead_ms` is the **audit round** -- the round that was running when the ban
+  fired, compared at the same index between the honest and faulty runs. This is
+  the cost.
+* `evict_delta_ms` is the first round that *begins after* the ban. It is the
+  first to run on a smaller `D`, so it is usually **faster** than the honest
+  baseline. This is a benefit of eviction, never read as cost.
+* `steady_overhead_ms` is the whole-run median difference, for reference only.
 
 `f` is only the tolerance bound, not the number of evictions: one bad dealer is
-caught and evicted in ~1 round regardless of `f`. To test the worst case (evict
-several at once) pass a comma list, e.g. `FAULTY="3,5,7,9,11"` for 5 faulty
-dealers at n=16.
+caught and evicted in ~1 round regardless of `f`. `FAULTY` is a bad dealer's
+**node id**, not a count -- `FAULTY=3` injects one bad dealer (node 3), and
+`FAULTY="3,5,7,9,11"` is the n=16 worst case of f=5 at once.
 
-Note: the bad dealer is evicted around round 1 (`decided-set D shrinks`), so the
-faulty run's median mostly reflects the post-eviction `|D|` regime; the one-time
-audit timeline is in the `complaint_ms` / `ban_ms` columns.
+### Which phase the time goes to
+
+The ban is logged *before* `recover_awss_local_share` is called, so
+`complaint_ms` -> `ban_ms` measures **attribution only** -- the evidence check
+and the decision to ban -- and not the repair that follows. `recovered_ms` and
+`audit_done_ms` close the rest of the path, and `--metric stages` stacks all
+three:
+
+```bash
+python3 bench_pptb/elim_plot.py --csv elim_overhead.csv --metric stages \
+  --out elim_stages.png
+```
+
+| phase | interval | what it covers |
+| --- | --- | --- |
+| attribution | `COMPLAINT` -> `BAN` | verify the complaint evidence, rebroadcast the report, send this node's own assist |
+| share repair | `BAN` -> `AWSS-RECOVERED` | collect peers' assists and rebuild the victim's share |
+| full audit | `AWSS-RECOVERED` -> `DEALER-AUDIT-COMPLETE` | the `n-2f` row audit that names the dealer's fault |
+
+At n=4, f=1, B=32 these measure 0 ms / 6 ms / 7 ms, so the whole elimination
+path is ~13 ms. Quote `--metric audit` as the attribution latency, not as the
+cost of eliminating a dealer.
 
 ## Fault injection
 
@@ -125,4 +156,6 @@ dealer. The switch is a no-op when the variable is unset, so honest benchmarks
 are unaffected.
 
 Markers added for measurement: `[PPT][STAGE][COMPLAINT]`, `[PPT][STAGE][BAN]`,
-and the existing `[PPT][STAGE][BATCH-START|ACS-DECIDE|RECON-START]`.
+and the existing `[PPT][STAGE][BATCH-START|ACS-DECIDE|RECON-START]`. The
+elimination phase split also reads `[PPT][AWSS-RECOVERED]` and
+`[PPT][DEALER-AUDIT-COMPLETE]`, which the base branch already logs at INFO.

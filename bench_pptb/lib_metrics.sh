@@ -70,11 +70,16 @@ elim_row() {  # $1 honest metrics.txt ; $2 faulty metrics.txt ; $3 delay ; $4 ba
   she=$(e2e_ms "$hm"); sfe=$(e2e_ms "$fm")
   sov=$(diff_ms "$sfe" "$she")
 
+  # The ban is logged before recovery starts, so complaint->ban is attribution
+  # only. Carry the repair and audit markers too, so the elimination path can be
+  # split into stages instead of being represented by its cheapest one.
   cm=$(marker_ms "$fm" "first COMPLAINT at")
   bm=$(marker_ms "$fm" "first BAN")
+  rm_=$(marker_ms "$fm" "first AWSS-RECOVERED at")
+  am=$(marker_ms "$fm" "first AUDIT-COMPLETE at")
   hn=$(e2e_n "$hm"); fn=$(e2e_n "$fm")
 
-  echo "$d,$b,$rep,${ar:-NA},$audit,${er:-NA},${evict##*,},${she:-NA},${sfe:-NA},${sov:-NA},${cm:-NA},${bm:-NA},${hn:-0},${fn:-0}"
+  echo "$d,$b,$rep,${ar:-NA},$audit,${er:-NA},${evict##*,},${she:-NA},${sfe:-NA},${sov:-NA},${cm:-NA},${bm:-NA},${rm_:-NA},${am:-NA},${hn:-0},${fn:-0}"
 }
 
-ELIM_CSV_HEADER="delay_ms,batch,rep,audit_round,honest_e2e_ms,faulty_e2e_ms,overhead_ms,evict_round,evict_delta_ms,steady_honest_ms,steady_faulty_ms,steady_overhead_ms,complaint_ms,ban_ms,honest_n,faulty_n"
+ELIM_CSV_HEADER="delay_ms,batch,rep,audit_round,honest_e2e_ms,faulty_e2e_ms,overhead_ms,evict_round,evict_delta_ms,steady_honest_ms,steady_faulty_ms,steady_overhead_ms,complaint_ms,ban_ms,recovered_ms,audit_done_ms,honest_n,faulty_n"

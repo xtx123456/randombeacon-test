@@ -33,6 +33,11 @@ RECON_DONE = re.compile(r"completed reconstruction for round (\d+) and index (\d
 ALL_DONE = re.compile(r"\[BEACON-(?:AGREE|DISAGREE)\] round (\d+) index (\d+)")
 COMPLAINT = re.compile(r"\[PPT\]\[STAGE\]\[COMPLAINT\].*dealer (\d+)")
 BAN = re.compile(r"\[PPT\]\[STAGE\]\[BAN\].*banned dealer (\d+)")
+# The ban is logged before recover_awss_local_share is even called, so
+# complaint->ban is attribution only. These two close the rest of the pipeline:
+# repairing the victim's share, then the full dealer audit.
+RECOVERED = re.compile(r"\[PPT\]\[AWSS-RECOVERED\].*dealer=(\d+)")
+AUDIT_DONE = re.compile(r"\[PPT\]\[DEALER-AUDIT-COMPLETE\].*dealer=(\d+)")
 
 # Below this many surviving rounds the medians are noise, so say so loudly.
 MIN_SAMPLES = 5
@@ -134,7 +139,7 @@ def main():
               "compared against a completion timestamp recorded before it finished")
 
     # Elimination markers (earliest across the node log provided).
-    comp_ts = ban_ts = None
+    comp_ts = ban_ts = rec_ts = aud_ts = None
     banned = None
     for line in Path(args.node).read_text(errors="ignore").splitlines():
         if comp_ts is None and COMPLAINT.search(line):
@@ -143,6 +148,16 @@ def main():
         if mb and ban_ts is None:
             ban_ts = ts(line)
             banned = int(mb.group(1))
+        # Only count repair work for the dealer that was actually banned, so a
+        # recovery driven by an unrelated slow dealer cannot land in the split.
+        if rec_ts is None and banned is not None:
+            mr = RECOVERED.search(line)
+            if mr and int(mr.group(1)) == banned:
+                rec_ts = ts(line)
+        if aud_ts is None and banned is not None:
+            ma = AUDIT_DONE.search(line)
+            if ma and int(ma.group(1)) == banned:
+                aud_ts = ts(line)
     # The round that was running when the ban fired. The complaint -> assist ->
     # recovery -> ban work happens inside it, so this is the round that pays the
     # one-time cost.
@@ -181,6 +196,29 @@ def main():
     if ban_ts and bs:
         t0 = min(bs.values())
         print(f"first BAN (dealer {banned}) at   : +{(ban_ts - t0).total_seconds()*1000:.0f} ms from first BATCH-START")
+    if rec_ts and bs:
+        t0 = min(bs.values())
+        print(f"first AWSS-RECOVERED at  : +{(rec_ts - t0).total_seconds()*1000:.0f} ms from first BATCH-START")
+    if aud_ts and bs:
+        t0 = min(bs.values())
+        print(f"first AUDIT-COMPLETE at  : +{(aud_ts - t0).total_seconds()*1000:.0f} ms from first BATCH-START")
+    # The ban is logged before recovery starts, so complaint->ban measures
+    # attribution alone. Splitting the rest out keeps "the audit is cheap" from
+    # being read as "the whole elimination path is cheap".
+    if comp_ts and ban_ts:
+        def ms(a, b):
+            return f"{(b - a).total_seconds()*1000:.0f} ms"
+        print(f"  stage attribution      : {ms(comp_ts, ban_ts)} (COMPLAINT -> BAN)")
+        if rec_ts:
+            print(f"  stage share repair     : {ms(ban_ts, rec_ts)} (BAN -> AWSS-RECOVERED)")
+        if rec_ts and aud_ts:
+            print(f"  stage full audit       : {ms(rec_ts, aud_ts)} (AWSS-RECOVERED -> AUDIT-COMPLETE)")
+        end = aud_ts or rec_ts or ban_ts
+        print(f"  stage total            : {ms(comp_ts, end)} (COMPLAINT -> "
+              + ("AUDIT-COMPLETE)" if aud_ts else "AWSS-RECOVERED)" if rec_ts else "BAN)"))
+        if not rec_ts:
+            print("WARNING: no AWSS-RECOVERED for the banned dealer -- complaint->ban "
+                  "covers attribution only, so it is not the cost of elimination")
     if audit_round is not None:
         print(f"audit round (ban fired in): round {audit_round}")
         if all_rounds and audit_round == all_rounds[-1]:
