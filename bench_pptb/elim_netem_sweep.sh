@@ -51,6 +51,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+. "$ROOT/bench_pptb/lib_metrics.sh"
 NODES="${NODES:-16}"
 DELAYS="${DELAYS:-0 10 30 40 50}"
 BATCH="${BATCH:-500}"
@@ -85,31 +86,10 @@ STAMP="$(date +%Y%m%d_%H%M%S)"
 OUT="$ROOT/bench_pptb/results/elim_netem_$STAMP"
 mkdir -p "$OUT"
 CSV="$OUT/elim_overhead.csv"
-echo "delay_ms,batch,rep,evict_round,honest_e2e_ms,faulty_e2e_ms,overhead_ms,steady_honest_ms,steady_faulty_ms,steady_overhead_ms,complaint_ms,ban_ms,honest_n,faulty_n" > "$CSV"
+echo "$ELIM_CSV_HEADER" > "$CSV"
 
 cleanup_netem() { tc qdisc del dev "$NETEM_IFACE" root 2>/dev/null || true; }
 trap cleanup_netem EXIT
-
-e2e_ms() {  # $1 metrics.txt -> median e2e ms (CSV line field 6, seconds)
-  local s
-  s=$(grep '^CSV,' "$1" 2>/dev/null | tail -1 | cut -d, -f6)
-  awk -v x="$s" 'BEGIN{ if (x=="") print ""; else printf "%.1f", x*1000 }'
-}
-e2e_n() {  # $1 metrics.txt -> number of rounds behind that median (CSV field 9)
-  grep '^CSV,' "$1" 2>/dev/null | tail -1 | cut -d, -f9
-}
-marker_ms() {  # $1 metrics.txt ; $2 text pattern -> the "+N ms" offset value
-  grep "$2" "$1" 2>/dev/null | grep -oE '\+[0-9]+ ms' | grep -oE '[0-9]+' | head -1
-}
-round_ms() {  # $1 metrics.txt ; $2 round -> that single round's e2e in ms
-  awk -F, -v r="$2" '$1=="ROUND" && $2==r { printf "%.1f", $3*1000; f=1; exit } END{ if (!f) print "" }' "$1"
-}
-evict_round_of() {  # $1 metrics.txt -> round in which D shrank, else empty
-  grep 'decided-set D shrinks at' "$1" 2>/dev/null | grep -oE 'round [0-9]+' | grep -oE '[0-9]+' | head -1
-}
-diff_ms() {  # $1 faulty ms ; $2 honest ms -> difference, or empty
-  awk -v f="$1" -v h="$2" 'BEGIN{ if (f==""||h=="") print ""; else printf "%.1f", f-h }'
-}
 
 # Work list of "<delay>:<batch>" items: PAIRS verbatim, else DELAYS x BATCH.
 WORK="$PAIRS"
@@ -135,22 +115,11 @@ for item in $WORK; do
       bash "$ROOT/bench_pptb/run_once_n.sh" "$b" "$FREQ" "$RUNTIME" "$TRANSPORT" "$OUT" "$fl" "$TESTDIR" "$IP" "$FAULTY"
 
     hm="$OUT/$hl/metrics.txt"; fm="$OUT/$fl/metrics.txt"
-
-    # One-time cost: compare the same round index in both runs.
-    er=$(evict_round_of "$fm"); er="${er:-1}"
-    hr=$(round_ms "$hm" "$er"); fr=$(round_ms "$fm" "$er")
-    ov=$(diff_ms "$fr" "$hr")
-
-    # Steady-state difference, for reference only.
-    she=$(e2e_ms "$hm"); sfe=$(e2e_ms "$fm")
-    sov=$(diff_ms "$sfe" "$she")
-
-    cm=$(marker_ms "$fm" "first COMPLAINT at")
-    bm=$(marker_ms "$fm" "first BAN")
-    hn=$(e2e_n "$hm"); fn=$(e2e_n "$fm")
-    echo "$d,$b,$rep,$er,${hr:-NA},${fr:-NA},${ov:-NA},${she:-NA},${sfe:-NA},${sov:-NA},${cm:-NA},${bm:-NA},${hn:-0},${fn:-0}" >> "$CSV"
-    [ -n "$hr" ] && [ -n "$fr" ] || \
-      echo "!! delay=${d}ms batch=${b} rep=${rep}: round $er missing from one of the runs -- raise RUNTIME so it completes"
+    row=$(elim_row "$hm" "$fm" "$d" "$b" "$rep")
+    echo "$row" >> "$CSV"
+    case "$row" in
+      *,NA,NA,NA,*) echo "!! delay=${d}ms batch=${b} rep=${rep}: the eviction round is missing from one of the runs -- raise RUNTIME so it completes" ;;
+    esac
   done
 done
 cleanup_netem
