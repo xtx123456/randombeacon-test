@@ -29,7 +29,10 @@
 #   FAULTY    bad dealer id or list   (default 3; victim defaults to (id+1) mod n)
 #   TRANSPORT secmsg|lite             (default secmsg; secmsg carries the complaint evidence)
 #   FREQ      --frequency             (default 1)
-#   RUNTIME   seconds per run         (default 180; raise for large n/batch/delay)
+#   RUNTIME   seconds per run         (default 600; each run must cover enough
+#             rounds that the median is not noise -- at n=16/batch=800 a round
+#             takes tens of seconds, so 180 leaves only a handful. analyze.py
+#             warns, and the CSV carries honest_n/faulty_n, when it is too low.)
 #   WARMUP    rounds trimmed per end  (default 2; small so the eviction rounds count)
 #   NETEM_IFACE loopback iface        (default lo)
 set -euo pipefail
@@ -43,7 +46,7 @@ PAIRS="${PAIRS:-}"
 FAULTY="${FAULTY:-3}"
 TRANSPORT="${TRANSPORT:-secmsg}"
 FREQ="${FREQ:-1}"
-RUNTIME="${RUNTIME:-180}"
+RUNTIME="${RUNTIME:-600}"
 WARMUP="${WARMUP:-2}"
 NETEM_IFACE="${NETEM_IFACE:-lo}"
 TESTDIR="${TESTDIR:-$ROOT/testdata/cc_$NODES}"
@@ -69,7 +72,7 @@ STAMP="$(date +%Y%m%d_%H%M%S)"
 OUT="$ROOT/bench_pptb/results/elim_netem_$STAMP"
 mkdir -p "$OUT"
 CSV="$OUT/elim_overhead.csv"
-echo "delay_ms,batch,honest_e2e_ms,faulty_e2e_ms,overhead_ms,complaint_ms,ban_ms" > "$CSV"
+echo "delay_ms,batch,honest_e2e_ms,faulty_e2e_ms,overhead_ms,complaint_ms,ban_ms,honest_n,faulty_n" > "$CSV"
 
 cleanup_netem() { tc qdisc del dev "$NETEM_IFACE" root 2>/dev/null || true; }
 trap cleanup_netem EXIT
@@ -78,6 +81,9 @@ e2e_ms() {  # $1 metrics.txt -> median e2e ms (CSV line field 6, seconds)
   local s
   s=$(grep '^CSV,' "$1" 2>/dev/null | tail -1 | cut -d, -f6)
   awk -v x="$s" 'BEGIN{ if (x=="") print ""; else printf "%.1f", x*1000 }'
+}
+e2e_n() {  # $1 metrics.txt -> number of rounds behind that median (CSV field 9)
+  grep '^CSV,' "$1" 2>/dev/null | tail -1 | cut -d, -f9
 }
 marker_ms() {  # $1 metrics.txt ; $2 text pattern -> the "+N ms" offset value
   grep "$2" "$1" 2>/dev/null | grep -oE '\+[0-9]+ ms' | grep -oE '[0-9]+' | head -1
@@ -110,7 +116,11 @@ for item in $WORK; do
   ov=$(awk -v f="$fe" -v h="$he" 'BEGIN{ if (f==""||h=="") print ""; else printf "%.1f", f-h }')
   cm=$(marker_ms "$OUT/$fl/metrics.txt" "first COMPLAINT at")
   bm=$(marker_ms "$OUT/$fl/metrics.txt" "first BAN")
-  echo "$d,$b,${he:-NA},${fe:-NA},${ov:-NA},${cm:-NA},${bm:-NA}" >> "$CSV"
+  hn=$(e2e_n "$OUT/$hl/metrics.txt"); fn=$(e2e_n "$OUT/$fl/metrics.txt")
+  echo "$d,$b,${he:-NA},${fe:-NA},${ov:-NA},${cm:-NA},${bm:-NA},${hn:-0},${fn:-0}" >> "$CSV"
+  if [ "${hn:-0}" -lt 5 ] || [ "${fn:-0}" -lt 5 ]; then
+    echo "!! delay=${d}ms batch=${b}: only ${hn:-0}/${fn:-0} rounds measured -- overhead is noise, raise RUNTIME"
+  fi
 done
 cleanup_netem
 

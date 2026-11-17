@@ -17,7 +17,7 @@ BATCHES="${BATCHES:-1 4 8 16 32 64 128 256}"
 ELIM_BATCH="${ELIM_BATCH:-32}"
 
 SUMMARY="$OUT/summary.csv"
-echo "label,batch,beacon_outputs,tps,e2e_median_s,agree_median_s,recon_median_s" > "$SUMMARY"
+echo "label,batch,beacon_outputs,tps,e2e_median_s,agree_median_s,recon_median_s,e2e_samples" > "$SUMMARY"
 
 append() { grep '^CSV,' "$1" | sed 's/^CSV,//' >> "$SUMMARY" || true; }
 

@@ -29,6 +29,9 @@ RECON_DONE = re.compile(r"completed reconstruction for round (\d+) and index (\d
 COMPLAINT = re.compile(r"\[PPT\]\[STAGE\]\[COMPLAINT\].*dealer (\d+)")
 BAN = re.compile(r"\[PPT\]\[STAGE\]\[BAN\].*banned dealer (\d+)")
 
+# Below this many surviving rounds the medians are noise, so say so loudly.
+MIN_SAMPLES = 5
+
 
 def ts(line):
     m = TS.search(line)
@@ -156,12 +159,18 @@ def main():
 
     # Machine-readable one-liner for CSV aggregation.
     se = stats(e2e); sa = stats(agree); sr = stats(recon)
+    if se is None or se["n"] < MIN_SAMPLES:
+        got = 0 if se is None else se["n"]
+        print(f"WARNING: only {got} round(s) left after trimming {args.warmup} per end "
+              f"({len(bs)} BATCH-START, {len(last_out)} completed at the syncer) -- "
+              f"raise RUNTIME before trusting these medians")
     print("CSV," + ",".join(str(x) for x in [
         args.label, args.batch, out_events,
         f"{tps:.3f}" if tps else "",
         f"{se['median']:.6f}" if se else "",
         f"{sa['median']:.6f}" if sa else "",
         f"{sr['median']:.6f}" if sr else "",
+        se["n"] if se else 0,
     ]))
 
 
