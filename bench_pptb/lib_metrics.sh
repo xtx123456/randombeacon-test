@@ -29,8 +29,10 @@ round_ms() {  # $1 metrics.txt ; $2 round -> that single round's e2e in ms
   awk -F, -v r="$2" '$1=="ROUND" && $2==r { printf "%.1f", $3*1000; f=1; exit } END{ if (!f) print "" }' "$1"
 }
 
-evict_round_of() {  # round in which D shrank, else empty
-  grep 'decided-set D shrinks at' "$1" 2>/dev/null | grep -oE 'round [0-9]+' | grep -oE '[0-9]+' | head -1
+evict_round_of() {  # round the banned dealer left D, else empty
+  # Second pattern is the wording used before the detection was corrected.
+  grep -E 'banned dealer leaves D|decided-set D shrinks at' "$1" 2>/dev/null \
+    | grep -oE 'round [0-9]+' | grep -oE '[0-9]+' | head -1
 }
 
 diff_ms() {  # $1 faulty ms ; $2 honest ms -> difference, or empty
@@ -41,10 +43,15 @@ elim_row() {  # $1 honest metrics.txt ; $2 faulty metrics.txt ; $3 delay ; $4 ba
   local hm="$1" fm="$2" d="$3" b="$4" rep="$5"
   local er hr fr ov she sfe sov cm bm hn fn
 
-  # One-time cost: the same round index in both runs.
-  er=$(evict_round_of "$fm"); er="${er:-1}"
-  hr=$(round_ms "$hm" "$er"); fr=$(round_ms "$fm" "$er")
-  ov=$(diff_ms "$fr" "$hr")
+  # One-time cost: the same round index in both runs. Without an observed
+  # eviction there is nothing to compare, so report NA rather than guess a round.
+  er=$(evict_round_of "$fm")
+  if [ -n "$er" ]; then
+    hr=$(round_ms "$hm" "$er"); fr=$(round_ms "$fm" "$er")
+    ov=$(diff_ms "$fr" "$hr")
+  else
+    er="NA"; hr=""; fr=""; ov=""
+  fi
 
   # Steady-state difference, for reference only.
   she=$(e2e_ms "$hm"); sfe=$(e2e_ms "$fm")

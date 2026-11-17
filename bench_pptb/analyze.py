@@ -68,14 +68,14 @@ def main():
     ad = first_per_round(args.node, ACS_DECIDE)
     rs = first_per_round(args.node, RECON_START)
 
-    # Decided-set sizes per round, and last beacon-output time per round.
+    # Who ACS selected per round, so eviction can be detected by the banned
+    # dealer's absence rather than by |D| shrinking.
     dset = {}
     for line in Path(args.node).read_text(errors="ignore").splitlines():
         m = ACS_DECIDE.search(line)
         if m:
             r = int(m.group(1))
-            members = [x for x in m.group(2).split(",") if x.strip() != ""]
-            dset.setdefault(r, len(members))
+            dset.setdefault(r, {int(x) for x in m.group(2).split(",") if x.strip()})
 
     syncer_lines = Path(args.syncer).read_text(errors="ignore").splitlines()
 
@@ -143,22 +143,16 @@ def main():
         if mb and ban_ts is None:
             ban_ts = ts(line)
             banned = int(mb.group(1))
+    # First round that began after the ban and left the banned dealer out of D.
+    # |D| alone is not a signal: it varies round to round with who finished
+    # sharing in time, and a dealer can be missing from an early D just for
+    # being slow, which is why the round has to start after the ban to count.
     evict_round = None
-    if banned is not None:
+    if banned is not None and ban_ts is not None:
         for r in sorted(dset):
-            if dset[r] <= args.batch and banned is not None:
-                pass
-        # Round where decided-set size first drops (banned dealer excluded).
-        sizes = [(r, dset[r]) for r in sorted(dset)]
-        if sizes:
-            base = max(s for _, s in sizes)
-            for r, s in sizes:
-                if s < base:
-                    evict_round = r
-                    break
-
-    def fmt(s):
-        return "NA" if s is None else f"{s*1000:.1f}ms(med {s and ''})"
+            if r in bs and bs[r] >= ban_ts and banned not in dset[r]:
+                evict_round = r
+                break
 
     print(f"=== {args.label} (batch={args.batch}) ===")
     print(f"beacon outputs           : {out_events}"
@@ -178,7 +172,13 @@ def main():
         t0 = min(bs.values())
         print(f"first BAN (dealer {banned}) at   : +{(ban_ts - t0).total_seconds()*1000:.0f} ms from first BATCH-START")
     if evict_round is not None:
-        print(f"decided-set D shrinks at : round {evict_round} (banned dealer excluded)")
+        print(f"banned dealer leaves D at: round {evict_round}")
+        if all_rounds and evict_round == all_rounds[-1]:
+            print("WARNING: the eviction round is this run's last round, which shutdown "
+                  "distorts -- raise RUNTIME so a later round carries the comparison")
+    elif banned is not None:
+        print("WARNING: dealer was banned but no later round left it out of D -- the run "
+              "ended too early to observe the eviction; raise RUNTIME")
 
     # Untrimmed per-round rows. The verify+evict cost is a one-time event in the
     # eviction round, so it has to be read off that round directly -- a longer
